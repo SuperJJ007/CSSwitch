@@ -1003,7 +1003,7 @@ Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>"
 - [ ] **Step 1: 往 `test/test_scripts.sh` 的 `echo "----"` 之前追加 7.7 断言**
 
 ```bash
-# --- 7.7 端口归一化 + dry-run ---
+# 7.7 端口归一化 + dry-run
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 08765 --dry-run 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "拒绝"; then ok "08765 rejected via int-normalize"; else no "08765 bypassed guard (rc=$rc)"; fi
 
