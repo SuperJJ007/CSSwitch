@@ -89,6 +89,8 @@ PROVIDERS = {
 PROV = None      # 当前 provider 配置（dict），运行时设定
 KEY = None       # 当前 provider 的 key，只驻内存
 LOG = None
+PROV_NAME = None  # 运行时设定；模块被 import 做测试时也要有定义，避免 handler NameError
+AUTH_SECRET = None  # 未设则不启用鉴权（保持旧行为）
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
 
 
@@ -309,7 +311,20 @@ class H(BaseHTTPRequestHandler):
         chunk = f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode()
         self.wfile.write(hex(len(chunk))[2:].encode() + b"\r\n" + chunk + b"\r\n")
 
+    def _auth_ok(self):
+        if not AUTH_SECRET:
+            return True
+        prefix = "/" + AUTH_SECRET
+        if self.path == prefix or self.path.startswith(prefix + "/"):
+            self.path = self.path[len(prefix):] or "/"
+            return True
+        self._send_json(403, {"type": "error", "error": {
+            "type": "permission_error", "message": "forbidden"}})
+        return False
+
     def do_GET(self):
+        if not self._auth_ok():
+            return
         if self.path.startswith("/v1/models"):
             data = [{"type": "model", "id": mid, "display_name": disp,
                      "created_at": "2026-01-01T00:00:00Z"} for mid, disp in PROV["models"]]
@@ -322,6 +337,8 @@ class H(BaseHTTPRequestHandler):
             self._send_json(404, {"type": "error", "error": {"type": "not_found_error", "message": self.path}})
 
     def do_POST(self):
+        if not self._auth_ok():
+            return
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) if n else b"{}"
         if not self.path.startswith("/v1/messages"):
@@ -476,11 +493,17 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=18991)
     ap.add_argument("--env-file", default=None)
     ap.add_argument("--log", default=None)
+    ap.add_argument("--auth-token", default=None)
     args = ap.parse_args()
     PROV_NAME = args.provider
     PROV = PROVIDERS[PROV_NAME]
     LOG = args.log
     KEY = load_key(PROV, args)
+    AUTH_SECRET = os.environ.get("CSSWITCH_AUTH_TOKEN") or args.auth_token
+    _up = os.environ.get("CSSWITCH_UPSTREAM_URL")
+    if _up:
+        PROV = dict(PROV)
+        PROV["url"] = _up
     if not KEY:
         print(f"找不到 {PROV['key_env']}。用环境变量或 --env-file <路径> 提供。", file=sys.stderr)
         sys.exit(1)
