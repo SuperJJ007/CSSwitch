@@ -1042,6 +1042,17 @@ pub fn run() {
             // 三键：关闭/最小化/缩放）+ visible + center，启动即居中弹出、可拖动
             // （修 #4；标题栏自带拖动，顺带解决 #1 拖不动）。托盘图标已移除。
 
+            // 遗留 provider=relay 迁移（防御项，幂等）：把 PR #4 单槽迁到多槽 relay-<preset>。
+            // 本机无 relay 槽 → no-op；下游若有旧槽则一次性迁移并落盘。
+            {
+                let dir = config::default_dir();
+                if let Ok(mut cfg) = config::load_from(&dir) {
+                    if relay_presets::migrate_legacy_relay(&mut cfg) {
+                        let _ = config::update(&dir, |c| *c = cfg.clone());
+                    }
+                }
+            }
+
             // 关窗即退出：与「退出」按钮一致 —— 停代理、清 secret，保留沙箱运行
             // （spec §5.1）。不接这一步，从标题栏红叉关窗会绕过 quit_app 直接退，
             // 把代理子进程留成孤儿。

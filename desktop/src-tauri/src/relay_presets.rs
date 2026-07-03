@@ -35,6 +35,28 @@ pub fn match_base_url(url: &str) -> Option<&'static str> {
         .map(|p| p.id)
 }
 
+/// 遗留 provider=relay 迁移（防御项，幂等，修评审 P1-2 防御化）。
+/// PR #4 用单槽 `providers["relay"]` + `provider="relay"`；多槽落地后把它迁到 `relay-<preset>`：
+///   - 有旧 `relay` 槽 → 按 base_url match_base_url（不中→relay-custom）搬 key/base_url/model，删旧槽。
+///   - provider=="relay" → 改成迁移后的目标 id；无槽可搬则落 deepseek（不留非法 provider）。
+/// 改动了返回 true。已是多槽 / 非 relay 配置 → 不动，返回 false。
+pub fn migrate_legacy_relay(cfg: &mut crate::config::Config) -> bool {
+    let mut changed = false;
+    let target = if let Some(slot) = cfg.providers.remove("relay") {
+        let id = match_base_url(&slot.base_url).unwrap_or("relay-custom");
+        cfg.providers.insert(id.to_string(), slot);
+        changed = true;
+        Some(id.to_string())
+    } else {
+        None
+    };
+    if cfg.provider == "relay" {
+        cfg.provider = target.unwrap_or_else(|| "deepseek".to_string());
+        changed = true;
+    }
+    changed
+}
+
 static PRESETS: &[RelayPreset] = &[
     RelayPreset {
         id: "relay-xiaomi",
@@ -84,6 +106,79 @@ static PRESETS: &[RelayPreset] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{Config, ProviderCfg};
+
+    fn cfg_with_relay(base_url: &str) -> Config {
+        let mut c = Config {
+            provider: "relay".into(),
+            ..Default::default()
+        };
+        c.providers.insert(
+            "relay".into(),
+            ProviderCfg {
+                key: "legacy_key".into(),
+                base_url: base_url.into(),
+                model: String::new(),
+            },
+        );
+        c
+    }
+
+    #[test]
+    fn migrate_known_base_url_moves_to_matched_preset() {
+        let mut c = cfg_with_relay("https://open.bigmodel.cn/api/anthropic");
+        let changed = migrate_legacy_relay(&mut c);
+        assert!(changed);
+        assert_eq!(c.provider, "relay-glm");
+        assert!(!c.providers.contains_key("relay"), "旧 relay 槽应删除");
+        assert_eq!(c.key_for("relay-glm").as_deref(), Some("legacy_key"));
+        assert_eq!(
+            c.base_url_for("relay-glm").as_deref(),
+            Some("https://open.bigmodel.cn/api/anthropic")
+        );
+    }
+
+    #[test]
+    fn migrate_unknown_base_url_falls_to_custom() {
+        let mut c = cfg_with_relay("https://unknown.example/relay");
+        assert!(migrate_legacy_relay(&mut c));
+        assert_eq!(c.provider, "relay-custom");
+        assert_eq!(c.key_for("relay-custom").as_deref(), Some("legacy_key"));
+    }
+
+    #[test]
+    fn migrate_is_idempotent_and_noop_on_new_config() {
+        // 已是多槽（relay-glm）→ 不动，返回 false。
+        let mut c = Config {
+            provider: "relay-glm".into(),
+            ..Default::default()
+        };
+        c.providers.insert(
+            "relay-glm".into(),
+            ProviderCfg {
+                key: "k".into(),
+                base_url: "https://open.bigmodel.cn/api/anthropic".into(),
+                model: "glm-4.6".into(),
+            },
+        );
+        assert!(!migrate_legacy_relay(&mut c));
+        assert_eq!(c.provider, "relay-glm");
+        // 非 relay 配置也不动。
+        let mut d = Config::default();
+        assert!(!migrate_legacy_relay(&mut d));
+        assert_eq!(d.provider, "deepseek");
+    }
+
+    #[test]
+    fn migrate_provider_relay_without_slot_falls_to_deepseek() {
+        // provider=relay 但无 relay 槽（异常残留）→ 落 deepseek，别留非法 provider。
+        let mut c = Config {
+            provider: "relay".into(),
+            ..Default::default()
+        };
+        assert!(migrate_legacy_relay(&mut c));
+        assert_eq!(c.provider, "deepseek");
+    }
 
     #[test]
     fn table_has_five_presets_with_expected_ids() {
