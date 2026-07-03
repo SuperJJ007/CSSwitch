@@ -1,0 +1,35 @@
+# 版本管理
+.git
+.gitignore
+.gitattributes
+.gitmodules
+.gitleaks.toml
+
+# GitHub
+.github
+
+# 运行时
+.sandbox
+.sandbox/
+
+# 项目特有
+findings/
+findings/auto-maint/
+desktop/
+docs/assets/
+node_modules/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# 日志
+*.log
+logs/
+
+# 本地 env（按 .env.example 模板手写，不提交）
+.env
+.env.local
+.env.production
