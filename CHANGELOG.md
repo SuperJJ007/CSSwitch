@@ -4,6 +4,21 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## Unreleased — WSL2 容器化部署
+
+### 新增 Added
+
+- **WSL2 容器化代理部署**（实验性）：将 CSSwitch 翻译代理以 Docker 容器方式部署在 WSL2 中，供 Windows 上的 OpenAI/Anthropic 兼容客户端使用。
+  - `proxy/csswitch_proxy.py` 新增 `--host` / `CSSWITCH_BIND_HOST` 参数，支持绑定 `0.0.0.0` 监听任意地址（默认 `127.0.0.1`）。
+  - `docker/Dockerfile`：基于 `python:3.11-slim`，非 root 运行，零 pip 依赖。
+  - `docker/docker-compose.yml`：proxy 服务编排（env_file、端口映射、健康检查、自动重启、日志卷），可选 Caddy TLS 反代（`--profile tls`）。
+  - `scripts/docker-build.sh` / `scripts/wsl2-deploy.sh` / `scripts/wsl2-stop.sh` / `scripts/wsl2-logs.sh`：WSL2/Linux 容器管理脚本。
+  - `scripts/wsl2-deploy.ps1` / `scripts/wsl2-stop.ps1` / `scripts/wsl2-logs.ps1`：Windows PowerShell 包装，自动探测 WSL2 IP 并输出连接地址。
+  - `docs/wsl2-container-deployment.md`：完整部署指南（前置条件、网络说明、安全提示、故障排查）。
+  - `scripts/doctor.sh` 新增 Docker / docker compose / WSL2 环境检测。
+  - `test/test_container.sh`：可选容器冒烟测试（`RUN_CONTAINER_TESTS=1`）。
+- README 增加 WSL2/Docker 徽章与入口链接。
+
 ## [0.2.0] — 2026-07-03
 
 > 主题：一键**幂等化**——修 #3（运行中再点的分派）与 #6 的「复发」部分（更新后对话「不见」），并随三轮外部复审全面加固代理与进程路径。
