@@ -10,4 +10,6 @@ echo "== bash scripts =="
 bash test/test_scripts.sh
 echo "== bash ops scripts (doctor/verify-proxy/self-test) =="
 bash test/test_ops_scripts.sh
+echo "== container smoke test (RUN_CONTAINER_TESTS=1) =="
+bash test/test_container.sh
 echo "ALL GREEN"
