@@ -522,7 +522,7 @@ fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
                 "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
                 "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
                 "key": config::mask(&p.api_key), "icon": p.icon, "icon_color": p.icon_color,
-                "website_url": p.website_url, "sort_index": p.sort_index,
+                "website_url": p.website_url, "sort_index": p.sort_index, "notes": p.notes,
             })
         })
         .collect();
@@ -1036,15 +1036,21 @@ fn set_active_profile_txn(
             if is_edit {
                 config::write_rolling_backup(&dir).ok(); // 覆盖连接前留底（仅编辑路径需要）
             }
-            config::update(&dir, |c| {
+            if let Err(e) = config::update(&dir, |c| {
                 c.active_id = id.to_string();
                 if let Some(edit) = conn_edit {
                     if let Some(p) = c.profile_by_id_mut(id) {
                         edit.apply(p);
                     }
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            }) {
+                // spec §7 步 5：config 提交失败也要回滚进程——正式代理已起，若不回滚就成「运行新/盘旧」。
+                // 恢复旧 active 代理，active_id 仍为旧值，用户可重试。
+                restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active);
+                return Err(format!(
+                    "校验通过、代理已起，但写盘失败（{e}），已回滚到原配置（沙箱未受影响）。请检查磁盘空间/权限后重试。"
+                ));
+            }
             let hint = if is_edit {
                 format!("已保存并应用「{}」的新连接。", candidate.name)
             } else {
@@ -1927,6 +1933,22 @@ mod tests {
             p.get("api_key").is_none() || p["api_key"].is_null(),
             "全 key 不出后端"
         );
+    }
+
+    #[test]
+    fn get_config_returns_notes_so_rename_does_not_wipe_them() {
+        // M1 回归：build_get_config 必须回传 notes，否则前端读到空、下次改名把备注静默清掉。
+        let d = tmpdir_lib();
+        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, None).unwrap();
+        update_profile_metadata_inner(&d, &id, "GLM", Some("我的备注")).unwrap();
+        let v = build_get_config(&d).unwrap();
+        let p = v["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == id)
+            .unwrap();
+        assert_eq!(p["notes"], "我的备注", "notes 必须随 get_config 回传");
     }
 
     #[test]
