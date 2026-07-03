@@ -2,10 +2,10 @@
 
 本文件记待修队列与近期排期。按用户反馈与自测记录，附根因与方向。
 
-> **排期（用户 2026-07-03）**：**v0.2.0 已发布**（Latest，#3 幂等 forge 毕业 + 三轮外审加固，见 CHANGELOG）。#3 落地同时**阻止 #6 复发**（不再新增孤儿 org）；#6 待 #6b 做完历史恢复才真正修复毕业。**下个主线** = 面板内自定义 OpenAI 兼容端点（文末 roadmap，#4 provider 研究的落地切片）。
+> **排期（用户 2026-07-03）**：**v0.2.1 已发布**（Latest，登录热修：修 0.2.0 两处「一键开始走完仍落登录页」缺陷，见 #7 与 CHANGELOG）。此前 v0.2.0（#3 幂等 forge 毕业 + 三轮外审 + 阻止 #6 复发）。#6 待 #6b 做完历史恢复才真正修复毕业。**下个主线（两条，见文末）** = ① 打开 app 即自动起 Science + 后台常驻（issue #3 原生入口，spec 已写、两轮外审已折入、待复审）；② 面板内自定义 OpenAI 兼容端点。
 
 > **约定**：已修问题发布后从本文件「毕业」到 [`../CHANGELOG.md`](../CHANGELOG.md)。
-> **v0.2.0 已发布**（2026-07-03，Latest）：#3 运行中再点主按钮幂等分派（幂等 forge：org_uuid 只在真首启铸一次、此后 sticky，健康沙箱不重伪造）+ 三轮 GPT 外审加固；同时阻止 #6 复发。此前 v0.1.5（仅 #1 文案脱敏）、v0.1.4（node-ectomy、卡死实机修 403→401、正常窗口去托盘等）见 CHANGELOG。
+> **v0.2.1 已发布**（2026-07-03，Latest）：登录热修（`sandbox_url` 多行 URL 只取首条 + 健康快捷路径先只读校验登录态），见 #7 / CHANGELOG `[0.2.1]`。此前 **v0.2.0**：#3 运行中再点主按钮幂等分派（幂等 forge：org_uuid 只在真首启铸一次、此后 sticky，健康沙箱不重伪造）+ 三轮 GPT 外审 + 阻止 #6 复发。更早 v0.1.5（#1 文案脱敏）、v0.1.4（node-ectomy、卡死实机修 403→401、正常窗口去托盘）见 CHANGELOG。
 
 ## 1. ✅ 对外文案脱敏（已随 v0.1.5 发布，已毕业）
 
@@ -76,12 +76,22 @@
 - **数据都在**：`~/.csswitch/sandbox/home/.claude-science/orgs/<org_uuid>/operon-cli.db`，未丢。
 - **恢复思路（待实机验证）**：把想要的历史 `org_uuid` 写回 `active-org.json`，并令 `.oauth-tokens/*.enc` 里的 `org_uuid` 与之一致，看 Science 是否据此重载旧历史（= #6「未验证（待实机）」那条）。可能需要一个「历史会话」选择 UI（列出 `orgs/` 各库、让用户切换活动组织）。
 - **本轮已埋雏形**：`ensure_virtual_login` 遇「多历史组织但无法定位活动者」会**报恢复错误**并提示用户手动把 `org_uuid` 写回 `active-org.json`——这就是 6b 的人工版最小形态。
-- **优先级**：低于「下个主线（自定义 OpenAI 端点）」，但它是 #6 毕业的前置。
+- **优先级**：低于「下个主线」，但它是 #6 毕业的前置。
+
+## 7. ✅「开了 CSSwitch 仍要登录」登录热修（已随 v0.2.1 发布，已毕业）
+
+> **状态：已随 v0.2.1（2026-07-03，Latest）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.1]`。** 下游 0.2.0 用户反馈「开了 switch、一键开始走完仍要登录」。GPT 两轮诊断 + 对代码逐条核实，锁定 0.2.0 两处缺陷（走 systematic-debugging，test-first 红→绿修复）：
+>
+> - **Bug1 入口 URL 解析**：`claude-science url` 现输出多行（第一行真 URL + 第二行「single-use…」说明），`sandbox_url()`（`lib.rs`）把整段 stdout 当 URL 交 `open` → 换行/说明污染参数、单次性 nonce 未被正确消费 → 落 `/login`（**这条才是用户直接症状**）。修：新增纯函数 `first_http_url()` 只取第一条合法 `http(s)://` URL。
+> - **Bug2 健康快捷路径绕过登录修复**：0.2.0 只要沙箱 daemon 活着就「连 auth 文件都不读」直接重开，导致旧版遗留 / 凭证损坏 / 已落登录页的健康 daemon 永不自愈（0.2.0 引入的分支）。修：健康分支先做**只读**校验 `login_intact`（复用既有 `read_intact_login` 自洽判定）；自洽→只重开（org 不动、旧对话不丢），失效→停沙箱、走 `ensure_virtual_login` 修复保 org + 重启。
+>
+> 各补一条离线回归测试（`first_http_url_*` / `login_intact_*`），`cargo test` 49 全绿、fmt CLEAN、`run_all.sh` ALL GREEN。**更新安全**已用全仓删除路径审计证明「升级不删会话」：无任何生产代码删除 `orgs/`（唯一生产删除=原子写临时文件 + 多余登录 `.enc`；Bug2 修法走保 org 的 `ensure_virtual_login`；stop/launch 脚本零删除）。符合 cc-switch「更新只换 app、不动 `~/.csswitch` 用户数据」的原则。
 
 ---
 
-**下个主线（用户 2026-07-03 定，#1 之后优先做）**：
-- **面板内自定义 OpenAI 兼容端点**：面板里配 base_url / 模型名 / 鉴权头，无需改代码即接任意 OpenAI 兼容上游。它是第 4 条 provider 研究（[`provider-support.md`](provider-support.md)）的**可落地产品化切片**。开工前先走一轮 brainstorming + 设计。
+**下个主线（用户 2026-07-03 定，两条）**：
+- **① 打开 app 即自动起 Science + 后台常驻（issue #3 原生入口 + 配置可见）**：用户 0.2.1 实机时又主动提「一键开始要不要加自动拉起 Science 的逻辑」——正是 issue #3。澄清：`一键开始` 内部**已经**在起沙箱 Science，用户真正要的是「**开 app 就自动起、退后台**」这个触发方式（不再手动点）。设计已成文并锁定：**本地开发文档**（gitignore）`docs/superpowers/specs/2026-07-03-native-entry-and-config-visibility-design.md`，**两轮 GPT 外审已折进、四决策已锁定**（⌘, 菜单 / 关窗≠退出 / 已保存条+打勾 / 存时验启动只查非空）+ 第二轮外审（清 key 按运行中 provider 判、`validate_and_save` 事务化、生命周期串行器 + generation token、清除确认）。**尚未写实现计划、尚未写代码。** 切三片：**A** 配置可见 + 清 key 运行态撤销 + `validate_and_save` 事务化 + 串行器最小核心；**B** boot 协调器 + 后台常驻 + 单实例 + ⌘, 菜单 + 关窗≠退出 + `visible=false`（自动起就在这片）；**C** WKWebView spike 门控的 app 窗口。轻量版（启动钩子后台调 `one_click_login`）可先尝鲜。**下一步 = 用户复审 spec → `superpowers:writing-plans`（A/B/C 一份计划、A→B→C 执行验收）。**
+- **② 面板内自定义 OpenAI 兼容端点**：面板里配 base_url / 模型名 / 鉴权头，无需改代码即接任意 OpenAI 兼容上游。它是第 4 条 provider 研究（[`provider-support.md`](provider-support.md)）的**可落地产品化切片**。开工前先走一轮 brainstorming + 设计。
 
 **其它 roadmap（非 bug）**：
 - **python-ectomy**：翻译代理移到 Rust（axum），拔掉 python（node 已在 v0.1.4 拔除），最终零外部运行时。
