@@ -187,12 +187,15 @@ mod tests {
 
     #[test]
     fn two_picks_are_bindable() {
-        // 分配的端口应可再次 bind（证明已释放，临时代理能用）。
+        // pick_scratch_port 内部 bind :0 后 drop listener 释放端口，返回的端口应可再次 bind
+        // （证明本 fn 未持有它，临时代理稍后能绑）。并行测试下另一个分配器可能抢走刚释放的
+        // 端口（OS 端口重绑 race），故重试几次：只要有一次能再 bind 即证明端口确被释放；若
+        // pick_scratch_port 真持有端口（bug），所有重试都会失败 → 仍被捕获。
         use std::net::TcpListener;
-        let p = pick_scratch_port().unwrap();
-        assert!(
-            TcpListener::bind(("127.0.0.1", p)).is_ok(),
-            "端口应已释放可再 bind"
-        );
+        let rebound = (0..8).any(|_| {
+            let p = pick_scratch_port().unwrap();
+            TcpListener::bind(("127.0.0.1", p)).is_ok()
+        });
+        assert!(rebound, "pick_scratch_port 返回的端口应已释放、可再 bind");
     }
 }
