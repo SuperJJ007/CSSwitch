@@ -10,84 +10,107 @@
 
 # CSSwitch
 
-[Claude Science](https://claude.com) 是一套 **AI agent 原生的科研平台**：从查找、分析文献，到科研数据分析，再到图片与文章制作，全流程打通。
+[Claude Science](https://claude.com) 是 Anthropic 推出的 AI Agent 科研平台，可以协助完成文献检索与分析、数据处理、图表生成和论文写作等工作。
 
-CSSwitch 让你**无需 Claude 订阅**也能用上它：填入你自选的第三方 API（DeepSeek、通义千问，或任意 OpenAI 兼容端点）即可。Science 那套 AI agent 科研体验照旧，底层模型换成你自己的。类比 CC Switch 之于 Claude Code。
+CSSwitch 让你不必订阅 Claude，也能在 Science 中使用自己的第三方模型。填入 API Key，选择服务商，剩下的交给 CSSwitch。简单来说，它之于 Claude Science，就像 CC Switch 之于 Claude Code。
 
 ## 背景
 
-Claude Science 的登录只是**启动门票**：登录后推理请求打到哪，由环境变量 `ANTHROPIC_BASE_URL` 决定。CSSwitch 把它指向本地一个翻译代理，代理剥掉 Science 带来的 OAuth、换成你的第三方 key、按需翻译协议，最终打到你选的模型。登录门则在**隔离沙箱**里写一份本地自造的虚拟 OAuth 越过，全程不碰真实登录、零真实凭证。
+Science 需要登录才能正常启动，但启动之后，推理请求发往哪里由环境变量 `ANTHROPIC_BASE_URL` 决定。
+
+CSSwitch 会把这个地址指向本地代理。代理收到请求后，会移除 Science 附带的 OAuth 信息，换成你的第三方 API Key；如果服务商使用不同的接口格式，代理还会负责协议转换，最后把请求发给你选择的模型。
+
+Science 启动所需的登录状态则由 CSSwitch 在隔离环境中生成。这套本地登录只负责让 Science 启动，不参与后续推理，也不会接触你真实的 Claude 登录信息。
 
 ```
-Claude Science（沙箱 · 虚拟登录）
+Claude Science（隔离环境 · 本地登录）
    │  ANTHROPIC_BASE_URL=http://127.0.0.1:<port>/<secret>
    ▼
-csswitch_proxy.py（本地翻译代理：剥离入站 Bearer、注入你的第三方 key）
+csswitch_proxy.py（移除原有凭证、注入第三方 Key、按需转换协议）
    ▼
 DeepSeek 原生 Anthropic 端点  /  通义千问等 OpenAI 兼容端点
 ```
 
-## 特性（安全 · 易用）
+## 致谢
 
-**易用**
+CSSwitch 的名字和产品形态参考了 [CC Switch](https://github.com/farion1231/cc-switch)，后者是一款使用 Tauri 和 Rust 开发的 Claude Code API 服务商切换工具。CSSwitch 的部分交互设计也借鉴了 CC Switch，在此表示感谢。两个项目彼此独立，不存在从属或背书关系。
 
-- **开箱即用**：一个 macOS 桌面 app 把一切串好。你只需填入自己的第三方 API key，点「一键开始」，浏览器自动打开已登录的 Science。**零 node 运行时依赖**：虚拟登录已是 Rust 原生实现，装了就能用，不再要求本机有 node。
-- **自选模型**：DeepSeek、通义千问，或任意 OpenAI 兼容端点，面板里随时切换。
-- **第三方 / 官方一键切换**：有 Claude 订阅、想走官方时，面板顶部切到「官方 Claude」即可干净交回你真实的 Science 与订阅（CSSwitch 不插手你的官方登录、也不起代理与沙箱）。
-- **原生保真**：DeepSeek 走原生 Anthropic 端点，thinking 与工具调用不失真。
+## 特性
 
-**安全（绝不影响你真实的 Claude 登录与订阅）**
+### 省心好用
 
-- **零真实凭证**：登录用本地自造的虚拟 OAuth，绝不复制、不修改、不删除你真实的 `~/.claude-science`。
-- **与真实实例隔离**：沙箱用独立 HOME、独立端口、独立 data-dir，真实实例（端口 8765）零影响；脚本对真实目录与 8765 做失败关闭护栏。
-- **密钥只在本地**：0600 存 `~/.csswitch`，经环境变量注入子进程（绝不进命令行与日志），界面只回显末 4 位掩码；入站 `Authorization` / `x-api-key` 一律剥离不转发；代理只监听回环地址并做路径 secret 鉴权。
+- **装好就能用**：填入第三方 API Key，点击「一键开始」，CSSwitch 会自动启动代理和隔离环境，并打开已经完成本地登录的 Science。虚拟登录由 Rust 原生实现，不需要另外安装 Node.js。
+- **重复点击也不会打乱状态**：「一键开始」会先检查当前运行状态。窗口关了就重新打开，代理停了就重启代理，隔离环境没启动就补上。它不会反复生成登录身份，也不会把正在使用的会话切换到其他组织。发现连接异常时，还会先检查并尝试自动恢复。
+- **随时切回官方 Claude**：如果你有 Claude 订阅，可以在面板顶部切换到「官方 Claude」。切换后，CSSwitch 不会再启动代理或隔离环境，也不会干预你的官方登录。
+- **保留模型原生能力**：DeepSeek 通过原生 Anthropic 端点接入，不需要额外转换协议，可以更完整地保留 Thinking 和工具调用等能力。
+- **保存 Key 时立即验证**：每次保存第三方 API Key，CSSwitch 都会发送一条最小请求进行验证。Key 有问题会当场提示，不必等到正式使用时才发现。
+- **方便检查更新**：可以从面板直接打开 GitHub Releases，查看和下载新版本。
+
+### 与真实账号隔离
+
+- **不读取真实登录凭证**：Science 启动所需的登录状态由 CSSwitch 在本地生成。你的 `~/.claude-science` 不会被复制、修改或删除。
+- **不干扰真实 Science**：隔离环境拥有独立的 HOME、端口和数据目录，不会占用真实 Science 使用的 8765 端口。程序也为真实数据目录和端口设置了保护措施，一旦发现可能发生冲突，就会停止操作。
+- **API Key 只保存在本机**：密钥以 `0600` 权限保存在 `~/.csswitch`，并通过环境变量传给子进程，不会写入命令行参数或日志。界面只显示经过遮盖的末四位。
+- **代理只接受本机请求**：代理仅监听回环地址，并通过路径 Secret 验证请求。传入请求中的 `Authorization` 和 `x-api-key` 会先被移除，不会被原样转发给第三方服务商。
+
+## 支持的第三方 API
+
+目前可以在面板中选择以下两家服务商：
+
+| Provider | 接入方式 | 说明 |
+|---|---|---|
+| **DeepSeek**（默认） | 原生 Anthropic 端点 | 无需转换协议，可保留 Thinking 和工具调用 |
+| **通义千问（Qwen）** | 阿里云 DashScope 的 OpenAI 兼容端点 | 由本地代理转换 Anthropic 与 OpenAI 协议 |
+
+Kimi、智谱 GLM、OpenRouter 等服务商，以及自定义 OpenAI 兼容端点，目前还没有加入正式版本，相关计划见下方「更新计划」。
 
 ## 快速开始
 
-**前置**：装好 [Claude Science](https://claude.com)，本机有 `python3`（虚拟登录已是 Rust 原生实现，**不再需要 node**）。
+开始之前，请先安装 [Claude Science](https://claude.com)，并确认系统中有 `python3`。虚拟登录已经由 Rust 原生实现，**不需要安装 Node.js**。
 
-1. 下载最新 [Release](../../releases/latest) 里的 `CSSwitch_*.dmg`，拖进「应用程序」。首次打开**右键 →「打开」**（未公证，属正常，见下）。
-2. 打开 CSSwitch，弹出一个正常窗口（可拖动 / 缩放 / 最小化）。保持顶部「**第三方模型**」，选 provider，**粘贴你自己的第三方 API key**（只存本地 `~/.csswitch/config.json`，0600）。
-3. 点「**一键开始**」。它会自动起代理、写虚拟登录、起隔离沙箱、开浏览器打开已登录的 Science。完事，开始用。
+1. 从最新的 [Release](../../releases/latest) 下载 `CSSwitch_*.dmg`，然后把 CSSwitch 拖入「应用程序」。由于当前版本尚未经过 Apple 公证，第一次启动时请右键应用并选择「打开」。
+2. 打开 CSSwitch，保持顶部选择「**第三方模型**」，选择服务商，然后粘贴自己的第三方 API Key。密钥只会保存在本机的 `~/.csswitch/config.json` 中，文件权限为 `0600`。
+3. 点击「**一键开始**」。CSSwitch 会依次启动代理、写入本地登录状态、启动隔离环境，并在浏览器中打开 Science。
 
-> 你唯一要提供的就是**你自己的第三方 API key**（你付费的 key，无法内置到 app 里）。其余全自动。
+> 你只需要准备自己的第三方 API Key，其余步骤由 CSSwitch 自动完成。
 >
-> **首次打开被 Gatekeeper 拦是正常的**：本 app 做了 ad-hoc 签名但未做 Apple 公证。右键 →「打开」，或到系统设置 → 隐私与安全性 →「仍要打开」。目前仅 arm64（Apple Silicon）。
+> 如果应用被 Gatekeeper 拦截，可以右键选择「打开」，或者前往「系统设置 → 隐私与安全性」并点击「仍要打开」。当前版本仅支持 Apple Silicon（arm64）。
 
-开发者的命令行用法（手动起代理与沙箱）、构建与测试，见 [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) 与 [`desktop/README.md`](./desktop/README.md)。
+命令行用法、构建和测试步骤见 [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) 与 [`desktop/README.md`](./desktop/README.md)。各版本的具体变化见 [`CHANGELOG.md`](./CHANGELOG.md)。
 
 ## 更新计划（Roadmap）
 
-以下为规划方向，不代表时间承诺。欢迎以 issue / PR 参与共建。
+以下内容是后续计划，不代表已经上线，也不构成时间承诺。欢迎通过 Issue 或 PR 参与完善。
 
 **更广泛的模型与 API 支持**
 
-- 内建更多第三方 provider：Kimi（Moonshot）、智谱 GLM、OpenRouter、本地 Ollama 等。
-- 面板内直接配置任意 OpenAI 兼容端点（自定义 `base_url`、模型名、鉴权头），无需改代码。
-- 每个 provider 的模型映射与选择器展示可在界面里编辑。
+- 支持更多第三方服务商，包括 Kimi（Moonshot）、智谱 GLM、OpenRouter 和本地 Ollama 等。
+- 直接在面板中配置任意 OpenAI 兼容端点，包括 `base_url`、模型名称和鉴权请求头，无需修改代码。
+- 在界面中编辑各服务商的模型映射和展示名称。
 
 **多学科的 Skill / MCP 支持**
 
-- 面向社会学、政治学、计算机科学等多学科，整理开箱即用的 Skill 与 MCP 服务器清单。
-- 学科工具包一键装配：统计分析、文献抓取、数据可视化、问卷与量表处理等。
-- 与 Science 的工具调用、代码执行打通，形成各学科的研究工作流模板。
+- 面向社会学、政治学和计算机科学等学科，整理开箱即用的 Skill 与 MCP 服务器清单。
+- 提供可以一键配置的学科工具包，覆盖统计分析、文献获取、数据可视化和问卷量表处理等工作。
+- 结合 Science 的工具调用和代码执行能力，为不同学科提供研究工作流模板。
 
 **体验与工程**
 
-- Qwen 走真流式翻译，降低首 token 延迟（DeepSeek 已是原生透传真流式）。
-- 继续收敛运行时依赖：把翻译代理移到 Rust（axum）以拔掉 python（虚拟登录的 node 依赖已在 v0.1.4 拔除），最终做到零外部运行时。
-- Intel（x86_64）与 universal 构建；可选的正式签名与 Apple 公证。
-- 面板增加日志查看、用量统计、更快的 provider 切换入口。
+- 为 DeepSeek 增加工具调用兜底。少数情况下，DeepSeek 会把工具调用作为普通文本返回，导致 Science 无法继续执行；相关方案正在验证，目前默认关闭。
+- 为 Qwen 实现真正的流式协议转换，缩短首个 Token 的等待时间。DeepSeek 当前已经采用原生流式透传。
+- 继续减少运行时依赖：计划使用 Rust（axum）重写代理并移除 Python。虚拟登录对 Node.js 的依赖已在 v0.1.4 中移除。
+- 提供 Intel（x86_64）和 Universal 构建，并评估正式签名与 Apple 公证。
+- 在面板中加入日志查看、用量统计和更快捷的服务商切换入口。
 
 ## 反馈与报错
 
-遇到问题或有想法，欢迎在 GitHub 提交（比私信更利于跟踪与复用）：
+遇到问题或有新的想法，欢迎在 GitHub 提交反馈，方便持续跟踪和集中讨论：
 
-- **报 bug**：[新建 Bug 反馈](https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml)，或面板右下角「反馈 / 报 bug」直接跳转。
-- **提功能 / 想支持的 API**：[新建功能建议](https://github.com/SuperJJ007/CSswitch/issues/new?template=feature_request.yml)。
-- **附日志更快定位**：面板「日志」链接会打开 `~/.csswitch/logs/`（`proxy.log`、`sandbox.log`）。**贴之前务必先删掉任何 API key / 令牌。**
+- **报告问题**：[新建 Bug 反馈](https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml)，也可以点击面板右下角的「反馈 / 报 bug」。
+- **提出功能建议**：[新建功能建议](https://github.com/SuperJJ007/CSswitch/issues/new?template=feature_request.yml)，告诉我们你希望支持的模型或 API。
+- **附上日志**：面板中的「日志」链接会打开 `~/.csswitch/logs/`，其中包含 `proxy.log` 和 `sandbox.log`。日志可以帮助定位问题，但**提交前请务必删除其中的 API Key 和令牌**。
 
-隐私：本项目**不含任何自动遥测 / 崩溃上报**，不会在后台把你的数据发给任何人。所有反馈都由你手动提交、内容由你决定。
+CSSwitch 不包含自动遥测或崩溃上报，也不会在后台上传你的数据。只有你主动提交的反馈，才会离开本机。
 
 <p align="center">
   <img src="docs/assets/wechat-group.jpg" alt="CSSwitch 微信群" width="420">
@@ -95,13 +118,13 @@ DeepSeek 原生 Anthropic 端点  /  通义千问等 OpenAI 兼容端点
 
 ## 风险与免责声明
 
-- 本项目仅供**个人学习与研究**用途，**使用者自负风险**。
-- 推理请求经本地代理直连你自己付费的第三方模型，**不经过 Anthropic 服务端**做推理，用的是本地自造的虚拟登录，**零真实 Anthropic 凭证**。
-- Science 在**启动阶段**仍会尝试访问其硬编码的 profile / account 接口（`api.anthropic.com` / `claude.ai`）；代理对这些请求即时短路（返回「未登录」），Science 以未登录态正常启动、不影响第三方推理。因此本项目**不宣称**「完全零 Anthropic 接触」这类绝对说法。
-- 虚拟登录下，**Anthropic 托管的远程 MCP 服务**（如 pubmed / clinical-trials / chembl / biorxiv，位于 `*.mcp.claude.com`）不可用：它们需真实 Anthropic 授权，代理已将其短路，Science 会自动跳过（启动日志有 `load failed (skipped)` 属正常）。**本地内置的 bio-tools MCP 仍正常可用。**
-- 对 Science 登录令牌加密格式的逆向、以及「越过登录」的实现，可能触及相关服务条款与版权法规（如美国 DMCA §1201 反规避条款）。是否适用、有无豁免需专业法律判断。
-- 本项目与 Anthropic **无任何从属、合作或背书关系**；不偷取算力（推理走你自付第三方）、不泄露用户密钥、不含恶意代码。
-- 软件按「现状」提供，**不提供任何形式的担保**。
+- 本项目仅供**个人学习与研究**使用，使用风险由用户自行承担。
+- 推理请求会通过本地代理发送到你自行付费的第三方模型，**不使用 Anthropic 的推理服务**。用于启动 Science 的登录状态在本地生成，不包含真实的 Anthropic 凭证。
+- Science 启动时仍会尝试访问内置的 Profile 和 Account 接口（`api.anthropic.com`、`claude.ai`）。代理会直接终止这些请求并返回「未登录」，因此这里不使用「完全不接触 Anthropic」之类的绝对表述。
+- 使用本地登录时，Anthropic 托管的远程 MCP 服务无法使用，包括 `pubmed`、`clinical-trials`、`chembl` 和 `biorxiv` 等位于 `*.mcp.claude.com` 的服务。这些服务需要真实的 Anthropic 授权，Science 会在加载失败后自动跳过；日志中出现 `load failed (skipped)` 属于正常现象。**本地内置的 bio-tools MCP 不受影响。**
+- 对 Science 登录令牌加密格式的分析，以及在本地生成登录状态的实现，可能涉及相关服务条款和版权法规，例如美国《数字千年版权法》DMCA §1201。具体规定是否适用、是否存在豁免，应由专业人士判断。
+- 本项目与 Anthropic **不存在从属、合作或背书关系**。推理费用由用户向所选的第三方服务商支付。
+- 软件按「现状」提供，**不作任何形式的担保**。
 
 ## 许可
 
