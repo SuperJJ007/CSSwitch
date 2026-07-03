@@ -6,6 +6,7 @@
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
   <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-1d1d1f.svg" alt="macOS">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
+  <img src="https://img.shields.io/badge/WSL2%20%7C%20Docker-2496ED.svg?logo=docker" alt="WSL2 / Docker">
 </p>
 
 # CSSwitch
@@ -55,6 +56,8 @@ DeepSeek 原生 Anthropic 端点  /  通义千问等 OpenAI 兼容端点
 > **首次打开被 Gatekeeper 拦是正常的**：本 app 做了 ad-hoc 签名但未做 Apple 公证。右键 →「打开」，或到系统设置 → 隐私与安全性 →「仍要打开」。目前仅 arm64（Apple Silicon）。
 
 开发者的命令行用法（手动起代理与沙箱）、构建与测试，见 [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) 与 [`desktop/README.md`](./desktop/README.md)。
+
+**Windows / WSL2 用户**：可将 CSSwitch 翻译代理以 Docker 容器方式部署在 WSL2 中，供 Windows 上的 OpenAI/Anthropic 兼容客户端使用。见 [`docs/wsl2-container-deployment.md`](./docs/wsl2-container-deployment.md)（实验性）。
 
 ## 更新计划（Roadmap）
 
