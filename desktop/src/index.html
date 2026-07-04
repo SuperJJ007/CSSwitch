@@ -51,7 +51,8 @@
         <div class="hint" id="wizBaseHint"></div>
         <label style="margin-top:10px" id="wizModelLabel">模型</label>
         <div id="wizModelInfo" class="modelinfo" hidden></div>
-        <select id="wizModel" aria-labelledby="wizModelLabel"></select>
+        <input id="wizModel" list="wizModelList" aria-labelledby="wizModelLabel" autocomplete="off" spellcheck="false" />
+        <datalist id="wizModelList"></datalist>
         <div class="hint" id="wizModelHint"></div>
         <label style="margin-top:10px" for="wizKey">API Key / Token</label>
         <input id="wizKey" type="password" placeholder="粘贴 key（只存本地）" autocomplete="off" spellcheck="false" />
@@ -73,7 +74,8 @@
         <div class="hint" id="connBaseHint"></div>
         <label style="margin-top:10px" id="connModelLabel">模型</label>
         <div id="connModelInfo" class="modelinfo" hidden></div>
-        <select id="connModel" aria-labelledby="connModelLabel"></select>
+        <input id="connModel" list="connModelList" aria-labelledby="connModelLabel" autocomplete="off" spellcheck="false" />
+        <datalist id="connModelList"></datalist>
         <div class="hint" id="connModelHint"></div>
         <label style="margin-top:10px" for="connKey">API Key / Token</label>
         <input id="connKey" type="password" autocomplete="off" spellcheck="false" />

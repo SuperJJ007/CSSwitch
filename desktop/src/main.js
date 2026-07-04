@@ -19,12 +19,12 @@ const invoke = PREVIEW
 // ── 预览兜底 mock（仅浏览器预览用；node --check 只验语法，真实 app 走真后端） ──
 const MOCK_TEMPLATES = [
   { id: "deepseek", name: "DeepSeek", category: "cn_official", api_format: "anthropic", adapter: "deepseek", base_url: "https://api.deepseek.com/anthropic", base_url_editable: false, requires_model_override: false, builtin_models: ["claude-opus-4-8", "claude-haiku-4-5"], icon: "deepseek", icon_color: "#1E88E5", website_url: "https://platform.deepseek.com" },
-  { id: "glm", name: "智谱 GLM", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://open.bigmodel.cn/api/anthropic", base_url_editable: true, requires_model_override: false, builtin_models: ["glm-4.6", "glm-5", "glm-4.5-air"], icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn" },
+  { id: "glm", name: "智谱 GLM", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://open.bigmodel.cn/api/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["glm-5.2", "glm-4.7", "glm-4.6", "glm-4.5-air"], icon: "glm", icon_color: "#2E6BE6", website_url: "https://open.bigmodel.cn" },
   { id: "xiaomi", name: "小米 MiMo", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.xiaomimimo.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["mimo-v2.5-pro"], icon: "xiaomi", icon_color: "#FF6900", website_url: "https://xiaomimimo.com" },
-  { id: "siliconflow", name: "硅基流动", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.siliconflow.cn", base_url_editable: true, requires_model_override: true, builtin_models: ["deepseek-ai/DeepSeek-V3", "zai-org/GLM-5.2"], icon: "siliconflow", icon_color: "#7C3AED", website_url: "https://siliconflow.cn" },
-  { id: "kimi", name: "Kimi（Moonshot）", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.moonshot.cn/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"], icon: "kimi", icon_color: "#16182F", website_url: "https://platform.moonshot.cn" },
-  { id: "minimax", name: "MiniMax", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.minimaxi.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["MiniMax-M2.7", "MiniMax-M3"], icon: "minimax", icon_color: "#E1341E", website_url: "https://platform.minimaxi.com" },
-  { id: "openrouter", name: "OpenRouter", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "https://openrouter.ai/api", base_url_editable: true, requires_model_override: false, builtin_models: ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4.8-fast"], icon: "openrouter", icon_color: "#6467F2", website_url: "https://openrouter.ai" },
+  { id: "siliconflow", name: "硅基流动", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.siliconflow.cn", base_url_editable: true, requires_model_override: true, builtin_models: ["deepseek-ai/DeepSeek-V4-Pro", "deepseek-ai/DeepSeek-V4-Flash", "deepseek-ai/DeepSeek-V3.2", "zai-org/GLM-5.2"], icon: "siliconflow", icon_color: "#7C3AED", website_url: "https://siliconflow.cn" },
+  { id: "kimi", name: "Kimi（Moonshot）", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.moonshot.cn/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"], icon: "kimi", icon_color: "#16182F", website_url: "https://platform.moonshot.cn" },
+  { id: "minimax", name: "MiniMax", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.minimaxi.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"], icon: "minimax", icon_color: "#E1341E", website_url: "https://platform.minimaxi.com" },
+  { id: "openrouter", name: "OpenRouter", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "https://openrouter.ai/api", base_url_editable: true, requires_model_override: true, builtin_models: ["anthropic/claude-sonnet-5", "anthropic/claude-opus-4.8", "anthropic/claude-opus-4.8-fast"], icon: "openrouter", icon_color: "#6467F2", website_url: "https://openrouter.ai" },
   { id: "qwen", name: "通义千问", category: "cn_official", api_format: "openai_chat", adapter: "qwen", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", base_url_editable: false, requires_model_override: false, builtin_models: ["qwen-max", "qwen-plus", "qwen-turbo"], icon: "qwen", icon_color: "#615CED", website_url: "https://dashscope.aliyun.com" },
   { id: "custom", name: "自定义", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], icon: "custom", icon_color: "#6B7280", website_url: "" },
 ];
@@ -161,30 +161,29 @@ const MODEL_HINT = {
 // （避免保存时被空值覆盖，守「零运行语义变化」）；relay：走下拉。
 function applyModelCapability(t, ui, currentModel) {
   const cap = modelCapability(t);
+  const listId = ui.sel.getAttribute("list");
+  const dl = listId && document.getElementById(listId);
   if (cap === CAP.NATIVE) {
+    // native：控件隐藏，保留 profile 既有 model（connSave/wizSave 读回原值不清空），不写回任何默认/壳。
     ui.info.textContent = MODEL_HINT.native;
     ui.info.hidden = false;
     ui.sel.hidden = true;
-    ui.sel.innerHTML = "";
-    if (currentModel) {               // 保留既有 model：隐藏下拉持有原值，connSave 读回原值不清空（修 P1）
-      const o = document.createElement("option");
-      o.value = currentModel; o.textContent = currentModel;
-      ui.sel.appendChild(o);
-      ui.sel.value = currentModel;
-    }
+    ui.sel.value = currentModel || "";
+    if (dl) dl.innerHTML = "";
     if (ui.fetchBtn) ui.fetchBtn.hidden = true;
     ui.hint.textContent = "";
     return cap;
   }
+  // relay（FIXED）：input + datalist 候选（内置精选 + 可自填）；预填旗舰默认或既有值。
   ui.info.hidden = true;
   ui.sel.hidden = false;
   if (ui.fetchBtn) ui.fetchBtn.hidden = false;
   const builtin = ((t && t.builtin_models) || []).slice();
   if (currentModel && !builtin.includes(currentModel)) builtin.unshift(currentModel);
   const models = builtin.map((id) => ({ id, supports_tools: null }));
-  renderModelSelect(ui.sel, models, cap === CAP.FIXED, "内置");
-  ui.sel.value = currentModel || (cap === CAP.FIXED && ui.sel.options[0] ? ui.sel.options[0].value : "");
-  ui.hint.textContent = cap === CAP.FIXED ? MODEL_HINT.fixed : MODEL_HINT.follow;
+  renderModelOptions(ui.sel, models, "内置");
+  ui.sel.value = currentModel || (builtin[0] || "");
+  ui.hint.textContent = MODEL_HINT.fixed;
   return cap;
 }
 
@@ -412,33 +411,33 @@ async function persistPorts() {
 }
 
 // ── 模型下拉渲染（requires_override=false 时首项「跟随 Science 选择器」；按 supports_tools 标注）──
-function renderModelSelect(sel, models, requiresOverride, sourceLabel) {
-  sel.innerHTML = "";
-  if (!requiresOverride) {
-    const o = document.createElement("option");
-    o.value = "";
-    o.textContent = "跟随 Science 选择器";
-    sel.appendChild(o);
-  }
+// 候选填进 input 关联的 <datalist>（下拉建议）；input 的值由调用方另设，用户可自由改。
+function renderModelOptions(sel, models, sourceLabel) {
+  const listId = sel.getAttribute("list");
+  const dl = listId && document.getElementById(listId);
+  if (!dl) return;
+  dl.innerHTML = "";
   for (const m of models || []) {
     const o = document.createElement("option");
     o.value = m.id;
     const tag = m.supports_tools === true ? " ·工具✓" : m.supports_tools === false ? " ·无工具" : "";
     const src = sourceLabel ? " [" + sourceLabel + "]" : "";
-    o.textContent = m.id + tag + src;
-    sel.appendChild(o);
+    o.label = m.id + tag + src;
+    dl.appendChild(o);
   }
 }
 
-// fetch_models 返回体 → 渲染下拉 + 提示（向导与连接编辑共用）。
+// fetch_models 返回体 → 刷新 datalist 候选 + 提示（向导与连接编辑共用）。
+// requiresOverride 保留形参（调用点仍传），但 datalist 无「跟随」空项，故此处不用。
 function applyFetchResult(sel, requiresOverride, r) {
+  void requiresOverride;
   const models = (r && r.models) || [];
   const src = r && r.source;
   // unsupported（端点不提供发现，4xx）与 builtin（200 但空）都铺内置，标「内置」；network/未知标「未验证」。
   const srcLabel = src === "live" ? "实时" : src === "builtin" || src === "unsupported" ? "内置" : "未验证";
   const prev = sel.value;
-  renderModelSelect(sel, models, requiresOverride, srcLabel);
-  if (prev && models.some((m) => m.id === prev)) sel.value = prev;
+  renderModelOptions(sel, models, srcLabel);
+  if (prev) sel.value = prev; // 保留用户已填/已选值，拉列表只刷新候选、绝不清空输入
   if (src === "unsupported") {
     // 端点未提供 /v1/models（如 Kimi）：内置模型可直接选，绝不表述成 key 无效。
     setMsg("该端点未提供模型列表，已用内置模型（可直接选择保存）。", "ok");
