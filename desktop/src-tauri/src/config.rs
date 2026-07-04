@@ -55,6 +55,11 @@ pub struct Config {
     /// 官方模式下 CSSwitch 只负责把你交回真实客户端，绝不碰/托管你的官方登录。
     #[serde(default = "default_mode")]
     pub mode: String,
+    /// CONNECT 隧道上游代理（host:port，如 "127.0.0.1:7890"）。非空时非 Anthropic 域的
+    /// HTTPS CONNECT 隧道经此代理而非直连目标，解决 MCP 外部数据库（PubMed/ChEMBL 等）
+    /// 在国内直连不可达的问题（#11）。
+    #[serde(default)]
+    pub upstream_proxy: String,
     #[serde(default)]
     pub providers: BTreeMap<String, ProviderCfg>,
 }
@@ -67,6 +72,7 @@ impl Default for Config {
             sandbox_port: default_sandbox_port(),
             secret: String::new(),
             mode: default_mode(),
+            upstream_proxy: String::new(),
             providers: BTreeMap::new(),
         }
     }

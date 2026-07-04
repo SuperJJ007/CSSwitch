@@ -13,8 +13,10 @@
 #   - encryption.key 的 keychain 镜像账号按【路径哈希】派生，沙箱与真实天然隔离
 #
 # 用法:
-#   先起代理: DEEPSEEK_API_KEY=... python3 proxy/csswitch_proxy.py --provider deepseek --port 18991
-#   再起沙箱: scripts/launch-virtual-sandbox.sh [--port 8990] [--proxy-url http://127.0.0.1:18991]
+#   先起代理: DEEPSEEK_API_KEY=... python3 proxy/csswitch_proxy.py --provider deepseek --port 18991 \
+#              [--upstream-proxy 127.0.0.1:7890]
+#   再起沙箱: scripts/launch-virtual-sandbox.sh [--port 8990] [--proxy-url http://127.0.0.1:18991] \
+#              [--upstream-proxy http://127.0.0.1:7890]
 set -euo pipefail
 
 PROJ="${0:A:h:h}"
@@ -24,6 +26,7 @@ REAL_DIR="$HOME/.claude-science"
 BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
 PORT=8990
 PROXY_URL="http://127.0.0.1:18991"
+UPSTREAM_PROXY=""   # 上游代理（如 Clash 7890），修 #11：MCP 外部数据库连通
 EMAIL="virtual@localhost.invalid"
 DRY_RUN=0
 SKIP_FORGE=0   # app 调用时置 1：OAuth 由 app 进程内 Rust 伪造，本脚本不再调 node
@@ -32,6 +35,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --port) PORT="$2"; shift 2;;
     --proxy-url) PROXY_URL="$2"; shift 2;;
+    --upstream-proxy) UPSTREAM_PROXY="$2"; shift 2;;
     --email) EMAIL="$2"; shift 2;;
     --dry-run) DRY_RUN=1; shift;;
     --skip-oauth-forge) SKIP_FORGE=1; shift;;
@@ -102,18 +106,25 @@ echo "  账号     = $EMAIL （本地假账号，不用真实凭证）"
 # 在到不了 claude.ai 的网络上会挂住重试 → UI 卡在 "Switching organization"。
 # 做法：**只设 https_proxy**（那条卡死的 profile 请求是 HTTPS → 走 CONNECT，代理的
 # do_CONNECT 对上述域名立即 403，operon 秒判 logged-out 秒过；其余 HTTPS 隧道透传）。
-# 【刻意不设 http_proxy】：代理未实现普通 HTTP 转发（GET http://host/…），若设了 http_proxy
-# 普通 HTTP 的 MCP/下载/包源会撞代理拿 404（修 P2）；不设则普通 HTTP 直连或走用户自己的
-# http_proxy，且无 Anthropic 域名走普通 HTTP，故不影响 fast-fail。
 # no_proxy 让本地推理仍直连 127.0.0.1（operon 认【小写】 https_proxy/no_proxy）。
+# 【修 #11】：若指定了 --upstream-proxy，则同时设 http_proxy 指向上游代理，
+# 解决 MCP 外部数据库（PubMed/ChEMBL 等）的 HTTP 请求国内直连不可达问题。
+# HTTPS 的 MCP 请求仍走 CSswitch 代理的 CONNECT 隧道（配合代理的 --upstream-proxy 参数）。
 _PROXY_HOSTPORT="$(printf '%s' "$PROXY_URL" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://([^/]+).*#\1#')"
 _FASTFAIL_PROXY="http://$_PROXY_HOSTPORT"
 _NO_PROXY="127.0.0.1,localhost,::1"
 echo "  外联防卡 = Anthropic HTTPS fast-fail（经 $_FASTFAIL_PROXY，no_proxy=$_NO_PROXY）"
+if [[ -n "$UPSTREAM_PROXY" ]]; then
+  echo "  上游代理 = $UPSTREAM_PROXY（MCP 外部数据库 / 包源走此通道）"
+  _HTTP_PROXY="$UPSTREAM_PROXY"
+else
+  _HTTP_PROXY=""
+fi
 echo
 
 HOME="$SANDBOX_HOME" \
 ANTHROPIC_BASE_URL="$PROXY_URL" \
+http_proxy="${_HTTP_PROXY:-}" HTTP_PROXY="${_HTTP_PROXY:-}" \
 https_proxy="$_FASTFAIL_PROXY" HTTPS_PROXY="$_FASTFAIL_PROXY" \
 no_proxy="$_NO_PROXY" NO_PROXY="$_NO_PROXY" \
 "$BIN" serve \

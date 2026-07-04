@@ -267,14 +267,20 @@ fn ensure_proxy(
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-        let child = Command::new(&py)
-            .arg(&script)
+        let mut cmd = Command::new(&py);
+        cmd.arg(&script)
             .arg("--provider")
             .arg(&provider)
             .arg("--port")
             .arg(port.to_string())
             .arg("--auth-token")
-            .arg(&secret)
+            .arg(&secret);
+        // 上游代理（修 #11）：非空时传给代理的 --upstream-proxy，
+        // 使非 Anthropic 域的 CONNECT 隧道经此代理出墙（MCP 外部数据库连通）。
+        if !cfg.upstream_proxy.is_empty() {
+            cmd.arg("--upstream-proxy").arg(&cfg.upstream_proxy);
+        }
+        let child = cmd
             // key 经环境变量注入，绝不作为命令行参数（避免 ps 泄露）。
             .env(key_env(&provider), &key)
             .stdout(Stdio::from(logf))

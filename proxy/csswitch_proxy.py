@@ -93,6 +93,7 @@ KEY = None       # 当前 provider 的 key，只驻内存
 LOG = None
 PROV_NAME = None  # 运行时设定；模块被 import 做测试时也要有定义，避免 handler NameError
 AUTH_SECRET = None  # 未设则不启用鉴权（保持旧行为）
+UPSTREAM_PROXY = None  # CONNECT 隧道上游代理（如 Clash 7890），解决 MCP 外部数据库在国内直连不通
 _DATE_SUFFIX = re.compile(r"-\d{8}$")
 
 # ---------- #3: targeted fast-fail（沙箱「Switching organization」卡死修复） ----------
@@ -418,19 +419,13 @@ class H(BaseHTTPRequestHandler):
             self._handle_openai(areq)
 
     # ---- HTTP CONNECT 隧道：Anthropic 域名 fast-fail、其余透传（修 #3） ----
+    # 当指定了 --upstream-proxy 时，非 Anthropic 域的 CONNECT 隧道不再直连目标，
+    # 而是通过上游代理（如 Clash/FlClash 的 7890）建立隧道，解决国内环境 MCP 外部
+    # 数据库（PubMed/ChEMBL 等）直连不可达的问题（修 #11）。
     def do_CONNECT(self):
-        # operon 用 https_proxy 走到这里；self.path 形如 "host:port"。
-        # 【为何不走 _auth_ok】CONNECT 把目标放在请求行、没有可嵌 path-secret 的位置，
-        # operon 的 https_proxy 也带不上 secret。此处不鉴权的实际风险面很小：
-        #   - 只监听回环（127.0.0.1），本机进程本就能自行外连，隧道不给它任何新能力；
-        #   - 隧道是裸 TCP 转发，不注入上游 key、不经推理端点（那两条仍受 secret 保护）。
-        #   即 path-secret 真正守护的边界（第三方 key + 推理端点）未被削弱。
-        # 进一步收紧可让 launch 把 secret 放进 https_proxy 的 userinfo 再校验
-        # Proxy-Authorization，但需先实测 operon 是否会带该头（否则误伤透传），留待整链联调。
         target = self.path
         host = target.rsplit(":", 1)[0].strip("[]").lower()
         if _is_blocked_host(host):
-            # 401（未登录）而非 403（禁止）：让 operon 判 logged-out 秒过，而非当组织问题反复重试。
             log(f"CONNECT {target} -> 401 未登录（Anthropic 域名 fast-fail）")
             self._connect_reply(401)
             return
@@ -439,19 +434,45 @@ class H(BaseHTTPRequestHandler):
         except (ValueError, IndexError):
             self._connect_reply(400)
             return
-        try:
-            upstream = socket.create_connection((host, port), timeout=10)
-        except Exception as e:
-            log(f"CONNECT {target} -> 502 上游连不上: {e}")
-            self._connect_reply(502)
-            return
+        if UPSTREAM_PROXY:
+            # 经上游代理建立隧道（修 #11：MCP 外部数据库连通）
+            try:
+                uph, upp = UPSTREAM_PROXY
+                upstream = socket.create_connection((uph, upp), timeout=10)
+                connect_req = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+                upstream.sendall(connect_req.encode())
+                # 读上游代理的 CONNECT 响应
+                resp = b""
+                while b"\r\n\r\n" not in resp:
+                    chunk = upstream.recv(4096)
+                    if not chunk:
+                        upstream.close()
+                        raise ConnectionError("上游代理 CONNECT 响应不完整")
+                    resp += chunk
+                status_line = resp.split(b"\r\n")[0].decode("utf-8", "replace")
+                if " 200 " not in status_line:
+                    upstream.close()
+                    log(f"CONNECT {target} -> 上游代理拒绝: {status_line.strip()}")
+                    self._connect_reply(502)
+                    return
+                log(f"CONNECT {target} -> 经上游代理 {uph}:{upp} 建立隧道")
+            except Exception as e:
+                log(f"CONNECT {target} -> 上游代理连不上 ({uph}:{upp}): {e}")
+                self._connect_reply(502)
+                return
+        else:
+            try:
+                upstream = socket.create_connection((host, port), timeout=10)
+            except Exception as e:
+                log(f"CONNECT {target} -> 502 直连不上: {e}")
+                self._connect_reply(502)
+                return
         self.send_response(200, "Connection Established")
         self.end_headers()
         try:
             self.wfile.flush()
         except Exception:
             pass
-        log(f"CONNECT {target} -> 隧道建立，透传")
         try:
             self._tunnel(self.connection, upstream)
         finally:
@@ -644,6 +665,9 @@ if __name__ == "__main__":
     ap.add_argument("--env-file", default=None)
     ap.add_argument("--log", default=None)
     ap.add_argument("--auth-token", default=None)
+    ap.add_argument("--upstream-proxy", default=None,
+                    help="CONNECT 隧道上游代理 host:port（如 127.0.0.1:7890），"
+                         "用于 MCP 外部数据库出墙（PubMed/ChEMBL 等）")
     args = ap.parse_args()
     PROV_NAME = args.provider
     PROV = PROVIDERS[PROV_NAME]
@@ -654,6 +678,18 @@ if __name__ == "__main__":
     if _up:
         PROV = dict(PROV)
         PROV["url"] = _up
+    if args.upstream_proxy:
+        hp = args.upstream_proxy.rsplit(":", 1)
+        if len(hp) == 2:
+            try:
+                UPSTREAM_PROXY = (hp[0], int(hp[1]))
+            except ValueError:
+                print(f"[csswitch] --upstream-proxy 端口非法：{hp[1]}", file=sys.stderr)
+                sys.exit(1)
+        else:
+            print(f"[csswitch] --upstream-proxy 格式应为 host:port，收到：{args.upstream_proxy}",
+                  file=sys.stderr)
+            sys.exit(1)
     if not KEY:
         print(f"找不到 {PROV['key_env']}。用环境变量或 --env-file <路径> 提供。", file=sys.stderr)
         sys.exit(1)
