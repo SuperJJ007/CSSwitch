@@ -14,7 +14,19 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
 use super::types::{RemoteAuthMethod, RemoteError, RemoteHostProfile};
+
+/// Windows: 禁止弹出命令行窗口（CREATE_NO_WINDOW）
+#[cfg(windows)]
+const NO_WINDOW: u32 = 0x08000000;
+
+fn hide_cmd(mut cmd: Command) -> Command {
+    #[cfg(windows)] { cmd.creation_flags(NO_WINDOW); }
+    cmd
+}
 
 /// SSH 超时秒数（ConnectTimeout）。
 const SSH_TIMEOUT_SECS: u64 = 10;
@@ -238,7 +250,7 @@ fn try_run_ssh(
     timeout_secs: u64,
 ) -> Result<String, RemoteError> {
     let args = build_ssh_args(profile, helper_args);
-    let output = Command::new("ssh")
+    let output = hide_cmd(Command::new("ssh"))
         .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -254,26 +266,40 @@ fn try_run_ssh(
             ),
         })?;
 
-    // 审核 P1-6 修复：在线程中使用 recv_timeout 实际实施命令超时。
-    // 在独立线程中执行 wait_with_output。
-    let output = std::thread::spawn(move || output.wait_with_output())
-        .join()
-        .map_err(|_| RemoteError {
-            code: "ssh_thread_panic".to_string(),
-            message: "SSH 执行线程异常".to_string(),
-            details: None,
-            recoverable: false,
-            suggestion: None,
-        })?
-        .map_err(|e| RemoteError {
+    // 使用 channel + recv_timeout 实现真正的命令超时
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = output.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    let output = match rx.recv_timeout(Duration::from_secs(timeout_secs)) {
+        Ok(result) => result.map_err(|e| RemoteError {
             code: "ssh_io_error".to_string(),
             message: format!("SSH 进程 I/O 错误：{e}"),
             details: None,
             recoverable: true,
             suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
-        })?;
-    // 注：命令级超时（timeout_secs）通过上层的重试策略间接实现（超时后用户发起重试）。
-    // 未来可在此加 recv_timeout 实现精确超时控制。
+        })?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(RemoteError {
+                code: "ssh_timeout".to_string(),
+                message: format!("SSH 命令执行超时（{timeout_secs}秒）"),
+                details: None,
+                recoverable: true,
+                suggestion: Some("网络慢或远程命令卡住。请检查网络连接。".to_string()),
+            });
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(RemoteError {
+                code: "ssh_thread_panic".to_string(),
+                message: "SSH 执行线程异常退出".to_string(),
+                details: None,
+                recoverable: false,
+                suggestion: Some("请报告此问题。".to_string()),
+            });
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();

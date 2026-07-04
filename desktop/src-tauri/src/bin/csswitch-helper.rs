@@ -16,6 +16,8 @@
 mod config;
 #[path = "../fs_ext.rs"]
 mod fs_ext;
+#[path = "../oauth_forge.rs"]
+mod oauth_forge;
 #[path = "../cli/mod.rs"]
 mod cli;
 

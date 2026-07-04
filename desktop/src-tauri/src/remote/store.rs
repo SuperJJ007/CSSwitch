@@ -67,8 +67,13 @@ pub fn save_profiles(profiles: &[RemoteHostProfile]) -> Result<(), String> {
     ));
     fs::write(&tmp, &json)
         .map_err(|e| format!("写入远程配置临时文件失败：{e}"))?;
+    // 设置 0600 权限，防止其他用户读取 SSH 配置
+    crate::fs_ext::set_file_permissions(&tmp, 0o600)
+        .map_err(|e| format!("设置权限失败：{e}"))?;
     fs::rename(&tmp, &path)
         .map_err(|e| format!("替换远程配置文件失败：{e}"))?;
+    crate::fs_ext::set_file_permissions(&path, 0o600)
+        .map_err(|e| format!("确认权限失败：{e}"))?;
     Ok(())
 }
 

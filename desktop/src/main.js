@@ -826,6 +826,31 @@ async function activate(id, skipVerify) {
 
 // ── 一键开始：读 active profile。无生效则引导先建/选一条（不再对旧 provider 槽落未提交输入）。──
 async function oneClick() {
+  // 远程模式：走 remote_one_click
+  if (target === 'remote' && currentProfile) {
+    if (!state.active_id) {
+      setMsg("远程模式需要选择一个生效的 Profile 配置。请先在列表点「设为当前」。", "err");
+      return;
+    }
+    const ap = state.profiles.find(p => p.id === state.active_id);
+    if (!ap) { setMsg("找不到当前生效的 Profile。", "err"); return; }
+    setBusy(true);
+    setMsg('远程一键开始：保存 Key → 起代理 → 起沙箱…');
+    try {
+      const r = await invoke("remote_one_click", {
+        profile: currentProfile,
+        provider: ap.template_id || "deepseek",
+        key: ap.key || "",
+        proxyPort: state.proxy_port || 18991,
+        sandboxPort: state.sandbox_port || 8990,
+      });
+      setMsg("远程已就绪！代理端口：" + (r && r.port), "ok");
+      await refreshStatus();
+    } catch (e) { setMsg("远程一键开始失败：" + e, "err"); }
+    finally { setBusy(false); }
+    return;
+  }
+  // 本地模式
   if (!state.active_id) {
     setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
     return;
@@ -845,6 +870,16 @@ async function oneClick() {
 }
 
 async function stopAll() {
+  if (target === 'remote' && currentProfile) {
+    setBusy(true); setMsg("远程停止中…");
+    try {
+      await invoke("remote_stop_proxy", { profile: currentProfile });
+      setMsg("远程代理已停止。", "ok");
+      await refreshStatus();
+    } catch (e) { setMsg("远程停止失败：" + e, "err"); }
+    finally { setBusy(false); }
+    return;
+  }
   setBusy(true);
   setMsg("停止中…");
   try {
@@ -913,6 +948,19 @@ async function checkUpdate() {
 }
 
 async function refreshStatus() {
+  // 远程模式：走 remote_status
+  if (target === 'remote' && currentProfile) {
+    try {
+      const s = await invoke("remote_status", { profile: currentProfile });
+      setLight(els.ltProxy, s.proxy);
+      setLight(els.ltSandbox, s.sandbox);
+      setLight(els.ltUpstream, s.upstream);
+      els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
+    } catch (e) {
+      [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
+    }
+    return;
+  }
   try {
     const s = await call("status");
     setLight(els.ltProxy, s.proxy);

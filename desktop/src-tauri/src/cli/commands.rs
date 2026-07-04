@@ -460,6 +460,7 @@ pub fn cmd_sandbox_status() -> CliEnvelope {
 
 /// `sandbox start <port> <proxy_url>` — 启动 Claude Science 沙箱。
 /// 用 `ANTHROPIC_BASE_URL` 环境变量指向代理，以独立 data-dir 运行。
+/// 注入虚拟 OAuth 凭证使 Science 认为已登录，设置 --host 0.0.0.0 允许外部访问。
 pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
     let bin = match find_cmd("claude-science") {
         Some(b) => b,
@@ -479,16 +480,45 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
     // 确保运行时目录存在
     let _ = std::fs::create_dir_all(&data_dir);
 
+    // 注入虚拟 OAuth 凭证，让 Science 认为已登录（否则启动后会因找不到登录态报错）
+    if let Err(e) = crate::oauth_forge::ensure_virtual_login(
+        &data_dir,
+        "virtual@localhost.invalid",
+        &sandbox_home,
+    ) {
+        super::logger::warn(&format!("OAuth 虚拟登录失败（沙箱启动后可能无凭证）: {e}"));
+    }
+
+    // https_proxy 只保留 host:port（剥掉 /secret 路径）。
+    // 对齐 launch-virtual-sandbox.sh：CONNECT 隧道不经过 path 路由，
+    // 代理的 do_CONNECT 对 Anthropic 域名秒回 403，operon 秒判 logged-out。
+    let proxy_hostport = match proxy_url.find("://") {
+        Some(i) => {
+            let after = &proxy_url[i + 3..];
+            match after.find('/') {
+                Some(j) => format!("http://{}", &after[..j]),
+                None => proxy_url.to_string(),
+            }
+        }
+        None => proxy_url.to_string(),
+    };
+
     match std::process::Command::new(&bin)
         .args(["serve", "--data-dir"])
         .arg(&data_dir)
         .arg("--port")
         .arg(port.to_string())
+        .arg("--host")
+        .arg("0.0.0.0")
         .arg("--no-browser")
         .arg("--no-auto-update")
         .arg("--detached")
         .env("HOME", &sandbox_home)
         .env("ANTHROPIC_BASE_URL", proxy_url)
+        .env("https_proxy", &proxy_hostport)
+        .env("HTTPS_PROXY", &proxy_hostport)
+        .env("no_proxy", "127.0.0.1,localhost,::1")
+        .env("NO_PROXY", "127.0.0.1,localhost,::1")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()

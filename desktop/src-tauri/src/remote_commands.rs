@@ -138,9 +138,9 @@ pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth,
     // 直接执行 SSH 安装命令（安装脚本为 shell 脚本，不符合 helper JSON 协议格式，
     // 因此不走 run_helper_json，而是直接执行 ssh 命令并验证退出码和 status 输出）。
     let args = remote::ssh::build_helper_install_args(&profile);
-    let output = std::process::Command::new("ssh")
-        .args(&args)
-        .output()
+    let mut cmd = std::process::Command::new("ssh");
+    #[cfg(windows)] { use std::os::windows::process::CommandExt; cmd.creation_flags(0x08000000); }
+    let output = cmd.args(&args).output()
         .map_err(|e| format!("无法启动 SSH：{e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -303,15 +303,14 @@ pub fn remote_doctor(profile: RemoteHostProfile) -> Result<Value, String> {
         .map_err(|e| e.message)
 }
 
-/// 远程一键开始：保存 key → 起代理。
-/// 注：完整流程需要在客户端先生成 secret，此处为简化版本。
+/// 远程一键开始：保存 key → 起代理 → 启沙箱。
 #[tauri::command]
 pub fn remote_one_click(
     profile: RemoteHostProfile,
     provider: String,
     key: String,
     proxy_port: u16,
-    _sandbox_port: u16,
+    sandbox_port: u16,
 ) -> Result<Value, String> {
     // 步骤 1：保存 key
     remote::ssh::run_helper_json_with_retry::<Value>(
@@ -332,6 +331,14 @@ pub fn remote_one_click(
     })
     .map_err(|e| e.message)?;
 
+    // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
+    let secret: String = {
+        use rand::RngCore;
+        let mut b = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut b);
+        b.iter().map(|x| format!("{x:02x}")).collect::<String>()
+    };
+
     // 步骤 2：起代理
     remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
@@ -340,18 +347,32 @@ pub fn remote_one_click(
             "start".to_string(),
             provider,
             proxy_port.to_string(),
-            // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
-            {
-                use rand::RngCore;
-                let mut b = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut b);
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-            },
+            secret.clone(),
         ],
     )
     .map_err(|e| remote::types::RemoteError {
         code: e.code,
         message: format!("启动代理失败：{}", e.message),
+        details: e.details,
+        recoverable: false,
+        suggestion: e.suggestion,
+    })
+    .map_err(|e| e.message)?;
+
+    // 步骤 3：启动沙箱（Science 通过代理访问 Anthropic API）
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}/{secret}");
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "sandbox".to_string(),
+            "start".to_string(),
+            sandbox_port.to_string(),
+            proxy_url,
+        ],
+    )
+    .map_err(|e| remote::types::RemoteError {
+        code: e.code,
+        message: format!("启动沙箱失败：{}", e.message),
         details: e.details,
         recoverable: false,
         suggestion: e.suggestion,
