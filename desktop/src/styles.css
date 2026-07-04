@@ -110,3 +110,14 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 /* 表单视图（向导/连接/改名）隐藏运行控制区与页脚；反馈消息区 .feedback 始终可见（P1-3）。 */
 .panel.view-form .list-only{display:none}
 .feedback{border-top:1px solid var(--line)}
+/* 模板选择 chip 网格（对齐 CC Switch；替代下拉）。 */
+.chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:2px}
+.chip{display:flex;align-items:center;gap:7px;padding:9px 10px;border:1px solid var(--line);
+  border-radius:10px;background:var(--field);color:var(--ink);cursor:pointer;font-family:inherit;
+  font-size:12.5px;font-weight:600;text-align:left}
+.chip:hover{border-color:var(--accent)}
+.chip.sel{border-color:var(--accent);background:var(--panel);box-shadow:0 0 0 2px rgba(194,90,52,.14)}
+.chip-dot{width:9px;height:9px;border-radius:50%;background:var(--sub);flex:none}
+.chip-name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chip-cat{font-size:10px;color:var(--sub);border:1px solid var(--line);border-radius:6px;
+  padding:1px 5px;background:var(--panel)}

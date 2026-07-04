@@ -364,17 +364,35 @@ function applyFetchResult(sel, requiresOverride, r) {
 // ── C2：新建向导 ──
 function openWizard() {
   hideSkip();
-  const sel = els.wizTemplate;
-  sel.innerHTML = "";
-  for (const t of state.templates || []) {
-    const o = document.createElement("option");
-    o.value = t.id;
-    o.textContent = t.name + "（" + (CAT_LABELS[t.category] || t.category) + "）";
-    sel.appendChild(o);
-  }
+  renderTemplateChips();
+  const first = (state.templates || [])[0];
+  selectWizTemplate(first ? first.id : "");
   showView("wizard");
+  setMsg("选择来源，填 key 即可创建（新建不会自动生效）。");
+}
+
+function renderTemplateChips() {
+  els.wizTemplateChips.innerHTML = (state.templates || []).map((t) => {
+    const dot = t.icon_color ? ' style="background:' + escapeHtml(t.icon_color) + '"' : "";
+    const cat = CAT_LABELS[t.category] || t.category || "";
+    return (
+      '<button type="button" class="chip" aria-pressed="false" data-tid="' + escapeHtml(t.id) + '">' +
+        '<span class="chip-dot"' + dot + "></span>" +
+        '<span class="chip-name">' + escapeHtml(t.name) + "</span>" +
+        '<span class="chip-cat">' + escapeHtml(cat) + "</span>" +
+      "</button>"
+    );
+  }).join("");
+}
+
+function selectWizTemplate(id) {
+  els.wizTemplate.value = id;
+  els.wizTemplateChips.querySelectorAll(".chip").forEach((c) => {
+    const on = c.getAttribute("data-tid") === id;
+    c.classList.toggle("sel", on);
+    c.setAttribute("aria-pressed", on ? "true" : "false");
+  });
   onWizTemplate();
-  setMsg("选择来源模板，预填后填入 key 即可创建（新建不会自动生效）。");
 }
 
 function onWizTemplate() {
@@ -767,7 +785,7 @@ function wire() {
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "advSec",
     "listSec", "profileList", "newBtn", "skipActivateBtn",
-    "wizSec", "wizTemplate", "wizTplHint", "wizName", "wizBase", "wizBaseHint",
+    "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBase", "wizBaseHint",
     "wizFetchBtn", "wizModel", "wizModelHint", "wizKey", "wizSaveBtn", "wizCancelBtn",
     "connSec", "connTitle", "connBase", "connBaseHint", "connFetchBtn",
     "connModel", "connModelHint", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
@@ -803,7 +821,11 @@ function wire() {
     if (id) activate(id, true);
   });
 
-  els.wizTemplate.addEventListener("change", onWizTemplate);
+  els.wizTemplateChips.addEventListener("click", (e) => {
+    if (busy) return;
+    const chip = e.target.closest(".chip");
+    if (chip) selectWizTemplate(chip.getAttribute("data-tid"));
+  });
   els.wizModel.addEventListener("change", refreshWizGate);
   els.wizFetchBtn.addEventListener("click", wizFetch);
   els.wizSaveBtn.addEventListener("click", wizSave);

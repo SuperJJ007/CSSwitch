@@ -37,8 +37,9 @@
 
       <!-- 新建向导：选模板 → 预填 → 填 key → 创建（不自动生效） -->
       <div class="sec tp-only" id="wizSec" hidden>
-        <label>选择来源模板</label>
-        <select id="wizTemplate"></select>
+        <label id="wizTplLabel">选择来源</label>
+        <div id="wizTemplateChips" class="chips" role="group" aria-labelledby="wizTplLabel"></div>
+        <input id="wizTemplate" type="hidden" />
         <div class="hint" id="wizTplHint"></div>
         <label style="margin-top:10px">名称</label>
         <input id="wizName" type="text" placeholder="给这套配置起个名字" autocomplete="off" spellcheck="false" />
