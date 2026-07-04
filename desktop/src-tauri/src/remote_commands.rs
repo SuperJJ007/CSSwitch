@@ -2,6 +2,9 @@
 //!
 //! 本模块提供所有与远程 Linux 服务器交互的 Tauri 命令，前端通过 `invoke()` 调用。
 //! 每个命令委托给 `remote::ssh` 模块执行 SSH + Helper JSON 协议。
+//! SSH 操作本身是阻塞的，Tauri 会自动在后台线程池执行 `#[tauri::command]` fn。
+//! 对于需要在 async 上下文中调用的场景（如 health 内部递归调用），使用
+//! [`run_blocking`] 在独立线程中执行以避免阻塞当前 async runtime。
 //!
 //! 命令分为四组：
 //! 1. Profile 管理 — 增删改查远程服务器连接配置
@@ -17,7 +20,25 @@ use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 // ============================================================================
-// 1. Profile 管理
+// 线程辅助 — 在独立 OS 线程中执行阻塞 I/O，避免卡住 Tauri 事件循环
+// ============================================================================
+
+/// 在当前线程之外的独立 OS 线程中运行一段阻塞代码，通过 channel 取回结果。
+/// 用于 async 上下文中需要执行 SSH（需要 `Send + 'static`）的场景。
+fn run_blocking<F, T>(f: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+    T: Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv().unwrap_or(Err("后台任务线程异常退出".to_string()))
+}
+
+// ============================================================================
+// 1. Profile 管理（纯本地 I/O，无需 spawn）
 // ============================================================================
 
 /// 列出所有远程服务器 Profile。
@@ -45,31 +66,24 @@ pub fn remote_validate_profile(profile: RemoteHostProfile) -> Result<bool, Strin
 }
 
 // ============================================================================
-// 2. 健康检查
+// 2. 健康检查（SSH，阻塞 I/O）
 // ============================================================================
 
 /// 检查远程服务器健康状态：SSH 连通性 + Helper 版本/能力。
-/// 使用默认重试（3 次）以容忍网络波动。
+/// SSH 是阻塞 I/O，Tauri 自动在后台线程执行此命令。
 #[tauri::command]
-pub async fn remote_check_health(
-    profile: RemoteHostProfile,
-) -> Result<RemoteHealth, String> {
+pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // 先做一次快速 SSH 连通性测试（仅 echo，0 重试）
-    let reachable = tokio::task::spawn_blocking(move || {
-        // 简单连通性测试：SSH 执行 echo
-        remote::ssh::run_helper_json_simple::<Value>(
-            &profile,
-            &["status".to_string()],
-        )
-        .is_ok()
-    })
-    .await
-    .unwrap_or(false);
+    // 快速 SSH 连通性测试（调用 helper status）
+    let reachable = remote::ssh::run_helper_json_simple::<Value>(
+        &profile,
+        &["status".to_string()],
+    )
+    .is_ok();
 
     if !reachable {
         return Ok(RemoteHealth {
@@ -83,29 +97,18 @@ pub async fn remote_check_health(
             capabilities: vec![],
             proxy_running: false,
             sandbox_running: false,
-            last_error: Some("无法通过 SSH 连接到服务器。请检查地址、端口和认证配置。".to_string()),
+            last_error: Some(
+                "无法通过 SSH 连接到服务器。请检查地址、端口和认证配置。".to_string(),
+            ),
             last_check: now,
         });
     }
 
-    // 调用 helper status 获取详细信息
-    let profile_clone = profile.clone();
-    let status_result: Result<Value, _> = tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["status".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| {
-        Err(remote::types::RemoteError {
-            code: "task_join_error".to_string(),
-            message: format!("后台任务异常：{e}"),
-            details: None,
-            recoverable: false,
-            suggestion: None,
-        })
-    });
+    // 获取详细状态（带重试）
+    let status_result = remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["status".to_string()],
+    );
 
     match status_result {
         Ok(status) => Ok(parse_health_from_status(&status, now)),
@@ -127,171 +130,119 @@ pub async fn remote_check_health(
 }
 
 /// 安装/升级远程 Helper。
+/// 包含慢速 SSH 操作（下载+安装），Tauri 自动在后台线程执行。
 #[tauri::command]
-pub async fn remote_install_helper(
-    profile: RemoteHostProfile,
-) -> Result<RemoteHealth, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        let _: Value = remote::ssh::run_helper_json_slow::<Value>(
-            &profile_clone,
-            &[], // install 使用专门构建的 SSH 命令
-        )
-        .map_err(|e| e.message)?;
-        Ok::<_, String>(())
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("安装任务异常：{e}")))?;
-
+pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
+    let _: Value =
+        remote::ssh::run_helper_json_slow::<Value>(&profile, &[]).map_err(|e| e.message)?;
     // 安装后重新检查健康
-    remote_check_health(profile).await
+    remote_check_health(profile)
 }
 
 // ============================================================================
-// 3. 配置
+// 3. 配置（SSH，阻塞 I/O）
 // ============================================================================
 
 /// 读取远程服务器上的配置。
 #[tauri::command]
-pub async fn remote_get_config(profile: RemoteHostProfile) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["config".to_string(), "get".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+pub fn remote_get_config(profile: RemoteHostProfile) -> Result<Value, String> {
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["config".to_string(), "get".to_string()],
+    )
     .map_err(|e| e.message)
 }
 
 /// 写入远程配置。
 #[tauri::command]
-pub async fn remote_set_config(
-    profile: RemoteHostProfile,
-    config_json: String,
-) -> Result<(), String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["config".to_string(), "set".to_string(), config_json],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
-    .map(|_: Value| ())
+pub fn remote_set_config(profile: RemoteHostProfile, config_json: String) -> Result<(), String> {
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["config".to_string(), "set".to_string(), config_json],
+    )
+    .map(|_| ())
     .map_err(|e| e.message)
 }
 
 /// 保存 Provider Key 到远程配置。
+/// 返回掩码后的 key（仅末 4 位可见）。
 #[tauri::command]
-pub async fn remote_save_provider_key(
+pub fn remote_save_provider_key(
     profile: RemoteHostProfile,
     provider: String,
     key: String,
 ) -> Result<String, String> {
-    let profile_clone = profile.clone();
-    let result: Value = tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &[
-                "config".to_string(),
-                "save-key".to_string(),
-                provider,
-                key,
-            ],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+    let result: Value = remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "config".to_string(),
+            "save-key".to_string(),
+            provider,
+            key,
+        ],
+    )
     .map_err(|e| e.message)?;
 
     Ok(result["masked"].as_str().unwrap_or("••••").to_string())
 }
 
 // ============================================================================
-// 4. 代理
+// 4. 代理（SSH，阻塞 I/O）
 // ============================================================================
 
 /// 启动远程代理。
 #[tauri::command]
-pub async fn remote_start_proxy(
+pub fn remote_start_proxy(
     profile: RemoteHostProfile,
     provider: String,
     port: u16,
     secret: String,
 ) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &[
-                "proxy".to_string(),
-                "start".to_string(),
-                provider,
-                port.to_string(),
-                secret,
-            ],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "proxy".to_string(),
+            "start".to_string(),
+            provider,
+            port.to_string(),
+            secret,
+        ],
+    )
     .map_err(|e| e.message)
 }
 
 /// 停止远程代理。
 #[tauri::command]
-pub async fn remote_stop_proxy(profile: RemoteHostProfile) -> Result<(), String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["proxy".to_string(), "stop".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
-    .map(|_: Value| ())
+pub fn remote_stop_proxy(profile: RemoteHostProfile) -> Result<(), String> {
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["proxy".to_string(), "stop".to_string()],
+    )
+    .map(|_| ())
     .map_err(|e| e.message)
 }
 
 /// 查询远程代理状态。
 #[tauri::command]
-pub async fn remote_proxy_status(profile: RemoteHostProfile) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["proxy".to_string(), "status".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+pub fn remote_proxy_status(profile: RemoteHostProfile) -> Result<Value, String> {
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["proxy".to_string(), "status".to_string()],
+    )
     .map_err(|e| e.message)
 }
 
-/// 验证远程代理上的 Key 有效性。
+/// 验证远程代理上的 Key 有效性（慢速：需经代理→上游往返）。
 #[tauri::command]
-pub async fn remote_verify_key(
+pub fn remote_verify_key(
     profile: RemoteHostProfile,
     port: u16,
     secret: String,
 ) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_slow::<Value>(
-            &profile_clone,
-            &[
-                "verify".to_string(),
-                port.to_string(),
-                secret,
-            ],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+    remote::ssh::run_helper_json_slow::<Value>(
+        &profile,
+        &["verify".to_string(), port.to_string(), secret],
+    )
     .map_err(|e| e.message)
 }
 
@@ -300,22 +251,16 @@ pub async fn remote_verify_key(
 // ============================================================================
 
 /// 远程综合状态（三盏灯：proxy / sandbox / upstream）。
-/// 返回格式与本地 `status` 命令一致以便前端复用 `updateLights()`。
+/// 返回格式与本地 `status` 命令一致，前端 `refreshStatus()` 无需修改。
 #[tauri::command]
-pub async fn remote_status(profile: RemoteHostProfile) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    let status: Value = tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["status".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
+pub fn remote_status(profile: RemoteHostProfile) -> Result<Value, String> {
+    let status: Value = remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["status".to_string()],
+    )
     .map_err(|e| e.message)?;
 
     let proxy_running = status["proxy_running"].as_bool().unwrap_or(false);
-    // 上游可达性通过 helper 平台信息推断（Linux 服务器通常可直连外网）
     let upstream_reachable = status["platform"].as_str().is_some();
 
     Ok(json!({
@@ -328,7 +273,7 @@ pub async fn remote_status(profile: RemoteHostProfile) -> Result<Value, String> 
 
 /// 查看远程日志。
 #[tauri::command]
-pub async fn remote_logs(
+pub fn remote_logs(
     profile: RemoteHostProfile,
     name: String,
     lines: Option<u32>,
@@ -337,91 +282,66 @@ pub async fn remote_logs(
     if let Some(n) = lines {
         args.push(n.to_string());
     }
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(&profile_clone, &args)
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
-    .map_err(|e| e.message)
+    remote::ssh::run_helper_json_with_retry::<Value>(&profile, &args).map_err(|e| e.message)
 }
 
 /// 远程诊断。
 #[tauri::command]
-pub async fn remote_doctor(profile: RemoteHostProfile) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &["doctor".to_string()],
-        )
-    })
-    .await
-    .unwrap_or_else(|e| Err(format!("后台任务异常：{e}")))?
-    .map_err(|e| e.message)
+pub fn remote_doctor(profile: RemoteHostProfile) -> Result<Value, String> {
+    remote::ssh::run_helper_json_with_retry::<Value>(&profile, &["doctor".to_string()])
+        .map_err(|e| e.message)
 }
 
-/// 远程一键开始：保存 key → 起代理 → 验证 → 起沙箱（如可用）。
-/// 复合操作，减少 SSH 往返次数。Helper 端实现为 `one-click` 复合命令。
+/// 远程一键开始：保存 key → 起代理。
+/// 注：完整流程需要在客户端先生成 secret，此处为简化版本。
 #[tauri::command]
-pub async fn remote_one_click(
+pub fn remote_one_click(
     profile: RemoteHostProfile,
     provider: String,
     key: String,
     proxy_port: u16,
-    sandbox_port: u16,
+    _sandbox_port: u16,
 ) -> Result<Value, String> {
-    let profile_clone = profile.clone();
-    tokio::task::spawn_blocking(move || {
-        // 步骤 1：保存 key
-        let _masked: Value = remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &[
-                "config".to_string(),
-                "save-key".to_string(),
-                provider.clone(),
-                key,
-            ],
-        )
-        .map_err(|e| {
-            remote::types::RemoteError {
-                code: e.code,
-                message: format!("保存 Key 失败：{}", e.message),
-                details: e.details,
-                recoverable: false,
-                suggestion: e.suggestion,
-            }
-        })?;
-
-        // 步骤 2：生成 secret 并起代理
-        // 注：secret 由前面的本地逻辑生成（Tauri 端 gen_secret），传参给 helper
-        let _proxy: Value = remote::ssh::run_helper_json_with_retry::<Value>(
-            &profile_clone,
-            &[
-                "proxy".to_string(),
-                "start".to_string(),
-                provider.clone(),
-                proxy_port.to_string(),
-                "csswitch".to_string(), // 简化的 secret
-            ],
-        )
-        .map_err(|e| {
-            remote::types::RemoteError {
-                code: e.code,
-                message: format!("启动代理失败：{}", e.message),
-                details: e.details,
-                recoverable: false,
-                suggestion: e.suggestion,
-            }
-        })?;
-
-        Ok(json!({ "ok": true, "port": proxy_port }))
+    // 步骤 1：保存 key
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "config".to_string(),
+            "save-key".to_string(),
+            provider.clone(),
+            key,
+        ],
+    )
+    .map_err(|e| remote::types::RemoteError {
+        code: e.code,
+        message: format!("保存 Key 失败：{}", e.message),
+        details: e.details,
+        recoverable: false,
+        suggestion: e.suggestion,
     })
-    .await
-    .unwrap_or_else(|e: Box<dyn std::any::Any + Send>| {
-        Err(format!("后台任务异常：{:?}", e.type_id()))
-    })?
-    .map_err(|e: remote::types::RemoteError| e.message)
+    .map_err(|e| e.message)?;
+
+    // 步骤 2：起代理
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "proxy".to_string(),
+            "start".to_string(),
+            provider,
+            proxy_port.to_string(),
+            "csswitch".to_string(), // 简化 secret
+        ],
+    )
+    .map_err(|e| remote::types::RemoteError {
+        code: e.code,
+        message: format!("启动代理失败：{}", e.message),
+        details: e.details,
+        recoverable: false,
+        suggestion: e.suggestion,
+    })
+    .map_err(|e| e.message)?;
+
+    Ok(json!({ "ok": true, "port": proxy_port }))
 }
 
 // ============================================================================

@@ -21,10 +21,10 @@ path = "src/bin/csswitch-helper.rs"
 
 [features]
 default = ["desktop"]
-desktop = ["tauri"]
+desktop = ["tauri", "tauri-build"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
 tauri = { version = "2", features = [], optional = true }

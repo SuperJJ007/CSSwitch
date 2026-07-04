@@ -5,7 +5,6 @@
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use rand::rngs::OsRng;
@@ -139,8 +138,12 @@ pub fn which(name: &str) -> Option<PathBuf> {
             return Some(hit);
         }
     }
-    // 2) GUI/.app 最小 PATH 兜底：扫常见安装目录。
-    find_in_dirs(name, common_bin_dirs())
+    // 2) GUI/.app 最小 PATH 兜底：扫常见安装目录（仅 Unix）。
+    #[cfg(unix)]
+    if let Some(hit) = find_in_dirs(name, common_bin_dirs()) {
+        return Some(hit);
+    }
+    None
 }
 
 /// 在给定目录序列里找可执行文件（第一个命中即返回）。
@@ -288,6 +291,8 @@ mod tests {
         assert!(!http_health(59999, None, 300));
     }
 
+    /// PATH 中找 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn which_finds_sh() {
         let sh = which("sh");
@@ -300,6 +305,8 @@ mod tests {
         assert!(which("definitely-not-a-real-binary-xyzzy").is_none());
     }
 
+    /// 在常见目录找 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn find_in_dirs_locates_exec() {
         // /bin/sh 几乎肯定存在且可执行。
@@ -337,6 +344,8 @@ mod tests {
         assert!(which_via_login_shell("").is_none());
     }
 
+    /// find_exe 应能找到 sh（仅 Unix）。
+    #[cfg(unix)]
     #[test]
     fn find_exe_finds_sh() {
         assert!(find_exe("sh").is_some());

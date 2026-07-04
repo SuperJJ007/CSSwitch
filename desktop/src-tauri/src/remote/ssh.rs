@@ -235,7 +235,7 @@ pub fn run_helper_json_slow<T: DeserializeOwned>(
 fn try_run_ssh(
     profile: &RemoteHostProfile,
     helper_args: &[String],
-    timeout_secs: u64,
+    _timeout_secs: u64,
 ) -> Result<String, RemoteError> {
     let args = build_ssh_args(profile, helper_args);
     let output = Command::new("ssh")

@@ -5,9 +5,6 @@
 //!
 //! 所有文件使用 `use crate::fs_ext::...` 替代 `use std::os::unix::fs::...`。
 
-use std::fs;
-use std::io;
-use std::path::Path;
 
 // ---------- 平台条件编译 ----------
 
@@ -59,8 +56,23 @@ mod imp {
         fn mode(&self) -> u32;
     }
     impl PermissionsExt for fs::Permissions {
-        fn from_mode(_mode: u32) -> fs::Permissions {
-            fs::Permissions::new() // 默认权限（非只读）
+        fn from_mode(mode: u32) -> fs::Permissions {
+            // Windows: `Permissions` 没有公开构造函数，通过当前目录 metadata 获取默认权限。
+            // 跨平台兼容性：此函数的结果在 Windows 上不会被实际使用
+            // （`set_file_permissions` on Windows 是 no-op），只需编译通过。
+            let mut p = std::fs::metadata(".")
+                .map(|m| m.permissions())
+                .unwrap_or_else(|_| {
+                    // 最终回退：获取 Cargo 工作目录权限
+                    std::fs::metadata(std::env::current_dir().unwrap_or_default())
+                        .map(|m| m.permissions())
+                        .unwrap()
+                });
+            // 没有写权限位 (0o444) → readonly
+            if mode & 0o222 == 0 {
+                p.set_readonly(true);
+            }
+            p
         }
         fn mode(&self) -> u32 {
             if self.readonly() { 0o444 } else { 0o666 }

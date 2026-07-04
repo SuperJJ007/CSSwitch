@@ -13,9 +13,4 @@ pub mod store;
 pub mod types;
 
 // 重新导出常用类型和函数，方便外部模块使用。
-pub use ssh::{run_helper_json, run_helper_json_simple, run_helper_json_slow, run_helper_json_with_retry};
-pub use store::{delete_profile, load_profiles, save_profiles, upsert_profile, validate_profile};
-pub use types::{
-    RemoteAuthMethod, RemoteError, RemoteHealth, RemoteHostProfile,
-    REQUIRED_CAPABILITIES,
-};
+pub use store::{delete_profile, load_profiles, upsert_profile, validate_profile};
