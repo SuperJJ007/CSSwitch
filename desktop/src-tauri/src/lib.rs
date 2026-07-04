@@ -1792,13 +1792,13 @@ fn app_version() -> String {
 /// 打开 GitHub Releases 页（检查更新时用系统浏览器打开，浏览器走用户自己的代理）。
 #[tauri::command]
 fn open_release_page() -> Result<(), String> {
-    open_in_browser("https://github.com/SuperJJ007/CSswitch/releases/latest")
+    open_in_browser("https://github.com/SuperJJ007/CSSwitch/releases/latest")
 }
 
 /// 打开「报 bug」页（预填 bug 模板）；用系统浏览器，走用户自己的代理。
 #[tauri::command]
 fn report_bug() -> Result<(), String> {
-    open_in_browser("https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml")
+    open_in_browser("https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml")
 }
 
 /// 在访达里打开日志目录 `~/.csswitch/logs`，方便用户附到 bug 反馈里（先自查有无密钥）。

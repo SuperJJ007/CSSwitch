@@ -10,6 +10,13 @@
 3. 绝不用改过的环境去起真实实例；真实端口 8765，沙箱一律独立 HOME+端口+data-dir。
 4. 测试默认不碰 Science；整链冒烟须用户明确同意（本轮用户已同意，见下「冒烟」）。
 
+## 命名规范
+
+项目名统一写作 **CSSwitch**（C-S-S，读作 CS Switch；CS = Claude **S**cience，呼应「CC Switch 之于 Claude Code」）。
+- 仓库名 2026-07-04 已从 `CSswitch` 改为 `CSSwitch`（GitHub URL 大小写不敏感，旧链接 / 克隆 / dmg 下载 / 更新检查照常）。
+- app productName、CHANGELOG、README、封面图、代码文案一律 `CSSwitch`；新增文案 / URL 都用 `CSSwitch`。
+- 例外保持不动：bundle id `com.csswitch.*`（小写惯例）；本机真实克隆目录 `/Users/superjj/ccproj/CSswitch`（磁盘真实名，改它会断一批脚本 / 记忆路径）。
+
 ## 分层
 
 CSSwitch = 翻译代理（Python）+ 虚拟登录伪造器（Node）+ 隔离脚本（shell）+ **菜单栏 app（Tauri，本阶段）**。

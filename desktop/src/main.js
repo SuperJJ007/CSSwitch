@@ -833,7 +833,7 @@ async function checkUpdate() {
   try { cur = await call("app_version"); } catch (e) {}
   try {
     const resp = await fetch(
-      "https://api.github.com/repos/SuperJJ007/CSswitch/releases/latest",
+      "https://api.github.com/repos/SuperJJ007/CSSwitch/releases/latest",
       { headers: { Accept: "application/vnd.github+json" } }
     );
     if (!resp.ok) throw new Error("HTTP " + resp.status);

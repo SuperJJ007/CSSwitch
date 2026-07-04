@@ -112,8 +112,8 @@ Kimi（Moonshot）、本地 Ollama 等更多来源仍在计划中，见下方「
 
 遇到问题或有新的想法，欢迎在 GitHub 提交反馈，方便持续跟踪和集中讨论：
 
-- **报告问题**：[新建 Bug 反馈](https://github.com/SuperJJ007/CSswitch/issues/new?template=bug_report.yml)，也可以点击面板右下角的「反馈 / 报 bug」。
-- **提出功能建议**：[新建功能建议](https://github.com/SuperJJ007/CSswitch/issues/new?template=feature_request.yml)，告诉我们你希望支持的模型或 API。
+- **报告问题**：[新建 Bug 反馈](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml)，也可以点击面板右下角的「反馈 / 报 bug」。
+- **提出功能建议**：[新建功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)，告诉我们你希望支持的模型或 API。
 - **附上日志**：面板中的「日志」链接会打开 `~/.csswitch/logs/`，其中包含 `proxy.log` 和 `sandbox.log`。日志可以帮助定位问题，但**提交前请务必删除其中的 API Key 和令牌**。
 
 CSSwitch 不包含自动遥测或崩溃上报，也不会在后台上传你的数据。只有你主动提交的反馈，才会离开本机。

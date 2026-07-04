@@ -130,7 +130,7 @@ RELAY_MODELS = []
 RELAY_FORCE_MODEL = None
 # 出站 User-Agent：部分中转站的 WAF 把默认的 "Python-urllib/x.y" 判为 bot 直接 403
 # （byteswarm 实测），故所有上游请求统一带一个非 bot 的 UA。
-UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSswitch)"
+UPSTREAM_UA = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)"
 
 # ---------- #3: targeted fast-fail（沙箱「Switching organization」卡死修复） ----------
 # 沙箱 Science 启动时会对 claude.ai/api/oauth/profile 发【阻塞式】请求解析组织；
