@@ -76,12 +76,20 @@ fn load_key_from_config(provider: &str) -> Result<Option<String>, String> {
     let raw = fs::read_to_string(&cfg).map_err(|e| format!("读配置失败：{e}"))?;
     let v: serde_json::Value =
         serde_json::from_str(&raw).map_err(|e| format!("解析配置失败：{e}"))?;
-    Ok(v.get("providers")
-        .and_then(|p| p.get(provider))
-        .and_then(|p| p.get("key"))
-        .and_then(|k| k.as_str())
-        .filter(|k| !k.is_empty())
-        .map(|k| k.to_string()))
+    // 新格式：profiles 数组中找 active profile 的 api_key
+    if let Some(profiles) = v.get("profiles").and_then(|p| p.as_array()) {
+        let active_id = v.get("active_id").and_then(|a| a.as_str()).unwrap_or("");
+        for p in profiles {
+            if p.get("id").and_then(|i| i.as_str()) == Some(active_id) {
+                if let Some(key) = p.get("key").or_else(|| p.get("api_key")).and_then(|k| k.as_str()) {
+                    if !key.is_empty() {
+                        return Ok(Some(key.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// 通过 HTTP GET /health 探活本地代理。
@@ -191,7 +199,11 @@ pub fn cmd_config_set(json_str: &str) -> CliEnvelope {
 pub fn cmd_config_save_key(provider: &str, key: &str) -> CliEnvelope {
     let dir = config_dir();
     let result = crate::config::update(&dir, |cfg| {
-        cfg.providers.entry(provider.to_string()).or_default().key = key.to_string();
+        if let Some(p) = cfg.active_profile_mut() {
+            if p.template_id == provider || crate::templates::adapter_for(&p.template_id) == provider {
+                p.api_key = key.to_string();
+            }
+        }
     });
     if let Err(e) = result {
         return CliEnvelope::err("config_write_error", &format!("保存 key 失败：{e}"));

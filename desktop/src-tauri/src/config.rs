@@ -116,6 +116,14 @@ impl Config {
         }
         self.profile_by_id(&self.active_id)
     }
+
+    pub fn active_profile_mut(&mut self) -> Option<&mut Profile> {
+        if self.active_id.is_empty() {
+            return None;
+        }
+        let id = self.active_id.clone();
+        self.profile_by_id_mut(&id)
+    }
     pub fn profile_by_id(&self, id: &str) -> Option<&Profile> {
         self.profiles.iter().find(|p| p.id == id)
     }
@@ -280,6 +288,7 @@ fn ensure_dir(dir: &Path) -> io::Result<()> {
 // ---------- 备份 ----------
 /// 原子拷贝 src → dst（拒符号链接、0600、O_EXCL 临时文件 + rename）。src 不存在 → Err。
 fn atomic_copy(src: &Path, dst: &Path) -> io::Result<()> {
+    use crate::fs_ext::{OpenOptionsExt, PermissionsExt};
     assert_not_symlink(dst)?;
     let data = fs::read(src)?; // src 不存在 → Err（迁移备份据此中止）
     let tmp = dst.with_extension(format!(

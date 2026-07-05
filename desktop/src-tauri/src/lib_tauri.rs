@@ -224,10 +224,14 @@ fn ensure_proxy(
 ) -> Result<(u16, String, ProxyAction), String> {
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
-    let provider = cfg.provider.clone();
-    let key = cfg
-        .key_for(&provider)
-        .ok_or_else(|| format!("缺少 {provider} 的 API key，请先在面板填写并保存。"))?;
+    let profile = cfg.active_profile().cloned()
+        .ok_or("没有生效的配置 Profile。请先「＋ 新建」或「设为当前」。")?;
+    let provider = templates::adapter_for(&profile.template_id).to_string();
+    let key = if profile.api_key.is_empty() {
+        return Err("当前 Profile 未填写 API Key。请填写后重试。".into());
+    } else {
+        profile.api_key.clone()
+    };
     let key_fp = key_fingerprint(&key);
     let port = cfg.proxy_port;
     let root = asset_root(app)
@@ -383,17 +387,18 @@ fn stop_sandbox_inner(_app: &tauri::AppHandle, st: &mut AppState) -> Result<(), 
 fn get_config() -> Result<serde_json::Value, String> {
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
-    let mut keys = serde_json::Map::new();
-    for p in ["deepseek", "qwen"] {
-        let masked = cfg.key_for(p).map(|k| config::mask(&k)).unwrap_or_default();
-        keys.insert(p.to_string(), serde_json::Value::String(masked));
-    }
     Ok(json!({
-        "provider": cfg.provider,
+        "schema_version": cfg.schema_version,
+        "active_id": cfg.active_id,
         "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port,
         "mode": cfg.mode,
-        "keys": keys,
+        "profiles": cfg.profiles.iter().map(|p| json!({
+            "id": p.id,
+            "name": p.name,
+            "template_id": p.template_id,
+            "key": config::mask(&p.api_key),
+        })).collect::<Vec<_>>(),
     }))
 }
 
@@ -475,35 +480,23 @@ fn open_official() -> Result<(), String> {
 
 #[derive(Deserialize)]
 struct UiSettings {
-    provider: String,
     proxy_port: u16,
     sandbox_port: u16,
 }
 
 #[tauri::command]
 fn set_config(cfg: UiSettings) -> Result<(), String> {
-    // 铁律防御：代理/沙箱端口都不许用真实实例保留端口 8765。
     if cfg.proxy_port == 8765 || cfg.sandbox_port == 8765 {
         return Err("端口 8765 是真实 Science 实例保留端口，不能用。".into());
     }
-    // 只认已实现的 provider，避免存进未知值后起代理时才失败（修 P2-3）。
-    if cfg.provider != "deepseek" && cfg.provider != "qwen" {
-        return Err(format!(
-            "未知 provider：{}（只支持 deepseek / qwen）。",
-            cfg.provider
-        ));
-    }
-    // 端口 0 非法（无法监听/探活）。
     if cfg.proxy_port == 0 || cfg.sandbox_port == 0 {
         return Err("端口不能为 0。".into());
     }
-    // 代理与沙箱不能同端口，否则互相抢占。
     if cfg.proxy_port == cfg.sandbox_port {
         return Err("代理端口与沙箱端口不能相同。".into());
     }
     let dir = config::default_dir();
     config::update(&dir, move |c| {
-        c.provider = cfg.provider;
         c.proxy_port = cfg.proxy_port;
         c.sandbox_port = cfg.sandbox_port;
     })
@@ -516,7 +509,12 @@ fn save_provider_key(provider: String, key: String) -> Result<String, String> {
     let dir = config::default_dir();
     let key2 = key.clone();
     config::update(&dir, move |c| {
-        c.providers.entry(provider).or_default().key = key2;
+        // 兼容旧接口：按 adapter/template_id 找到 active profile 并保存 key
+        if let Some(p) = c.active_profile_mut() {
+            if templates::adapter_for(&p.template_id) == provider || p.template_id == provider {
+                p.api_key = key2;
+            }
+        }
     })
     .map_err(|e| e.to_string())?;
     Ok(config::mask(&key))
@@ -836,7 +834,7 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
-        (pport, st.secret.clone(), sport, cfg.provider)
+        (pport, st.secret.clone(), sport, cfg.active_profile().map(|p| templates::adapter_for(&p.template_id).to_string()).unwrap_or_default())
     };
     let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
         "green"

@@ -14,6 +14,12 @@
 // 通过 #[path] 引入共享模块（helper 不依赖 Tauri，无法用 crate:: 引用整个 lib）。
 #[path = "../config.rs"]
 mod config;
+#[path = "../config_legacy.rs"]
+mod config_legacy;
+#[path = "../templates.rs"]
+mod templates;
+#[path = "../proc.rs"]
+mod proc;
 #[path = "../fs_ext.rs"]
 mod fs_ext;
 #[path = "../oauth_forge.rs"]
