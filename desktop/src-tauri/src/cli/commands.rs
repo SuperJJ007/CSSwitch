@@ -12,6 +12,10 @@ use serde_json::{json, Value};
 
 use super::types::CliEnvelope;
 
+const BUNDLED_PROXY: &str = include_str!("../../../../proxy/csswitch_proxy.py");
+const BUNDLED_DSML_SHIM: &str = include_str!("../../../../proxy/dsml_shim.py");
+const MANAGED_PROXY_HINT: &str = "~/.csswitch/proxy/csswitch_proxy.py";
+
 // ============================================================================
 // 路径工具
 // ============================================================================
@@ -31,6 +35,39 @@ fn config_path() -> PathBuf {
     config_dir().join("config.json")
 }
 
+fn managed_proxy_path() -> PathBuf {
+    config_dir().join("proxy").join("csswitch_proxy.py")
+}
+
+fn managed_proxy_file(name: &str) -> PathBuf {
+    config_dir().join("proxy").join(name)
+}
+
+fn write_managed_proxy_file(path: &Path, desired: &[u8]) -> Result<(), String> {
+    let needs_write = match fs::read(path) {
+        Ok(existing) => existing != desired,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => return Err(format!("读取 {} 失败：{e}", path.display())),
+    };
+    if needs_write {
+        fs::write(path, desired).map_err(|e| format!("写入 {} 失败：{e}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn ensure_managed_proxy_script() -> Result<PathBuf, String> {
+    let main = managed_proxy_path();
+    let parent = main
+        .parent()
+        .ok_or_else(|| format!("代理脚本路径无父目录：{MANAGED_PROXY_HINT}"))?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建 ~/.csswitch/proxy 失败：{e}"))?;
+
+    let shim = managed_proxy_file("dsml_shim.py");
+    write_managed_proxy_file(&shim, BUNDLED_DSML_SHIM.as_bytes())?;
+    write_managed_proxy_file(&main, BUNDLED_PROXY.as_bytes())?;
+    Ok(main)
+}
+
 /// 获取 `~/.csswitch/logs/` 目录路径。
 pub fn logs_dir() -> PathBuf {
     config_dir().join("logs")
@@ -38,29 +75,13 @@ pub fn logs_dir() -> PathBuf {
 
 /// 定位 `proxy/csswitch_proxy.py`：
 /// 1. `CSSWITCH_PROXY_DIR` 环境变量
-/// 2. Helper 二进制同级目录（部署态）
-/// 3. `~/.csswitch/proxy/`（统一管理目录）
-/// 4. 相对路径（开发态）
+/// 2. `~/.csswitch/proxy/`（统一管理目录，缺失或过期时由 helper 内置副本自愈）
 fn proxy_script_path() -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var("CSSWITCH_PROXY_DIR") {
         let p = PathBuf::from(&dir).join("csswitch_proxy.py");
         if p.is_file() { return Ok(p); }
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            let p = dir.join("proxy").join("csswitch_proxy.py");
-            if p.is_file() { return Ok(p); }
-            let p = dir.join("..").join("proxy").join("csswitch_proxy.py");
-            if p.is_file() { return Ok(p.canonicalize().unwrap_or(p)); }
-        }
-    }
-    // 统一管理目录 ~/.csswitch/proxy/
-    let default = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".csswitch").join("proxy").join("csswitch_proxy.py");
-    if default.is_file() { return Ok(default); }
-
-    Err("找不到 proxy/csswitch_proxy.py。请把它放到 ~/.csswitch/proxy/ 目录下。".to_string())
+    ensure_managed_proxy_script()
 }
 
 // ============================================================================
@@ -581,7 +602,7 @@ pub fn cmd_sandbox_status() -> CliEnvelope {
 
 /// `sandbox start <port> <proxy_url>` — 启动 Claude Science 沙箱。
 /// 用 `ANTHROPIC_BASE_URL` 环境变量指向代理，以独立 data-dir 运行。
-/// 注入虚拟 OAuth 凭证使 Science 认为已登录，设置 --host 0.0.0.0 允许外部访问。
+/// 注入虚拟 OAuth 凭证使 Science 认为已登录，仅监听回环地址，外部访问走 SSH 端口转发。
 pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
     let bin = match find_cmd("claude-science") {
         Some(b) => b,
@@ -630,7 +651,7 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
         .arg("--port")
         .arg(port.to_string())
         .arg("--host")
-        .arg("0.0.0.0")
+        .arg("127.0.0.1")
         .arg("--no-browser")
         .arg("--no-auto-update")
         .arg("--detached")

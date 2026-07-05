@@ -121,6 +121,34 @@ test("remote helper sandbox start returns a fresh claude-science url", () => {
   assert.match(body, /"url": url/);
 });
 
+test("remote helper sandbox start binds Science to loopback for SSH tunnel access", () => {
+  const m = helperCommands.match(/pub fn cmd_sandbox_start[\s\S]*?\n}\n\n\/\/\/ `sandbox stop/);
+  assert.ok(m, "cmd_sandbox_start body should be discoverable");
+  const body = m[0];
+  assert.match(body, /\.arg\("--host"\)\s*\.arg\("127\.0\.0\.1"\)/);
+  assert.doesNotMatch(body, /\.arg\("0\.0\.0\.0"\)/);
+});
+
+test("remote helper carries and installs the managed proxy script", () => {
+  assert.match(helperCommands, /include_str!\("\.\.\/\.\.\/\.\.\/\.\.\/proxy\/csswitch_proxy\.py"\)/);
+  assert.match(helperCommands, /include_str!\("\.\.\/\.\.\/\.\.\/\.\.\/proxy\/dsml_shim\.py"\)/);
+  assert.match(helperCommands, /fn ensure_managed_proxy_script\(\) -> Result<PathBuf, String>/);
+  assert.match(helperCommands, /"~\/\.csswitch\/proxy\/csswitch_proxy\.py"/);
+  assert.match(helperCommands, /dsml_shim\.py/);
+  assert.match(helperCommands, /BUNDLED_PROXY/);
+});
+
+test("remote helper prefers the self-healed managed proxy bundle after explicit overrides", () => {
+  const m = helperCommands.match(/fn proxy_script_path[\s\S]*?\n}\n\n\/\/ ==========/);
+  assert.ok(m, "proxy_script_path body should be discoverable");
+  const body = m[0];
+  assert.ok(
+    body.indexOf('std::env::var("CSSWITCH_PROXY_DIR")') < body.indexOf("ensure_managed_proxy_script()"),
+    "explicit CSSWITCH_PROXY_DIR override should remain first",
+  );
+  assert.doesNotMatch(body, /current_exe\(\)[\s\S]*ensure_managed_proxy_script\(\)/);
+});
+
 test("remote helper searches user-local binary directories for Science", () => {
   const m = helperCommands.match(/fn find_cmd[\s\S]*?\n}/);
   assert.ok(m, "find_cmd body should be discoverable");
