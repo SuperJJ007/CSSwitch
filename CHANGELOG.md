@@ -4,6 +4,34 @@
 
 > **约定**：已修问题从 [`docs/known-issues.md`](docs/known-issues.md)「毕业」到这里（发布即定稿）；未修/进行中留在 known-issues；硬 bug 的根因证据链存在 [`findings/`](findings/)。
 
+## [0.3.3] — 2026-07-05
+
+> 主题：**跨平台桌面构建 + 远程 Linux Helper**。这一版把 CSSwitch 从 Apple Silicon 单平台包推进到 Windows x64 / Windows arm64 / macOS arm64 三类桌面安装包，并把远程 Linux helper 做成 x86_64 / aarch64 两个静态产物，方便在 Windows 桌面里一键准备远程服务器上的 Science 沙箱。版本同时补齐 GitHub Actions 发版矩阵和 macOS 编译回归，后续可以通过 `v*` tag 自动构建并发布。
+
+### 新增 Added
+- **Windows 桌面包**：CI 现在产出 `CSSwitch-Windows-x64` 和 `CSSwitch-Windows-arm64` 两个 NSIS 安装器；x64 面向常见 Intel/AMD Windows，arm64 面向 Windows on Arm。
+- **macOS Apple Silicon DMG**：保留现有 macOS arm64 DMG 方案，不额外引入 Intel / Universal 构建，避免扩大未签名分发范围。
+- **远程 Linux helper 双架构**：CI 产出 `csswitch-helper-linux-x86_64` 与 `csswitch-helper-linux-aarch64`，桌面包会内置 helper 资产，用于自动上传到远程 Linux 主机并管理远程沙箱 / 代理。
+- **远程一键启动闭环**：补齐 SSH 登录认证、helper 上传 / 自愈、固定远程端口、返回远程沙箱访问链接、远程进程状态检测等路径，让 Windows 本机也能管理 Linux 远程运行环境。
+- **可追溯发布矩阵**：GitHub Actions 拆成 helper、Windows、macOS、测试、Release 五段；main 分支先验证产物，`v*` tag 再自动创建 Release 并挂载安装包 / 二进制资产。
+
+### 变更 Changed
+- **桌面包自包含策略**：Tauri 资源继续打入 `proxy/`、`scripts/` 和 `helper-assets/`，所以安装后的 Windows / macOS app 不需要旁边再放仓库源码。这里包含的 Python 文件是 CSSwitch 本地代理运行所需脚本，不是第三方项目二进制。
+- **平台产物定位明确**：Windows 发布 x64 + arm64 两个安装器；macOS 按现有方案只发 Apple Silicon arm64 DMG；Linux 不发布桌面 app，只发布给远程模式使用的 helper。
+- **远程 helper 内置代理脚本**：helper 自身也编译进代理脚本兜底，远程主机缺文件或安装目录被清理时可以重新落地，减少“装过一次后漂移”的问题。
+
+### 修复 Fixed
+- **macOS CI 编译失败**：修复 Tauri 回调和停沙箱路径里的 `AppHandle` 作用域问题，并加 UI contract 回归测试覆盖 `_app` / `app` 这类跨平台编译差异。
+- **helper / 桌面构建参数不一致**：统一 helper 的无桌面特性构建、Tauri 桌面 target 和资源下载路径，避免某个平台构建成功但包内缺远程资产。
+- **远程沙箱进程管理健壮性**：加强端口避让、用户级路径兼容、状态识别和停止逻辑，减少远程一键启动后残留进程或误判。
+
+### 说明 Notes
+- 如果要让安装包内部版本号和 Release tag 完全一致，请使用 `v0.3.3` tag 触发 Actions 重新构建；不建议把 `0.3.2` 版本号的旧 artifacts 挂到 `v0.3.3`。
+- 与 CC Switch 的关系：CSSwitch 的命名和产品形态受 [CC Switch](https://github.com/farion1231/cc-switch) 启发，也借鉴了“provider/profile 切换工具”的思路；CC Switch 使用 MIT 许可。CSSwitch 是面向 Claude Science 的独立项目，不隶属、不同步发布、也不受 CC Switch 或 Anthropic 背书；当前代理、桌面、远程 helper 和沙箱登录实现均为本仓库实现，没有打包 CC Switch 二进制。
+- 发布产物说明：Windows 下载 `.exe` 安装器；macOS Apple Silicon 下载 `.dmg`；`csswitch-helper-linux-*` 是远程服务器用的 helper，不是普通用户桌面安装包。
+- 分发限制：当前 Windows 未做代码签名，可能触发 SmartScreen；macOS 为 ad-hoc 签名、未 Apple notarization，首次打开需右键“打开”或在隐私与安全性里放行。
+- 安全边界仍不变：只操作 CSSwitch 的隔离沙箱和 `~/.csswitch` 配置，真实 Science 数据目录与 8765 端口仍按铁律保护。
+
 ## [0.3.2] — 2026-07-04
 
 > 主题：**Science 顶部显示真实模型名 + 新增 Kimi / MiniMax**。修复 relay 家在 Science 模型选择器里笼统显示「claude / opus」的问题（#11），让每个服务商都能选择或自填模型、并在 Science 里显示真实模型名；新增 Kimi（Moonshot）与 MiniMax；各家内置模型更新到官方主流版本。

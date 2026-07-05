@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <img src="https://img.shields.io/badge/platform-macOS%20(Apple%20Silicon)-1d1d1f.svg" alt="macOS">
+  <img src="https://img.shields.io/badge/platform-Windows%20x64%2Farm64%20%7C%20macOS%20arm64-1d1d1f.svg" alt="Platforms">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
 
@@ -76,14 +76,14 @@ CSSwitch 的名字和产品形态参考了 [CC Switch](https://github.com/farion
 
 开始之前，请先安装 [Claude Science](https://claude.com)，并确认系统中有 `python3`。虚拟登录已经由 Rust 原生实现，**不需要安装 Node.js**。
 
-1. 从最新的 [Release](../../releases/latest) 下载 `CSSwitch_*.dmg`，然后把 CSSwitch 拖入「应用程序」。由于当前版本尚未经过 Apple 公证，第一次启动时请右键应用并选择「打开」。
+1. 从最新的 [Release](../../releases/latest) 下载对应平台的安装包：Windows x64 下载 `CSSwitch_*_x64-setup.exe`，Windows on Arm 下载 `CSSwitch_*_arm64-setup.exe`，macOS Apple Silicon 下载 `CSSwitch_*.dmg` 并把 CSSwitch 拖入「应用程序」。`csswitch-helper-linux-*` 是远程 Linux 服务器模式使用的 helper，不是桌面安装包。
 2. 打开 CSSwitch，保持顶部选择「**第三方模型**」，点「**＋ 新建**」，选择来源、粘贴自己的第三方 API Key，点「**创建**」。密钥只保存在本机 `~/.csswitch` 目录下（`config.json` 及其滚动 / 迁移备份，均为 `0600` 权限），不会离开你的电脑。
 3. 在列表里点这条配置的「**设为当前**」。CSSwitch 会先校验 Key 再启用，通不过会提示、不会切换。
 4. 点击「**一键开始**」。CSSwitch 会依次启动代理、写入本地登录状态、启动隔离环境，并在浏览器中打开 Science。
 
 > 你只需要准备自己的第三方 API Key，其余步骤由 CSSwitch 自动完成。
 >
-> 如果应用被 Gatekeeper 拦截，可以右键选择「打开」，或者前往「系统设置 → 隐私与安全性」并点击「仍要打开」。当前版本仅支持 Apple Silicon（arm64）。
+> macOS 版本尚未经过 Apple 公证。如果应用被 Gatekeeper 拦截，可以右键选择「打开」，或者前往「系统设置 → 隐私与安全性」并点击「仍要打开」。Windows 版本暂未代码签名，首次安装可能触发 SmartScreen，请只从本仓库 Release 下载。
 
 命令行用法、构建和测试步骤见 [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) 与 [`desktop/README.md`](./desktop/README.md)。各版本的具体变化见 [`CHANGELOG.md`](./CHANGELOG.md)。
 

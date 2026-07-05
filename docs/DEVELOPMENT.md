@@ -24,14 +24,15 @@ CSSwitch = 翻译代理（Python）+ 虚拟登录伪造器（**Rust 原生**）+
 
 app 是**进程管家**：Rust 后端起停子进程、注入环境变量、读写配置、探活、跑切换事务；已验证的越权/翻译逻辑仍留在 `proxy/`、`scripts/` 里被当子进程调用（保住护栏与已验证行为，Rust 侧最小）。虚拟 OAuth 伪造已移进 Rust（`src-tauri/src/oauth_forge.rs`，字节级一致、护栏拒真实目录），**app 运行不需要 Node.js**；`scripts/make-virtual-oauth.mjs` 是等价的 Node 独立版，仅命令行单独用时才需要 node。
 
-## 现状（截至 2026-07-04，`main`，最新发布 v0.3.2）
+## 现状（截至 2026-07-05，`main`，最新发布以 GitHub Releases 为准）
 
-**已发布**：v0.3.2（Latest）—— 见 [`../CHANGELOG.md`](../CHANGELOG.md) 与 GitHub Releases（此处不复述版本号，以那两处为准）。
+**已发布**：见 [`../CHANGELOG.md`](../CHANGELOG.md) 与 GitHub Releases（此处不再硬写 Latest 版本号，以那两处为准）。
 
 **能力面**：
 - **多 profile 配置管理**（cc-switch 式）：7 家 provider 模板（DeepSeek / 通义千问 / 智谱 GLM / Kimi / MiniMax / 小米 MiMo / 硅基流动 / OpenRouter）+ 自定义端点；同一家可保存多套（不同 key / 模型）；JSON 存储 `~/.csswitch/config.json`（schema v2，v1→v2 一次性迁移），key 明文 0600、只回掩码。
 - **provider 分型**：native（deepseek/qwen，`--provider` 走各自固定端点）vs relay（其余，anthropic 兼容透传、双鉴权、带 `base_url`）。qwen 是唯一走 OpenAI↔Anthropic 翻译的（DashScope 只 OpenAI 端点）；deepseek/relay 都原生 anthropic 透传。
 - **模型选择（#9，v0.3.2）**：全 relay 家「选一个模型 → force」；模型控件是「下拉精选 + 自填」；代理 force 时 `/v1/models` 回单壳 `claude-opus-4-8`+真实 `display_name`，Science 顶部选择器显示真实模型名。
+- **跨平台发版（v0.3.3）**：GitHub Actions 产出 Windows x64 / Windows arm64 NSIS 安装器、macOS arm64 DMG，以及远程 Linux helper 的 x86_64 / aarch64 静态二进制；`v*` tag 会自动创建 Release 并挂载这些资产。
 - **UI**：正常窗口 420×700（`decorations:true`，已去托盘/菜单栏），配置列表 + chip 网格 + 三能力模型呈现（native/relay）。
 - **切换事务**：`set_active`/连接编辑经串行器走「scratch 校验候选 → 起正式代理探活 → 健康才提交 active_id」，失败回滚不停沙箱。
 
@@ -131,10 +132,9 @@ registry = "sparse+https://rsproxy.cn/index/"
 # 3. gh/git 前先： export HTTPS_PROXY=http://127.0.0.1:7890 HTTP_PROXY=http://127.0.0.1:7890 ALL_PROXY=http://127.0.0.1:7890
 #    （大写默认 8001 是死的，gh 会误报 token invalid）
 git push origin main
-# 4. 打包 dmg：cd desktop && npm run tauri build
-# 5. tag + Release
+# 4. 推送 main 后确认 GitHub Actions 的 main 构建全绿
+# 5. tag + 自动 Release（workflow 会重新构建并挂载 Windows/macOS/helper 产物；若 docs/release-notes/<tag>.md 或 <version>.md 存在则用它作为 Release 正文）
 git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z
-gh release create vX.Y.Z --title "..." --notes-file <notes> <dmg 路径>
 # 6. 发布前建议 gitleaks 扫（工作树/暂存/历史三处）
 ```
-当前 dmg 未 Apple 公证（无 APPLE_* 凭证），首次启动右键「打开」；仅 Apple Silicon（arm64）。
+当前 macOS DMG 未 Apple 公证（无 APPLE_* 凭证），首次启动右键「打开」；macOS 仅 Apple Silicon（arm64）。Windows 安装器暂未代码签名，首次安装可能触发 SmartScreen。

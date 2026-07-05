@@ -1,6 +1,6 @@
 # CSSwitch 桌面 app（Tauri）
 
-macOS 桌面 app（正常窗口，非菜单栏），把 CSSwitch 的日常操作收进一个面板：第三方 / 官方模式切换、选 provider、填第三方 key、一键开始、起停代理与沙箱、三盏状态灯。
+跨平台桌面 app（正常窗口，非菜单栏），把 CSSwitch 的日常操作收进一个面板：本地 / 远程模式切换、第三方 / 官方模式切换、选 provider、填第三方 key、一键开始、起停代理与沙箱、三盏状态灯。
 
 架构上它只是**进程管家**：Rust 后端负责起停子进程、注入环境变量、读写配置、探活。虚拟 OAuth 伪造已在 v0.1.4 移进 Rust 原生实现（`src/oauth_forge.rs`，app 运行时不再需要 node）；翻译逻辑仍在 `proxy/csswitch_proxy.py` 作子进程调用（下一步移 axum 拔 python），沙箱启动仍走 `scripts/launch-virtual-sandbox.sh`，以保住铁律护栏与已验证行为。
 
@@ -49,14 +49,14 @@ cd desktop
 npm run tauri build
 ```
 
-产物是 `.app` / `.dmg`。`proxy/` 与 `scripts/` 已通过 `tauri.conf.json` 的 `bundle.resources`
-打进 `Contents/Resources/`，从 Finder 启动的正式 `.app` 也能找到并调用它们（自包含）。
+产物按平台不同是 Windows `.exe` 安装器或 macOS `.app` / `.dmg`。`proxy/`、`scripts/` 与 `helper-assets/` 已通过 `tauri.conf.json` 的 `bundle.resources`
+打进安装包资源目录，从正式安装的 app 启动也能找到并调用它们（自包含）。
 沙箱运行状态落在可写的 `~/.csswitch/sandbox/home`（不写进只读的 `.app` 包内）。
 
 > **签名/分发说明**：本版做 **ad-hoc 签名**（`bundle.macOS.signingIdentity: "-"`，正确封装资源），
 > 但**未做 Apple 公证（notarization）**——那需要付费的 Apple Developer ID 证书。因此从 Finder 首次打开会被
 > Gatekeeper 拦：请**右键 →「打开」**，或系统设置 → 隐私与安全性 →「仍要打开」。
-> 产物目前是 **arm64（Apple Silicon）**；Intel Mac 需要额外的 x86_64 / universal 构建。
+> macOS 产物目前仍是 **arm64（Apple Silicon）**；Intel Mac 需要额外的 x86_64 / universal 构建。Windows CI 同时产出 x64 与 arm64 安装器。
 
 ## 铁律保障
 

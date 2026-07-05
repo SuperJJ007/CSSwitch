@@ -139,8 +139,33 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
-      - name: Create Release
+      - name: Resolve Release Notes
+        id: release_notes
+        shell: bash
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          if [[ -f "docs/release-notes/${tag}.md" ]]; then
+            echo "path=docs/release-notes/${tag}.md" >> "$GITHUB_OUTPUT"
+          elif [[ -f "docs/release-notes/${version}.md" ]]; then
+            echo "path=docs/release-notes/${version}.md" >> "$GITHUB_OUTPUT"
+          else
+            echo "path=" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Create Release with curated notes
+        if: steps.release_notes.outputs.path != ''
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            CSSwitch-Windows-*/*.exe
+            CSSwitch-macOS-arm64/*.dmg
+            csswitch-helper-*/*
+          draft: false
+          body_path: ${{ steps.release_notes.outputs.path }}
+      - name: Create Release with generated notes
+        if: steps.release_notes.outputs.path == ''
         uses: softprops/action-gh-release@v1
         with:
           files: |

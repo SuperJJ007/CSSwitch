@@ -175,6 +175,15 @@ test("release job uploads all public release assets", () => {
   assert.match(body, /csswitch-helper-\*\/\*/);
 });
 
+test("release job prefers curated release notes when present", () => {
+  const body = workflowJob("release");
+  assert.match(body, /Resolve Release Notes/);
+  assert.match(body, /docs\/release-notes\/\$\{tag\}\.md/);
+  assert.match(body, /docs\/release-notes\/\$\{version\}\.md/);
+  assert.match(body, /body_path: \$\{\{ steps\.release_notes\.outputs\.path \}\}/);
+  assert.match(body, /generate_release_notes: true/);
+});
+
 test("linux helper release workflow uses cross for musl target builds", () => {
   const body = workflowJob("build-helper");
   assert.match(body, /fail-fast: false/);
