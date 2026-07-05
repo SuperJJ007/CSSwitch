@@ -303,16 +303,19 @@ test("remote helper sandbox start returns a fresh claude-science url", () => {
   assert.match(body, /"url": url/);
 });
 
-test("remote helper waits for the Science daemon before fetching a sandbox url", () => {
+test("remote helper clears stale Science processes and waits for a usable sandbox url", () => {
   const m = helperCommands.match(/pub fn cmd_sandbox_start[\s\S]*?\n}\n\n\/\/\/ `sandbox stop/);
   assert.ok(m, "cmd_sandbox_start body should be discoverable");
   const body = m[0];
   assert.match(helperCommands, /fn wait_for_sandbox_ready/);
-  assert.match(helperCommands, /fn sandbox_daemon_running/);
+  assert.match(helperCommands, /fn terminate_sandbox_processes/);
+  assert.match(helperCommands, /fn matching_sandbox_pids/);
   assert.ok(
-    body.indexOf("wait_for_sandbox_ready") < body.indexOf("sandbox_fresh_url"),
-    "sandbox start must wait for daemon readiness before running claude-science url",
+    body.indexOf("terminate_sandbox_processes") < body.indexOf(".spawn()"),
+    "sandbox start must clear stale same-data-dir Science processes before spawning",
   );
+  assert.match(helperCommands, /let url = sandbox_fresh_url/);
+  assert.match(helperCommands, /http_health\(port, None/);
   assert.match(body, /sandbox\.log/);
   assert.doesNotMatch(
     body,

@@ -899,9 +899,7 @@ fn map_ssh_error(profile: &RemoteHostProfile, stderr: &str, exit_code: Option<i3
     // 认证失败（不可重试）
     // 注意：只包含 "permission denied" 但没有 "publickey"/"authentication failed"
     // 的是文件权限错误，由后面 permission_denied 分支处理。
-    if stderr_lower.contains("publickey")
-        || stderr_lower.contains("authentication failed")
-    {
+    if stderr_lower.contains("publickey") || stderr_lower.contains("authentication failed") {
         return RemoteError {
             code: "ssh_auth_failed".to_string(),
             message: "SSH 认证失败，请检查用户名和密钥配置".to_string(),

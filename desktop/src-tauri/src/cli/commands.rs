@@ -13,8 +13,12 @@ use serde_json::{json, Value};
 
 use super::types::CliEnvelope;
 
-const BUNDLED_PROXY: &str = include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/csswitch_proxy.py"));
-const BUNDLED_DSML_SHIM: &str = include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/dsml_shim.py"));
+const BUNDLED_PROXY: &str = include_str!(concat!(
+    env!("CSSWITCH_BUNDLED_PROXY_DIR"),
+    "/csswitch_proxy.py"
+));
+const BUNDLED_DSML_SHIM: &str =
+    include_str!(concat!(env!("CSSWITCH_BUNDLED_PROXY_DIR"), "/dsml_shim.py"));
 const MANAGED_PROXY_HINT: &str = "~/.csswitch/proxy/csswitch_proxy.py";
 
 // ============================================================================
@@ -80,7 +84,9 @@ pub fn logs_dir() -> PathBuf {
 fn proxy_script_path() -> Result<PathBuf, String> {
     if let Ok(dir) = std::env::var("CSSWITCH_PROXY_DIR") {
         let p = PathBuf::from(&dir).join("csswitch_proxy.py");
-        if p.is_file() { return Ok(p); }
+        if p.is_file() {
+            return Ok(p);
+        }
     }
     ensure_managed_proxy_script()
 }
@@ -124,7 +130,8 @@ fn proxy_launch_from_config(provider: &str) -> Result<Option<ProxyLaunch>, Strin
     }
     if adapter == "relay" {
         if profile.base_url.trim().is_empty()
-            || !(profile.base_url.starts_with("http://") || profile.base_url.starts_with("https://"))
+            || !(profile.base_url.starts_with("http://")
+                || profile.base_url.starts_with("https://"))
         {
             return Err("relay 配置需要 http(s):// 开头的 base_url。".to_string());
         }
@@ -156,7 +163,8 @@ fn proxy_health(port: u16, secret: &str) -> bool {
         return false;
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let req = format!("GET /{secret}/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
+    let req =
+        format!("GET /{secret}/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n");
     if stream.write_all(req.as_bytes()).is_err() {
         return false;
     }
@@ -166,7 +174,9 @@ fn proxy_health(port: u16, secret: &str) -> bool {
     };
     let head = String::from_utf8_lossy(&buf[..n]);
     // 严格解析 HTTP 状态码（审核 P2-7）：精确匹配第二段 "200"，避免 reason phrase 中的误判。
-    head.lines().next().map_or(false, |line| line.split_whitespace().nth(1) == Some("200"))
+    head.lines()
+        .next()
+        .map_or(false, |line| line.split_whitespace().nth(1) == Some("200"))
 }
 
 // ============================================================================
@@ -251,7 +261,9 @@ pub fn cmd_config_save_key(provider: &str, key: &str) -> CliEnvelope {
     let dir = config_dir();
     let result = crate::config::update(&dir, |cfg| {
         if let Some(p) = cfg.active_profile_mut() {
-            if p.template_id == provider || crate::templates::adapter_for(&p.template_id) == provider {
+            if p.template_id == provider
+                || crate::templates::adapter_for(&p.template_id) == provider
+            {
                 p.api_key = key.to_string();
             }
         }
@@ -273,7 +285,10 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     // 检查是否已在运行（通过 TCP 端口探活）
     if is_port_open(port) {
         if proxy_health(port, secret) {
-            return CliEnvelope::err("proxy_already_running", &format!("代理已在端口 {} 上运行", port));
+            return CliEnvelope::err(
+                "proxy_already_running",
+                &format!("代理已在端口 {} 上运行", port),
+            );
         }
         let _ = stop_recorded_proxy(port);
         if !clear_unhealthy_proxy_port(port) {
@@ -288,11 +303,13 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     // 获取需要注入的 active Profile 连接信息
     let launch = match proxy_launch_from_config(provider) {
         Ok(Some(v)) => v,
-        Ok(None) => return CliEnvelope::err_with_hint(
-            "key_not_found",
-            &format!("配置中未找到 {provider} 的 API key"),
-            "请先在客户端面板填写并保存 API Key。",
-        ),
+        Ok(None) => {
+            return CliEnvelope::err_with_hint(
+                "key_not_found",
+                &format!("配置中未找到 {provider} 的 API key"),
+                "请先在客户端面板填写并保存 API Key。",
+            )
+        }
         Err(e) => return CliEnvelope::err("config_read_error", &e),
     };
 
@@ -337,8 +354,7 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
         }
     }
 
-    match cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
-    {
+    match cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
         Ok(child) => {
             let pid = child.id();
             // 将 secret 持久化，并记录 PID 到文件供后续查找。
@@ -352,7 +368,9 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
             }))
         }
         Err(e) => {
-            let hint = if e.to_string().contains("AddrInUse") || e.to_string().contains("address in use") {
+            let hint = if e.to_string().contains("AddrInUse")
+                || e.to_string().contains("address in use")
+            {
                 format!("端口 {port} 已被占用。请更改端口或停止占用程序。")
             } else {
                 format!("启动代理失败：{e}")
@@ -503,7 +521,9 @@ fn clear_unhealthy_proxy_port(port: u16) -> bool {
 }
 
 /// 获取持久化 proxy secret 的文件路径。
-fn secret_file() -> PathBuf { config_dir().join("proxy.secret") }
+fn secret_file() -> PathBuf {
+    config_dir().join("proxy.secret")
+}
 
 /// 从 `~/.csswitch/proxy.secret` 加载上次代理启动时保存的 secret。
 fn load_proxy_secret() -> Result<String, String> {
@@ -521,8 +541,7 @@ fn load_proxy_secret() -> Result<String, String> {
 /// 审核 P0-1 修复：不再硬编码弱 secret，每次启动由调用方传入随机生成的 secret。
 fn save_proxy_secret(secret: &str) -> Result<(), String> {
     let _ = std::fs::create_dir_all(&config_dir());
-    std::fs::write(secret_file(), secret)
-        .map_err(|e| format!("写 secret 文件失败：{e}"))
+    std::fs::write(secret_file(), secret).map_err(|e| format!("写 secret 文件失败：{e}"))
 }
 
 /// 从配置文件读取代理端口，无配置时返回默认值 18991。
@@ -560,14 +579,18 @@ fn is_port_open(port: u16) -> bool {
     .is_ok()
 }
 
-fn sandbox_process_found() -> bool {
-    let (_, data_dir) = sandbox_paths();
+fn sandbox_process_found_for(data_dir: &Path) -> bool {
     let pattern = data_dir.to_string_lossy().to_string();
     Command::new("pgrep")
         .args(["-f", &pattern])
         .output()
         .map(|o| !o.stdout.is_empty())
         .unwrap_or(false)
+}
+
+fn sandbox_process_found() -> bool {
+    let (_, data_dir) = sandbox_paths();
+    sandbox_process_found_for(&data_dir)
 }
 
 fn sandbox_paths() -> (PathBuf, PathBuf) {
@@ -601,6 +624,60 @@ fn tail_file(path: &Path, max_chars: usize) -> String {
     tail.into_iter().collect::<String>().trim().to_string()
 }
 
+fn matching_sandbox_pids(data_dir: &Path) -> Vec<u32> {
+    let pattern = data_dir.to_string_lossy().to_string();
+    let Ok(out) = Command::new("pgrep").args(["-f", &pattern]).output() else {
+        return Vec::new();
+    };
+    let current_pid = std::process::id();
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.trim().parse::<u32>().ok())
+        .filter(|pid| *pid != current_pid)
+        .filter(|pid| {
+            fs::read(format!("/proc/{pid}/cmdline"))
+                .map(|raw| {
+                    let cmdline = String::from_utf8_lossy(&raw).replace('\0', " ");
+                    cmdline.contains("claude-science")
+                        && cmdline.contains("serve")
+                        && cmdline.contains(pattern.as_str())
+                })
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
+fn wait_sandbox_pids_exit(data_dir: &Path, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if matching_sandbox_pids(data_dir).is_empty() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    matching_sandbox_pids(data_dir).is_empty()
+}
+
+fn terminate_sandbox_processes(data_dir: &Path) -> bool {
+    let pids = matching_sandbox_pids(data_dir);
+    if pids.is_empty() {
+        return false;
+    }
+    for pid in &pids {
+        let _ = Command::new("kill")
+            .args(["-TERM", &pid.to_string()])
+            .output();
+    }
+    if wait_sandbox_pids_exit(data_dir, 12) {
+        return true;
+    }
+    for pid in matching_sandbox_pids(data_dir) {
+        let _ = Command::new("kill")
+            .args(["-KILL", &pid.to_string()])
+            .output();
+    }
+    wait_sandbox_pids_exit(data_dir, 8)
+}
+
 fn sandbox_daemon_running(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<bool, String> {
     match Command::new(bin)
         .args(["status", "--data-dir"])
@@ -632,38 +709,31 @@ fn wait_for_sandbox_ready(
     data_dir: &Path,
     port: u16,
     log_path: &Path,
-) -> Result<(), String> {
-    let mut last_status = "尚未检查".to_string();
-    for _ in 0..40 {
-        match sandbox_daemon_running(bin, sandbox_home, data_dir) {
-            Ok(true) if crate::proc::http_health(port, None, 400) => return Ok(()),
-            Ok(true) => last_status = format!("daemon 已运行，但端口 {port} 还未健康"),
-            Ok(false) => last_status = "daemon 尚未运行".to_string(),
-            Err(e) => last_status = e,
+) -> Result<String, String> {
+    let url = sandbox_fresh_url(bin, sandbox_home, data_dir)?;
+    for _ in 0..60 {
+        if crate::proc::http_health(port, None, 400) {
+            return Ok(url);
         }
-        std::thread::sleep(std::time::Duration::from_millis(250));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     let tail = tail_file(log_path, 2000);
     if tail.is_empty() {
-        Err(format!("等待 Science daemon 就绪超时：{last_status}"))
+        Err(format!(
+            "已拿到 Science 登录链接，但端口 {port} 的 /health 一直未就绪"
+        ))
     } else {
         Err(format!(
-            "等待 Science daemon 就绪超时：{last_status}\n--- sandbox.log ---\n{tail}"
+            "已拿到 Science 登录链接，但端口 {port} 的 /health 一直未就绪\n--- sandbox.log ---\n{tail}"
         ))
     }
 }
 
 fn sandbox_is_running() -> bool {
     let port = get_configured_sandbox_port();
-    let (sandbox_home, data_dir) = sandbox_paths();
-    match find_cmd("claude-science")
-        .as_deref()
-        .map(|bin| sandbox_daemon_running(bin, &sandbox_home, &data_dir))
-    {
-        Some(Ok(true)) => crate::proc::http_health(port, None, 400),
-        _ => false,
-    }
+    let (_, data_dir) = sandbox_paths();
+    crate::proc::http_health(port, None, 400) && sandbox_process_found_for(&data_dir)
 }
 
 /// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
@@ -680,7 +750,7 @@ pub fn cmd_sandbox_status() -> CliEnvelope {
         },
         None => (false, Some("未找到 claude-science 命令".to_string())),
     };
-    let running = daemon_running && port_healthy;
+    let running = port_healthy && process_found;
 
     if running {
         CliEnvelope::ok(json!({
@@ -725,6 +795,28 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
     // 确保运行时目录存在
     let _ = std::fs::create_dir_all(&data_dir);
 
+    if is_port_open(port) || sandbox_process_found_for(&data_dir) {
+        let _ = Command::new(&bin)
+            .args(["stop", "--data-dir"])
+            .arg(&data_dir)
+            .env("HOME", &sandbox_home)
+            .output();
+        terminate_sandbox_processes(&data_dir);
+        for _ in 0..20 {
+            if !is_port_open(port) && !sandbox_process_found_for(&data_dir) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        if is_port_open(port) {
+            return CliEnvelope::err_with_hint(
+                "port_in_use",
+                &format!("端口 {port} 已被占用，无法启动 Science 沙箱。"),
+                "请先停止占用该端口的进程，或在高级设置里更换沙箱端口。",
+            );
+        }
+    }
+
     // 注入虚拟 OAuth 凭证，让 Science 认为已登录（否则启动后会因找不到登录态报错）
     if let Err(e) = crate::oauth_forge::ensure_virtual_login(
         &data_dir,
@@ -760,11 +852,18 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
         .open(&sandbox_log)
     {
         Ok(file) => file,
-        Err(e) => return CliEnvelope::err("sandbox_log_error", &format!("打开 sandbox.log 失败：{e}")),
+        Err(e) => {
+            return CliEnvelope::err("sandbox_log_error", &format!("打开 sandbox.log 失败：{e}"))
+        }
     };
     let log_file_for_stderr = match log_file.try_clone() {
         Ok(file) => file,
-        Err(e) => return CliEnvelope::err("sandbox_log_error", &format!("复制 sandbox.log 句柄失败：{e}")),
+        Err(e) => {
+            return CliEnvelope::err(
+                "sandbox_log_error",
+                &format!("复制 sandbox.log 句柄失败：{e}"),
+            )
+        }
     };
 
     match std::process::Command::new(&bin)
@@ -788,33 +887,24 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
         .spawn()
     {
         Ok(_child) => {
-            if let Err(e) = wait_for_sandbox_ready(&bin, &sandbox_home, &data_dir, port, &sandbox_log) {
-                return CliEnvelope::err_with_hint(
-                    "sandbox_start_timeout",
-                    &format!("沙箱启动后未就绪：{e}"),
-                    "请查看 helper 的 sandbox.log，确认 claude-science 是否启动成功。",
-                );
-            }
-            match sandbox_fresh_url(&bin, &sandbox_home, &data_dir) {
+            match wait_for_sandbox_ready(&bin, &sandbox_home, &data_dir, port, &sandbox_log) {
                 Ok(url) => CliEnvelope::ok(json!({
                     "message": format!("沙箱已启动，端口 {}", port),
                     "port": port,
                     "url": url,
                 })),
                 Err(e) => CliEnvelope::err_with_hint(
-                    "sandbox_url_failed",
-                    &format!("沙箱已启动，但获取访问链接失败：{e}"),
-                    "请稍后重试一键开始，或在服务器上运行 claude-science url 获取新的访问链接。",
+                    "sandbox_start_timeout",
+                    &format!("沙箱启动后未就绪：{e}"),
+                    "请查看 helper 的 sandbox.log，确认 claude-science 是否启动成功。",
                 ),
             }
         }
-        Err(e) => {
-            CliEnvelope::err_with_hint(
-                "sandbox_start_failed",
-                &format!("启动沙箱失败：{e}"),
-                &format!("请检查端口 {} 是否被占用。", port),
-            )
-        }
+        Err(e) => CliEnvelope::err_with_hint(
+            "sandbox_start_failed",
+            &format!("启动沙箱失败：{e}"),
+            &format!("请检查端口 {} 是否被占用。", port),
+        ),
     }
 }
 
@@ -829,7 +919,11 @@ fn sandbox_fresh_url(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<
         {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                if let Some(url) = stdout.lines().map(str::trim).find(|line| line.starts_with("http")) {
+                if let Some(url) = stdout
+                    .lines()
+                    .map(str::trim)
+                    .find(|line| line.starts_with("http"))
+                {
                     return Ok(url.to_string());
                 }
                 last_error = "claude-science url 未返回可用 URL".to_string();
@@ -853,7 +947,8 @@ fn sandbox_fresh_url(bin: &str, sandbox_home: &Path, data_dir: &Path) -> Result<
 
 /// `sandbox stop` — 停止 Claude Science 沙箱。
 pub fn cmd_sandbox_stop() -> CliEnvelope {
-    if !sandbox_is_running() {
+    let (sandbox_home, data_dir) = sandbox_paths();
+    if !sandbox_is_running() && !sandbox_process_found_for(&data_dir) {
         return CliEnvelope::ok(json!({
             "message": "沙箱未运行。",
             "stopped": false,
@@ -862,13 +957,8 @@ pub fn cmd_sandbox_stop() -> CliEnvelope {
 
     let bin = match find_cmd("claude-science") {
         Some(b) => b,
-        None => {
-            return CliEnvelope::err("science_not_found", "未找到 claude-science 命令")
-        }
+        None => return CliEnvelope::err("science_not_found", "未找到 claude-science 命令"),
     };
-
-    let sandbox_home = config_dir().join("sandbox").join("home");
-    let data_dir = sandbox_home.join(".claude-science");
 
     match std::process::Command::new(&bin)
         .args(["stop", "--data-dir"])
@@ -877,14 +967,29 @@ pub fn cmd_sandbox_stop() -> CliEnvelope {
         .output()
     {
         Ok(out) if out.status.success() => {
+            terminate_sandbox_processes(&data_dir);
             CliEnvelope::ok_empty()
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            CliEnvelope::err("sandbox_stop_failed", &format!("停止沙箱失败：{stderr}"))
+            if terminate_sandbox_processes(&data_dir) {
+                CliEnvelope::ok(json!({
+                    "message": format!("claude-science stop 未能通过控制 socket 停止沙箱，已清理残留进程：{stderr}"),
+                    "stopped": true,
+                }))
+            } else {
+                CliEnvelope::err("sandbox_stop_failed", &format!("停止沙箱失败：{stderr}"))
+            }
         }
         Err(e) => {
-            CliEnvelope::err("sandbox_stop_failed", &format!("无法执行停止命令：{e}"))
+            if terminate_sandbox_processes(&data_dir) {
+                CliEnvelope::ok(json!({
+                    "message": format!("无法执行停止命令，已清理残留进程：{e}"),
+                    "stopped": true,
+                }))
+            } else {
+                CliEnvelope::err("sandbox_stop_failed", &format!("无法执行停止命令：{e}"))
+            }
         }
     }
 }
@@ -959,10 +1064,9 @@ pub fn cmd_verify(port: u16, secret: &str) -> CliEnvelope {
     use std::net::TcpStream;
 
     let addr = format!("127.0.0.1:{port}");
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &addr.parse().unwrap(),
-        std::time::Duration::from_secs(5),
-    ) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&addr.parse().unwrap(), std::time::Duration::from_secs(5))
+    else {
         return CliEnvelope::err("proxy_not_reachable", &format!("无法连接到代理端口 {port}"));
     };
 
@@ -993,12 +1097,19 @@ pub fn cmd_verify(port: u16, secret: &str) -> CliEnvelope {
 
     let head = String::from_utf8_lossy(&buf[..n]);
     let status_line = head.lines().next().unwrap_or("");
-    let code = status_line.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok());
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u16>().ok());
 
     match code {
         Some(200) => CliEnvelope::ok(json!({"ok": true, "hint": "key 有效，上游已接受。"})),
-        Some(c @ (401 | 403)) => CliEnvelope::ok(json!({"ok": false, "hint": format!("上游拒绝（{c}），key 可能无效或无权限。")})),
-        Some(c) => CliEnvelope::ok(json!({"ok": false, "hint": format!("上游返回 {c}，可能是 key 无效或上游异常。")})),
+        Some(c @ (401 | 403)) => CliEnvelope::ok(
+            json!({"ok": false, "hint": format!("上游拒绝（{c}），key 可能无效或无权限。")}),
+        ),
+        Some(c) => CliEnvelope::ok(
+            json!({"ok": false, "hint": format!("上游返回 {c}，可能是 key 无效或上游异常。")}),
+        ),
         None => CliEnvelope::err("proxy_invalid_response", "代理返回了无效的 HTTP 响应"),
     }
 }
