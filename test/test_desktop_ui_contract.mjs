@@ -76,6 +76,15 @@ test("remote one-click backend starts proxy and sandbox and returns access info"
   assert.match(body, /local_url/);
 });
 
+test("remote one-click retries the proxy port when the requested one is occupied", () => {
+  const m = remoteCommands.match(/pub fn remote_one_click[\s\S]*?\n}\n\n\/\/ ==========================================================================/);
+  assert.ok(m, "remote_one_click body should be discoverable");
+  const body = m[0];
+  assert.match(body, /for candidate_proxy_port in proxy_port\.\.=proxy_port\.saturating_add\(20\)/);
+  assert.match(body, /e\.code == "port_in_use"/);
+  assert.match(body, /selected_proxy_port/);
+});
+
 test("remote helper status reports the configured sandbox state", () => {
   assert.match(helperCommands, /fn sandbox_is_running/);
   assert.match(helperCommands, /fn get_configured_sandbox_port/);
@@ -92,6 +101,15 @@ test("remote helper sandbox stop is idempotent before requiring Science", () => 
     body.indexOf("if !sandbox_is_running()") < body.indexOf('find_cmd("claude-science")'),
     "not-running sandbox should return ok before requiring the binary",
   );
+});
+
+test("remote helper searches user-local binary directories for Science", () => {
+  const m = helperCommands.match(/fn find_cmd[\s\S]*?\n}/);
+  assert.ok(m, "find_cmd body should be discoverable");
+  const body = m[0];
+  assert.match(body, /\.local"\)\.join\("bin"\)/);
+  assert.match(body, /miniconda3"\)\.join\("bin"\)/);
+  assert.match(body, /anaconda3"\)\.join\("bin"\)/);
 });
 
 test("remote helper injects relay profile connection fields into proxy env", () => {

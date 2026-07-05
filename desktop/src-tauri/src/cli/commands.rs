@@ -753,12 +753,26 @@ pub fn cmd_verify(port: u16, secret: &str) -> CliEnvelope {
 
 /// 简易 which：在 PATH 中查找可执行文件。
 fn find_cmd(name: &str) -> Option<String> {
+    let mut dirs_to_check: Vec<PathBuf> = Vec::new();
     if let Ok(path) = std::env::var("PATH") {
         for dir in path.split(':') {
-            let full = PathBuf::from(dir).join(name);
-            if full.is_file() {
-                return Some(full.display().to_string());
+            if !dir.is_empty() {
+                dirs_to_check.push(PathBuf::from(dir));
             }
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        dirs_to_check.push(home.join(".local").join("bin"));
+        dirs_to_check.push(home.join("bin"));
+        dirs_to_check.push(home.join("miniconda3").join("bin"));
+        dirs_to_check.push(home.join("anaconda3").join("bin"));
+    }
+    dirs_to_check.push(PathBuf::from("/opt/conda/bin"));
+
+    for dir in dirs_to_check {
+        let full = dir.join(name);
+        if full.is_file() {
+            return Some(full.display().to_string());
         }
     }
     None

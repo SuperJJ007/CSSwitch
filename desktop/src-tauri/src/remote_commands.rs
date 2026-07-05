@@ -427,45 +427,75 @@ pub fn remote_one_click(
     sandbox_port: u16,
 ) -> Result<Value, String> {
     let secret = config::new_id();
-    let (remote_cfg, adapter) =
-        remote_active_config_for_start(&provider, proxy_port, Some(sandbox_port), &secret)?;
-    let config_json = serde_json::to_string(&remote_cfg).map_err(|e| e.to_string())?;
+    let max_proxy_port = proxy_port.saturating_add(20);
+    let mut selected_proxy_port = proxy_port;
+    let mut proxy_result = None;
+    let mut last_port_error = None;
 
-    remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &[
-            "config".to_string(),
-            "set".to_string(),
-            config_json,
-        ],
-    )
-    .map_err(|e| format!("同步当前 Profile 到服务器失败：{}", e.message))?;
+    for candidate_proxy_port in proxy_port..=proxy_port.saturating_add(20) {
+        let (remote_cfg, adapter) = remote_active_config_for_start(
+            &provider,
+            candidate_proxy_port,
+            Some(sandbox_port),
+            &secret,
+        )?;
+        let config_json = serde_json::to_string(&remote_cfg).map_err(|e| e.to_string())?;
 
-    remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &["proxy".to_string(), "stop".to_string()],
-    )
-    .map_err(|e| format!("停止旧远程代理失败：{}", e.message))?;
+        remote::ssh::run_helper_json_with_retry::<Value>(
+            &profile,
+            &[
+                "config".to_string(),
+                "set".to_string(),
+                config_json,
+            ],
+        )
+        .map_err(|e| format!("同步当前 Profile 到服务器失败：{}", e.message))?;
 
-    remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &["sandbox".to_string(), "stop".to_string()],
-    )
-    .map_err(|e| format!("停止旧远程沙箱失败：{}", e.message))?;
+        remote::ssh::run_helper_json_with_retry::<Value>(
+            &profile,
+            &["proxy".to_string(), "stop".to_string()],
+        )
+        .map_err(|e| format!("停止旧远程代理失败：{}", e.message))?;
 
-    let proxy_result = remote::ssh::run_helper_json_with_retry::<Value>(
-        &profile,
-        &[
-            "proxy".to_string(),
-            "start".to_string(),
-            adapter,
-            proxy_port.to_string(),
-            secret.clone(),
-        ],
-    )
-    .map_err(|e| format!("启动远程代理失败：{}", e.message))?;
+        remote::ssh::run_helper_json_with_retry::<Value>(
+            &profile,
+            &["sandbox".to_string(), "stop".to_string()],
+        )
+        .map_err(|e| format!("停止旧远程沙箱失败：{}", e.message))?;
 
-    let proxy_url = format!("http://127.0.0.1:{proxy_port}/{secret}");
+        match remote::ssh::run_helper_json_with_retry::<Value>(
+            &profile,
+            &[
+                "proxy".to_string(),
+                "start".to_string(),
+                adapter,
+                candidate_proxy_port.to_string(),
+                secret.clone(),
+            ],
+        ) {
+            Ok(result) => {
+                selected_proxy_port = candidate_proxy_port;
+                proxy_result = Some(result);
+                break;
+            }
+            Err(e) if e.code == "port_in_use" && candidate_proxy_port < max_proxy_port => {
+                last_port_error = Some(e.message);
+                continue;
+            }
+            Err(e) => return Err(format!("启动远程代理失败：{}", e.message)),
+        }
+    }
+
+    let proxy_result = proxy_result.ok_or_else(|| {
+        format!(
+            "启动远程代理失败：端口 {}-{} 均不可用。{}",
+            proxy_port,
+            max_proxy_port,
+            last_port_error.unwrap_or_else(|| "请换一个代理端口后重试。".to_string())
+        )
+    })?;
+
+    let proxy_url = format!("http://127.0.0.1:{selected_proxy_port}/{secret}");
     let sandbox_result = remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
         &[
@@ -479,7 +509,8 @@ pub fn remote_one_click(
 
     Ok(json!({
         "ok": true,
-        "proxy_port": proxy_port,
+        "proxy_port": selected_proxy_port,
+        "requested_proxy_port": proxy_port,
         "sandbox_port": sandbox_port,
         "proxy_url": proxy_url,
         "local_url": format!("http://127.0.0.1:{sandbox_port}"),
