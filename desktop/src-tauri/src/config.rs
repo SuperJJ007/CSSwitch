@@ -780,6 +780,7 @@ mod tests {
     }
 
     // ---------- A5: 备份基础设施 ----------
+    #[cfg(unix)]
     #[test]
     fn migration_backup_copies_and_is_0600() {
         let d = tmpdir().join(".csswitch");
@@ -810,6 +811,7 @@ mod tests {
             "净化后滚动备份应删除，清了的 key 不可从 .bak 恢复"
         );
     }
+    #[cfg(unix)]
     #[test]
     fn backup_rejects_symlinked_target() {
         let base = tmpdir();

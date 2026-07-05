@@ -9,6 +9,7 @@
 //! - 超时 + 重试（指数退避：2s/4s/8s）
 //! - 解析 helper 的 JSON 响应
 
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -161,7 +162,18 @@ API_URL="https://api.github.com/repos/{repo}/releases/latest"
 BINARY_NAME="csswitch-helper-${{OS}}-${{ARCH}}"
 
 # 从 API 响应中提取匹配的下载 URL（只匹配预期的文件名格式）
-DOWNLOAD_URL=$(curl -sSL "$API_URL" 2>/dev/null | grep -F "\"$BINARY_NAME\"" | grep -o 'https://[^"]*' | head -1 || true)
+API_JSON=$(mktemp)
+download "$API_URL" "$API_JSON"
+DOWNLOAD_URL=$(awk -v name="\"$BINARY_NAME\"" '
+  $0 ~ name {{ found=1 }}
+  found && /browser_download_url/ {{
+    if (match($0, /https:[^"]+/)) {{
+      print substr($0, RSTART, RLENGTH)
+      exit
+    }}
+  }}
+' "$API_JSON" || true)
+rm -f "$API_JSON"
 
 if [ -z "$DOWNLOAD_URL" ]; then
   echo "无法从 GitHub Releases 获取 $BINARY_NAME 下载链接。" >&2
@@ -197,6 +209,140 @@ mv "$TMP" "$HELPER_PATH"
 /// 返回：反序列化后的命令结果（T 类型）。
 ///
 /// 错误：返回结构化的 `RemoteError`，包含可重试标记和修复建议。
+pub fn detect_remote_platform(profile: &RemoteHostProfile) -> Result<(String, String), RemoteError> {
+    let out = run_ssh_script(
+        profile,
+        "printf '%s\\n%s\\n' \"$(uname -s)\" \"$(uname -m)\"",
+        DEFAULT_CMD_TIMEOUT_SECS,
+    )?;
+    let mut lines = out.lines().map(str::trim).filter(|line| !line.is_empty());
+    let os_raw = lines.next().unwrap_or_default();
+    let arch_raw = lines.next().unwrap_or_default();
+
+    let os = match os_raw {
+        "Linux" => "linux",
+        _ => os_raw,
+    }
+    .to_string();
+
+    let arch = match arch_raw {
+        "x86_64" | "amd64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        _ => arch_raw,
+    }
+    .to_string();
+
+    Ok((os, arch))
+}
+
+pub fn build_helper_stdin_install_args(profile: &RemoteHostProfile) -> Vec<String> {
+    let mut args = build_ssh_base_args(profile);
+    let helper_path = shell_quote(&profile.helper_path);
+    let script = format!(
+        r#"set -e
+HELPER_PATH={helper_path}
+HELPER_DIR=$(dirname "$HELPER_PATH")
+mkdir -p "$HELPER_DIR"
+TMP=$(mktemp "$HELPER_DIR/.csswitch-helper.XXXXXX")
+cat > "$TMP"
+chmod +x "$TMP"
+mv "$TMP" "$HELPER_PATH"
+"$HELPER_PATH" --json status
+"#,
+        helper_path = helper_path,
+    );
+    args.push(script);
+    args
+}
+
+pub fn install_helper_from_stdin(
+    profile: &RemoteHostProfile,
+    helper_bytes: &[u8],
+) -> Result<String, RemoteError> {
+    let args = build_helper_stdin_install_args(profile);
+    let mut child = hide_cmd(Command::new("ssh"))
+        .args(&args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RemoteError {
+            code: "ssh_spawn_failed".to_string(),
+            message: format!("无法启动 SSH 客户端：{e}"),
+            details: Some(format!("请确认 OpenSSH 客户端已安装并在 PATH 中：{e}")),
+            recoverable: false,
+            suggestion: Some("Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string()),
+        })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(helper_bytes).map_err(|e| RemoteError {
+            code: "helper_upload_failed".to_string(),
+            message: format!("上传 Helper 二进制失败：{e}"),
+            details: None,
+            recoverable: true,
+            suggestion: Some("请检查 SSH 连接是否稳定，并重试保存服务器。".to_string()),
+        })?;
+    }
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    let output = match rx.recv_timeout(std::time::Duration::from_secs(SLOW_CMD_TIMEOUT_SECS)) {
+        Ok(result) => result.map_err(|e| RemoteError {
+            code: "ssh_io_error".to_string(),
+            message: format!("SSH 进程 I/O 错误：{e}"),
+            details: None,
+            recoverable: true,
+            suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
+        })?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(RemoteError {
+                code: "ssh_timeout".to_string(),
+                message: format!("SSH 上传 Helper 超时（{}秒）", SLOW_CMD_TIMEOUT_SECS),
+                details: Some(format!("目标：{}@{}", profile.username, profile.host)),
+                recoverable: true,
+                suggestion: Some("网络慢或远程命令卡住。请检查 SSH 连接后重试。".to_string()),
+            });
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(RemoteError {
+                code: "ssh_thread_panic".to_string(),
+                message: "SSH 执行线程异常退出".to_string(),
+                details: None,
+                recoverable: false,
+                suggestion: Some("这可能是程序错误。请报告此问题。".to_string()),
+            });
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(map_ssh_error(profile, &stderr, output.status.code()));
+    }
+
+    const MAX_UPLOAD_OUTPUT_SIZE: usize = 1024 * 1024;
+    if output.stdout.len() > MAX_UPLOAD_OUTPUT_SIZE {
+        return Err(RemoteError {
+            code: "output_too_large".to_string(),
+            message: format!("Helper 输出过大（{} 字节）", output.stdout.len()),
+            details: None,
+            recoverable: false,
+            suggestion: Some("请在远程服务器上查看 Helper 日志排查问题。".to_string()),
+        });
+    }
+
+    String::from_utf8(output.stdout).map_err(|_| RemoteError {
+        code: "invalid_utf8".to_string(),
+        message: "Helper 返回了无效的 UTF-8 数据".to_string(),
+        details: None,
+        recoverable: false,
+        suggestion: Some("这可能表示 Helper 二进制损坏。请尝试重新安装 Helper。".to_string()),
+    })
+}
+
 pub fn run_helper_json<T: DeserializeOwned>(
     profile: &RemoteHostProfile,
     helper_args: &[String],
@@ -270,6 +416,87 @@ pub fn run_helper_json_slow<T: DeserializeOwned>(
 // ============================================================================
 
 /// 执行 `ssh ... <cmd>` 并返回 stdout 字符串。
+pub fn run_ssh_script(
+    profile: &RemoteHostProfile,
+    remote_cmd: &str,
+    timeout_secs: u64,
+) -> Result<String, RemoteError> {
+    let mut args = build_ssh_base_args(profile);
+    args.push(remote_cmd.to_string());
+    let child = hide_cmd(Command::new("ssh"))
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| RemoteError {
+            code: "ssh_spawn_failed".to_string(),
+            message: format!("无法启动 SSH 客户端：{e}"),
+            details: Some(format!("请确认 OpenSSH 客户端已安装并在 PATH 中：{e}")),
+            recoverable: false,
+            suggestion: Some("Windows 10+ 自带 OpenSSH。请在系统可选功能中确认已安装。".to_string()),
+        })?;
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let timeout_duration = std::time::Duration::from_secs(timeout_secs);
+    std::thread::spawn(move || {
+        let result = child.wait_with_output();
+        let _ = tx.send(result);
+    });
+
+    let output = match rx.recv_timeout(timeout_duration) {
+        Ok(result) => result.map_err(|e| RemoteError {
+            code: "ssh_io_error".to_string(),
+            message: format!("SSH 进程 I/O 错误：{e}"),
+            details: None,
+            recoverable: true,
+            suggestion: Some("请重试。如持续出现，请检查系统资源。".to_string()),
+        })?,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            return Err(RemoteError {
+                code: "ssh_timeout".to_string(),
+                message: format!("SSH 命令执行超时（{}秒）", timeout_secs),
+                details: Some(format!("命令：{} {} {}", profile.host, profile.username, remote_cmd)),
+                recoverable: true,
+                suggestion: Some("网络慢或远程命令卡住。请检查 SSH 连接后重试。".to_string()),
+            });
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(RemoteError {
+                code: "ssh_thread_panic".to_string(),
+                message: "SSH 执行线程异常退出".to_string(),
+                details: None,
+                recoverable: false,
+                suggestion: Some("这可能是程序错误。请报告此问题。".to_string()),
+            });
+        }
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(map_ssh_error(profile, &stderr, output.status.code()));
+    }
+
+    const MAX_SCRIPT_OUTPUT_SIZE: usize = 1024 * 1024;
+    if output.stdout.len() > MAX_SCRIPT_OUTPUT_SIZE {
+        return Err(RemoteError {
+            code: "output_too_large".to_string(),
+            message: format!("SSH 输出过大（{} 字节）", output.stdout.len()),
+            details: None,
+            recoverable: false,
+            suggestion: Some("请在远程服务器上查看命令输出排查问题。".to_string()),
+        });
+    }
+
+    String::from_utf8(output.stdout).map_err(|_| RemoteError {
+        code: "invalid_utf8".to_string(),
+        message: "SSH 返回了无效的 UTF-8 数据".to_string(),
+        details: None,
+        recoverable: false,
+        suggestion: Some("请检查远程 Shell 输出。".to_string()),
+    })
+}
+
 fn try_run_ssh(
     profile: &RemoteHostProfile,
     helper_args: &[String],

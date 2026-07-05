@@ -10,9 +10,16 @@ on:
 jobs:
   # ---- Windows 桌面 app ----
   build-windows:
+    needs: build-helper
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Download Linux Helper Assets
+        uses: actions/download-artifact@v4
+        with:
+          pattern: csswitch-helper-linux-*
+          path: desktop/src-tauri/helper-assets
+          merge-multiple: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
@@ -35,9 +42,11 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target:
-          - x86_64-unknown-linux-musl
-          - aarch64-unknown-linux-musl
+        include:
+          - target: x86_64-unknown-linux-musl
+            asset_arch: x86_64
+          - target: aarch64-unknown-linux-musl
+            asset_arch: aarch64
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -49,11 +58,13 @@ jobs:
         run: |
           cd desktop/src-tauri
           cargo build --bin csswitch-helper --no-default-features --release --target ${{ matrix.target }}
+          mkdir -p helper-out
+          cp target/${{ matrix.target }}/release/csswitch-helper helper-out/csswitch-helper-linux-${{ matrix.asset_arch }}
       - name: Upload Helper
         uses: actions/upload-artifact@v4
         with:
-          name: csswitch-helper-${{ matrix.target }}
-          path: desktop/src-tauri/target/${{ matrix.target }}/release/csswitch-helper
+          name: csswitch-helper-linux-${{ matrix.asset_arch }}
+          path: desktop/src-tauri/helper-out/csswitch-helper-linux-${{ matrix.asset_arch }}
 
   # ---- Tests ----
   test:

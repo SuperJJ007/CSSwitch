@@ -5,7 +5,10 @@ import test from "node:test";
 const html = readFileSync(new URL("../desktop/src/index.html", import.meta.url), "utf8");
 const main = readFileSync(new URL("../desktop/src/main.js", import.meta.url), "utf8");
 const remoteCommands = readFileSync(new URL("../desktop/src-tauri/src/remote_commands.rs", import.meta.url), "utf8");
+const remoteSsh = readFileSync(new URL("../desktop/src-tauri/src/remote/ssh.rs", import.meta.url), "utf8");
 const helperCommands = readFileSync(new URL("../desktop/src-tauri/src/cli/commands.rs", import.meta.url), "utf8");
+const tauriConf = readFileSync(new URL("../desktop/src-tauri/tauri.conf.json", import.meta.url), "utf8");
+const buildWorkflow = readFileSync(new URL("../.github/workflows/build.yml", import.meta.url), "utf8");
 
 function remoteStartProxyBody() {
   const m = remoteCommands.match(/pub fn remote_start_proxy[\s\S]*?\n}\n\n\/\/\/ 停止远程代理/);
@@ -62,6 +65,68 @@ test("remote one-click frontend calls the full remote stack command", () => {
   assert.match(body[0], /proxyPort/);
   assert.match(body[0], /sandboxPort/);
   assert.doesNotMatch(body[0], /call\(["']remote_start_proxy["']/);
+});
+
+test("remote profile test prepares helper instead of only checking health", () => {
+  const body = main.match(/async function testProfileConnection\(\) \{[\s\S]*?\n\}/);
+  assert.ok(body, "testProfileConnection body should be discoverable");
+  assert.match(body[0], /call\(["']remote_prepare_helper["']/);
+  assert.doesNotMatch(body[0], /call\(["']remote_check_health["']/);
+});
+
+test("remote profile save prepares helper before saving the server", () => {
+  const body = main.match(/async function saveProfile\(\) \{[\s\S]*?\n\}/);
+  assert.ok(body, "saveProfile body should be discoverable");
+  assert.match(body[0], /call\(["']remote_prepare_helper["']/);
+  assert.match(body[0], /call\(["']remote_save_profile["']/);
+  assert.ok(
+    body[0].indexOf('call("remote_prepare_helper"') < body[0].indexOf('call("remote_save_profile"'),
+    "save should prepare helper before persisting the remote server",
+  );
+});
+
+test("remote one-click does not repeat helper preparation", () => {
+  const body = main.match(/async function remoteOneClick\(\) \{[\s\S]*?\n\}/);
+  assert.ok(body, "remoteOneClick body should be discoverable");
+  assert.doesNotMatch(body[0], /remote_prepare_helper/);
+});
+
+test("backend exposes explicit remote helper preparation command", () => {
+  assert.match(remoteCommands, /pub fn remote_prepare_helper/);
+  assert.match(main, /case "remote_prepare_helper"/);
+});
+
+test("remote helper preparation installs only when health is not ready and falls back to bundled upload", () => {
+  const m = remoteCommands.match(/pub fn remote_prepare_helper[\s\S]*?\n}\n\n\/\/ ============================================================================/);
+  assert.ok(m, "remote_prepare_helper body should be discoverable");
+  const body = m[0];
+  assert.match(body, /helper_ready_for_profile/);
+  assert.match(body, /install_helper_from_github/);
+  assert.match(body, /install_helper_from_bundle/);
+  assert.ok(
+    body.indexOf("install_helper_from_github") < body.indexOf("install_helper_from_bundle"),
+    "GitHub release install should be attempted before bundled upload fallback",
+  );
+});
+
+test("remote bundled helper upload uses SSH stdin and installs atomically", () => {
+  assert.match(remoteSsh, /pub fn install_helper_from_stdin/);
+  assert.match(remoteSsh, /stdin\(Stdio::piped\(\)\)/);
+  assert.match(remoteSsh, /cat > "\$TMP"/);
+  assert.match(remoteSsh, /chmod \+x "\$TMP"/);
+  assert.match(remoteSsh, /mv "\$TMP" "\$HELPER_PATH"/);
+});
+
+test("remote github helper installer extracts browser download url after matching asset name", () => {
+  assert.match(remoteSsh, /BINARY_NAME="csswitch-helper-\$\{\{OS\}\}-\$\{\{ARCH\}\}"/);
+  assert.match(remoteSsh, /browser_download_url/);
+  assert.match(remoteSsh, /awk -v name=/);
+});
+
+test("desktop bundle and release workflow provide linux helper assets for upload fallback", () => {
+  assert.match(tauriConf, /helper-assets/);
+  assert.match(buildWorkflow, /csswitch-helper-linux-\$\{\{ matrix\.asset_arch \}\}/);
+  assert.match(buildWorkflow, /helper-assets/);
 });
 
 test("remote one-click backend starts proxy and sandbox and returns access info", () => {

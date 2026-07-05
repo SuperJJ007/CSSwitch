@@ -17,9 +17,12 @@ use crate::remote::{
 };
 use crate::{config, templates};
 use serde_json::{json, Value};
-use std::time::{SystemTime, UNIX_EPOCH};
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
+use tauri::Manager;
 
 // P1-8 修复：health check 结果缓存，减少频繁 SSH 连接
 lazy_static::lazy_static! {
@@ -163,27 +166,180 @@ pub fn remote_check_health(profile: RemoteHostProfile) -> Result<RemoteHealth, S
     Ok(health)
 }
 
-/// 安装/升级远程 Helper。
-/// 通过 SSH 执行安装脚本：从 GitHub Releases 下载 helper 二进制到远程服务器。
-#[tauri::command]
-pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
-    // 直接执行 SSH 安装命令（安装脚本为 shell 脚本，不符合 helper JSON 协议格式，
-    // 因此不走 run_helper_json，而是直接执行 ssh 命令并验证退出码和 status 输出）。
-    let args = remote::ssh::build_helper_install_args(&profile);
+fn remote_check_health_uncached(profile: &RemoteHostProfile) -> RemoteHealth {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    let reachable = remote::ssh::run_helper_json_simple::<Value>(
+        profile,
+        &["status".to_string()],
+    )
+    .is_ok();
+
+    if !reachable {
+        return RemoteHealth {
+            reachable: false,
+            helper_installed: false,
+            helper_version: None,
+            desktop_version: env!("CARGO_PKG_VERSION").to_string(),
+            compatible: false,
+            platform: None,
+            arch: None,
+            capabilities: vec![],
+            proxy_running: false,
+            sandbox_running: false,
+            last_error: Some("无法通过 SSH 连接到服务器，或远程 Helper 尚未安装。".to_string()),
+            last_check: now,
+        };
+    }
+
+    match remote::ssh::run_helper_json_with_retry::<Value>(
+        profile,
+        &["status".to_string()],
+    ) {
+        Ok(status) => parse_health_from_status(&status, now),
+        Err(e) => RemoteHealth {
+            reachable: true,
+            helper_installed: false,
+            helper_version: None,
+            desktop_version: env!("CARGO_PKG_VERSION").to_string(),
+            compatible: false,
+            platform: None,
+            arch: None,
+            capabilities: vec![],
+            proxy_running: false,
+            sandbox_running: false,
+            last_error: Some(format!("Helper 不存在或无法执行：{}", e.message)),
+            last_check: now,
+        },
+    }
+}
+
+fn cache_health(profile_id: &str, health: &RemoteHealth) {
+    let mut cache = HEALTH_CACHE.lock().unwrap();
+    cache.insert(profile_id.to_string(), (health.clone(), std::time::Instant::now()));
+}
+
+fn helper_ready_for_profile(health: &RemoteHealth) -> bool {
+    let has_required = REQUIRED_CAPABILITIES
+        .iter()
+        .chain(["sandbox"].iter())
+        .all(|req| health.capabilities.iter().any(|cap| cap.as_str() == *req));
+
+    health.reachable
+        && health.helper_installed
+        && health.compatible
+        && health.platform.as_deref() == Some("linux")
+        && has_required
+}
+
+fn install_helper_from_github(profile: &RemoteHostProfile) -> Result<(), String> {
+    let args = remote::ssh::build_helper_install_args(profile);
     let mut cmd = std::process::Command::new("ssh");
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x08000000);
     }
-    let output = cmd.args(&args).output()
+    let output = cmd
+        .args(&args)
+        .output()
         .map_err(|e| format!("无法启动 SSH：{e}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(format!("Helper 安装失败。请确认远程服务器可访问 GitHub：{stderr}"));
+        return Err(format!("GitHub Release 安装失败：{stderr}"));
     }
-    // 安装成功后重新检查健康
-    remote_check_health(profile)
+    Ok(())
+}
+
+fn bundled_helper_candidates(app: &tauri::AppHandle, arch: &str) -> Vec<PathBuf> {
+    let filename = format!("csswitch-helper-linux-{arch}");
+    let mut candidates = Vec::new();
+    if let Ok(res) = app.path().resource_dir() {
+        candidates.push(res.join("helper-assets").join(&filename));
+    }
+    candidates.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("helper-assets").join(&filename));
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("helper-assets").join(&filename));
+        }
+    }
+    candidates
+}
+
+fn bundled_helper_path(app: &tauri::AppHandle, arch: &str) -> Option<PathBuf> {
+    bundled_helper_candidates(app, arch)
+        .into_iter()
+        .find(|path| path.is_file())
+}
+
+fn install_helper_from_bundle(
+    app: &tauri::AppHandle,
+    profile: &RemoteHostProfile,
+    arch: &str,
+) -> Result<(), String> {
+    let path = bundled_helper_path(app, arch)
+        .ok_or_else(|| format!("安装包内没有适用于 linux/{arch} 的 Helper 资源"))?;
+    let bytes = fs::read(&path)
+        .map_err(|e| format!("读取内置 Helper 失败（{}）：{e}", path.display()))?;
+    remote::ssh::install_helper_from_stdin(profile, &bytes)
+        .map(|_| ())
+        .map_err(|e| e.message)
+}
+
+/// 安装/升级远程 Helper。
+/// 通过 SSH 执行安装脚本：从 GitHub Releases 下载 helper 二进制到远程服务器。
+#[tauri::command]
+pub fn remote_install_helper(profile: RemoteHostProfile) -> Result<RemoteHealth, String> {
+    install_helper_from_github(&profile)?;
+    let health = remote_check_health_uncached(&profile);
+    cache_health(&profile.id, &health);
+    Ok(health)
+}
+
+#[tauri::command]
+pub fn remote_prepare_helper(
+    app: tauri::AppHandle,
+    profile: RemoteHostProfile,
+) -> Result<RemoteHealth, String> {
+    remote::validate_profile(&profile)?;
+
+    let initial = remote_check_health_uncached(&profile);
+    if helper_ready_for_profile(&initial) {
+        cache_health(&profile.id, &initial);
+        return Ok(initial);
+    }
+
+    let (os, arch) = remote::ssh::detect_remote_platform(&profile)
+        .map_err(|e| format!("SSH 连接失败：{}", e.message))?;
+    if os != "linux" {
+        return Err(format!("远程 Helper 目前仅支持 Linux，当前服务器是 {os}/{arch}。"));
+    }
+    if arch != "x86_64" && arch != "aarch64" {
+        return Err(format!("远程 Helper 暂不支持 {arch} 架构。"));
+    }
+
+    let github_result = install_helper_from_github(&profile);
+    if let Err(github_err) = github_result {
+        install_helper_from_bundle(&app, &profile, &arch)
+            .map_err(|bundle_err| {
+                format!(
+                    "自动安装 Helper 失败。GitHub 下载失败：{github_err}；内置上传失败：{bundle_err}"
+                )
+            })?;
+    }
+
+    let health = remote_check_health_uncached(&profile);
+    cache_health(&profile.id, &health);
+    if helper_ready_for_profile(&health) {
+        Ok(health)
+    } else {
+        Err(health.last_error.unwrap_or_else(|| {
+            "Helper 已安装但能力不完整，请重新安装最新版 CSSwitch 后重试。".to_string()
+        }))
+    }
 }
 
 // ============================================================================

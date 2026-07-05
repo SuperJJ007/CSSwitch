@@ -350,6 +350,7 @@ mod tests {
         assert!(http_get_body(59998, Some("secret"), "/v1/models", 300).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn which_finds_sh() {
         let sh = which("sh");

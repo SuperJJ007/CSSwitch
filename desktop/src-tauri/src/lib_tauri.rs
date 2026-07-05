@@ -1428,6 +1428,7 @@ pub fn run() {
             remote_commands::remote_delete_profile,
             remote_commands::remote_validate_profile,
             remote_commands::remote_check_health,
+            remote_commands::remote_prepare_helper,
             remote_commands::remote_install_helper,
             remote_commands::remote_get_config,
             remote_commands::remote_set_config,

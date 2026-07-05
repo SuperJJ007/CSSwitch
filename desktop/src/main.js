@@ -132,6 +132,8 @@ function mockInvoke(cmd, args) {
       return Promise.resolve(true);
     case "remote_check_health":
       return Promise.resolve({ reachable: true, helperInstalled: false, compatible: false, platform: "linux", arch: "x86_64", proxyRunning: false, sandboxRunning: false, lastError: "预览模式" });
+    case "remote_prepare_helper":
+      return Promise.resolve({ reachable: true, helperInstalled: true, compatible: true, platform: "linux", arch: "x86_64", proxyRunning: false, sandboxRunning: false });
     case "remote_status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber", remote: true });
     case "remote_start_proxy":
@@ -885,6 +887,9 @@ async function saveProfile() {
     return;
   }
   try {
+    els.profileEditMsg.textContent = "正在准备远程 Helper…";
+    els.profileEditMsg.className = "msg";
+    await call("remote_prepare_helper", { profile });
     await call("remote_save_profile", { profile });
     closeProfileEdit();
     await openProfileModal();
@@ -909,11 +914,12 @@ async function testProfileConnection() {
     helperPath: els.editProfileHelperPath.value.trim() || "~/.csswitch/bin/csswitch-helper",
   };
   els.testProfileBtn.disabled = true;
-  els.profileEditMsg.textContent = "正在测试连接…";
+  els.profileEditMsg.textContent = "正在测试连接并准备远程 Helper…";
   try {
-    const h = await call("remote_check_health", { profile });
-    els.profileEditMsg.textContent = h.reachable ? "连接成功。" : (h.lastError || "连接失败");
-    els.profileEditMsg.className = h.reachable ? "msg ok" : "msg err";
+    const h = await call("remote_prepare_helper", { profile });
+    const ready = h.reachable && h.helperInstalled && h.compatible;
+    els.profileEditMsg.textContent = ready ? "连接成功，Helper 已就绪。" : (h.lastError || "连接成功，但 Helper 未就绪");
+    els.profileEditMsg.className = ready ? "msg ok" : "msg err";
   } catch (e) {
     els.profileEditMsg.textContent = "连接失败：" + e;
     els.profileEditMsg.className = "msg err";
