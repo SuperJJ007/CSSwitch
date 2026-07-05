@@ -135,13 +135,29 @@ test("desktop bundle and release workflow provide linux helper assets for upload
   assert.match(buildWorkflow, /helper-assets/);
 });
 
+test("desktop release workflow uses the Tauri v2 bundles argument", () => {
+  assert.doesNotMatch(buildWorkflow, /--bundler\b/);
+  assert.match(buildWorkflow, /npx tauri build --bundles nsis/);
+  assert.match(buildWorkflow, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles dmg/);
+});
+
+test("linux helper release workflow uses cross for musl target builds", () => {
+  const body = workflowJob("build-helper");
+  assert.match(body, /fail-fast: false/);
+  assert.match(body, /taiki-e\/install-action@v2/);
+  assert.match(body, /tool: cross/);
+  assert.match(body, /cross build --bin csswitch-helper --no-default-features --release --target \$\{\{ matrix\.target \}\}/);
+  assert.doesNotMatch(body, /cargo build --bin csswitch-helper --no-default-features --release --target \$\{\{ matrix\.target \}\}/);
+  assert.doesNotMatch(body, /apt-get install -y musl-tools/);
+});
+
 test("macOS desktop builds bundle the linux helper assets too", () => {
   const body = workflowJob("build-macos");
   assert.match(body, /needs: build-helper/);
   assert.match(body, /Download Linux Helper Assets/);
   assert.match(body, /pattern: csswitch-helper-linux-\*/);
   assert.match(body, /path: desktop\/src-tauri\/helper-assets/);
-  assert.match(body, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundler dmg/);
+  assert.match(body, /npx tauri build --target \$\{\{ matrix\.target \}\} --bundles dmg/);
   assert.match(buildWorkflow, /CSSwitch-macOS-\*/);
 });
 

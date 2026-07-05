@@ -30,7 +30,7 @@ jobs:
         run: |
           cd desktop
           npm install
-          npx tauri build --bundler nsis
+          npx tauri build --bundles nsis
       - name: Upload NSIS Installer
         uses: actions/upload-artifact@v4
         with:
@@ -69,7 +69,7 @@ jobs:
         run: |
           cd desktop
           npm install
-          npx tauri build --target ${{ matrix.target }} --bundler dmg
+          npx tauri build --target ${{ matrix.target }} --bundles dmg
       - name: Upload DMG Installer
         uses: actions/upload-artifact@v4
         with:
@@ -80,6 +80,7 @@ jobs:
   build-helper:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-musl
@@ -91,12 +92,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - name: Install musl-tools
-        run: sudo apt-get install -y musl-tools
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cross
       - name: Build Helper
         run: |
           cd desktop/src-tauri
-          cargo build --bin csswitch-helper --no-default-features --release --target ${{ matrix.target }}
+          cross build --bin csswitch-helper --no-default-features --release --target ${{ matrix.target }}
           mkdir -p helper-out
           cp target/${{ matrix.target }}/release/csswitch-helper helper-out/csswitch-helper-linux-${{ matrix.asset_arch }}
       - name: Upload Helper
