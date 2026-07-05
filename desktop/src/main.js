@@ -1,177 +1,656 @@
-// CSSwitch 菜单栏面板前端。只调用后端 Tauri command，绝不碰任何密钥落盘逻辑。
-// 后端只把 key 的【掩码】回显给这里；完整 key 永不进前端。
-//
-// 预览兜底：在普通浏览器里打开（没有 Tauri 后端）时，用 mockInvoke 返回假数据，
-// 让界面能完整渲染、不报错。真实 app 里 window.__TAURI__ 存在，走真后端，此兜底不生效。
+// CSSwitch desktop frontend. The UI is driven by the v2 profile schema:
+// named profiles + active_id. Full API keys never enter this script; the
+// backend only returns masked key tails.
 const PREVIEW = !window.__TAURI__;
-const invoke = PREVIEW
-  ? (cmd, args) => mockInvoke(cmd, args)
-  : window.__TAURI__.core.invoke;
+const invoke = PREVIEW ? (cmd, args) => mockInvoke(cmd, args) : window.__TAURI__.core.invoke;
+
+const MOCK_TEMPLATES = [
+  { id: "deepseek", name: "DeepSeek", category: "cn_official", api_format: "anthropic", adapter: "deepseek", base_url: "https://api.deepseek.com/anthropic", base_url_editable: false, requires_model_override: false, builtin_models: ["claude-opus-4-8", "claude-haiku-4-5"], website_url: "https://platform.deepseek.com", icon: "deepseek", icon_color: "#1E88E5" },
+  { id: "glm", name: "智谱 GLM", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://open.bigmodel.cn/api/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["glm-5.2", "glm-4.7", "glm-4.6"], website_url: "https://open.bigmodel.cn", icon: "glm", icon_color: "#2E6BE6" },
+  { id: "kimi", name: "Kimi（Moonshot）", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.moonshot.cn/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["kimi-k2.7-code", "kimi-k2.7-code-highspeed"], website_url: "https://platform.moonshot.cn", icon: "kimi", icon_color: "#16182F" },
+  { id: "minimax", name: "MiniMax", category: "cn_official", api_format: "anthropic", adapter: "relay", base_url: "https://api.minimaxi.com/anthropic", base_url_editable: true, requires_model_override: true, builtin_models: ["MiniMax-M3", "MiniMax-M2.7"], website_url: "https://platform.minimaxi.com", icon: "minimax", icon_color: "#E1341E" },
+  { id: "qwen", name: "通义千问", category: "cn_official", api_format: "openai_chat", adapter: "qwen", base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1", base_url_editable: false, requires_model_override: false, builtin_models: ["qwen-max", "qwen-plus", "qwen-turbo"], website_url: "https://dashscope.aliyun.com", icon: "qwen", icon_color: "#615CED" },
+  { id: "custom", name: "自定义", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], website_url: "", icon: "custom", icon_color: "#6B7280" },
+];
+
+const mockStore = {
+  schema_version: 2,
+  active_id: "",
+  proxy_port: 18991,
+  sandbox_port: 8990,
+  mode: "proxy",
+  profiles: [],
+  remoteProfiles: [],
+};
+
+function mockMask(key) {
+  return key ? "••••" + String(key).slice(-4) : "";
+}
 
 function mockInvoke(cmd, args) {
+  args = args || {};
   switch (cmd) {
     case "get_config":
-      return Promise.resolve({ provider: "deepseek", proxy_port: 18991, sandbox_port: 8990, mode: "proxy", keys: { deepseek: "", qwen: "" } });
-    case "set_mode":
-    case "open_official":
+      return Promise.resolve({
+        schema_version: 2,
+        active_id: mockStore.active_id,
+        proxy_port: mockStore.proxy_port,
+        sandbox_port: mockStore.sandbox_port,
+        mode: mockStore.mode,
+        templates: MOCK_TEMPLATES,
+        profiles: mockStore.profiles.map((p) => ({ ...p })),
+      });
+    case "list_templates":
+      return Promise.resolve(MOCK_TEMPLATES);
+    case "set_settings":
+    case "set_config":
+      mockStore.proxy_port = args.cfg.proxy_port;
+      mockStore.sandbox_port = args.cfg.sandbox_port;
       return Promise.resolve(null);
+    case "set_mode":
+      mockStore.mode = args.mode;
+      return Promise.resolve(null);
+    case "create_profile": {
+      const tpl = MOCK_TEMPLATES.find((t) => t.id === args.templateId) || MOCK_TEMPLATES[0];
+      const id = "p-" + Math.random().toString(16).slice(2, 10);
+      mockStore.profiles.push({
+        id,
+        name: args.name || tpl.name,
+        template_id: tpl.id,
+        category: tpl.category,
+        api_format: tpl.api_format,
+        base_url: args.baseUrl || tpl.base_url || "",
+        model: args.model || "",
+        key: mockMask(args.key || ""),
+        icon: tpl.icon,
+        icon_color: tpl.icon_color,
+        website_url: tpl.website_url,
+        notes: "",
+      });
+      return Promise.resolve(id);
+    }
+    case "update_profile_metadata": {
+      const p = mockStore.profiles.find((x) => x.id === args.id);
+      if (!p) return Promise.reject("找不到配置");
+      p.name = args.name;
+      p.notes = args.notes || "";
+      return Promise.resolve(null);
+    }
+    case "update_profile_connection": {
+      const p = mockStore.profiles.find((x) => x.id === args.id);
+      if (!p) return Promise.reject("找不到配置");
+      if (args.baseUrl != null) p.base_url = args.baseUrl;
+      if (args.apiFormat != null) p.api_format = args.apiFormat;
+      if (args.model != null) p.model = args.model;
+      if (args.key) p.key = mockMask(args.key);
+      return Promise.resolve(null);
+    }
+    case "clear_profile_key": {
+      const p = mockStore.profiles.find((x) => x.id === args.id);
+      if (p) p.key = "";
+      return Promise.resolve(null);
+    }
+    case "delete_profile":
+      mockStore.profiles = mockStore.profiles.filter((x) => x.id !== args.id);
+      if (mockStore.active_id === args.id) mockStore.active_id = "";
+      return Promise.resolve(null);
+    case "set_active_profile": {
+      const p = mockStore.profiles.find((x) => x.id === args.id);
+      if (!p) return Promise.reject("找不到配置");
+      mockStore.active_id = args.id;
+      return Promise.resolve({ committed: true, active_id: args.id, hint: "预览模式：已设为当前。" });
+    }
+    case "fetch_models":
+      return Promise.resolve({ models: [{ id: "glm-5.2", supports_tools: true }, { id: "glm-4.7", supports_tools: null }], source: "preview" });
     case "status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
-    case "save_provider_key":
-      return Promise.resolve("••••••••••" + String((args && args.key) || "").slice(-4));
-    case "start_proxy":
-      return Promise.resolve({ port: 18991 });
-    case "verify_key":
-      return Promise.resolve({ ok: true, hint: "（预览模式：假装 key 有效）" });
     case "one_click_login":
-      return Promise.resolve({ url: "http://127.0.0.1:8990" });
-    case "run_doctor":
-      return Promise.resolve("（预览模式：后端未运行，这里是占位文本）");
-    case "app_version":
-      return Promise.resolve("0.0.0-preview");
+      return Promise.resolve({ url: "http://127.0.0.1:8990", msg: "预览模式：假装已启动。" });
+    case "stop_all":
+    case "open_url":
+    case "open_official":
     case "open_release_page":
     case "report_bug":
     case "open_logs":
+    case "quit_app":
       return Promise.resolve(null);
-    // 远程命令 mock
+    case "run_doctor":
+      return Promise.resolve("预览模式：后端未运行。");
+    case "app_version":
+      return Promise.resolve("0.0.0-preview");
     case "remote_list_profiles":
-      return Promise.resolve([]);
+      return Promise.resolve(mockStore.remoteProfiles.map((p) => ({ ...p })));
+    case "remote_save_profile": {
+      const p = args.profile;
+      const i = mockStore.remoteProfiles.findIndex((x) => x.id === p.id);
+      if (i >= 0) mockStore.remoteProfiles[i] = p;
+      else mockStore.remoteProfiles.unshift(p);
+      return Promise.resolve(p);
+    }
+    case "remote_delete_profile":
+      mockStore.remoteProfiles = mockStore.remoteProfiles.filter((p) => p.id !== args.id);
+      return Promise.resolve(true);
     case "remote_check_health":
-      return Promise.resolve({ reachable: true, helperInstalled: false, compatible: false, desktopVersion: "0.0.0", platform: null, arch: null, capabilities: [], proxyRunning: false, sandboxRunning: false, lastError: "预览模式", lastCheck: 0 });
+      return Promise.resolve({ reachable: true, helperInstalled: false, compatible: false, platform: "linux", arch: "x86_64", proxyRunning: false, sandboxRunning: false, lastError: "预览模式" });
     case "remote_status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber", remote: true });
-    case "remote_doctor":
-      return Promise.resolve({ checks: [{ name: "预览模式", ok: false, detail: "后端未运行" }] });
+    case "remote_start_proxy":
+      return Promise.resolve({ ok: true, port: args.port });
+    case "remote_one_click":
+      return Promise.resolve({
+        ok: true,
+        proxy_port: args.proxyPort,
+        sandbox_port: args.sandboxPort,
+        local_url: "http://127.0.0.1:" + args.sandboxPort,
+        tunnel_hint: "ssh -N -L " + args.sandboxPort + ":127.0.0.1:" + args.sandboxPort + " user@host",
+      });
+    case "remote_stop_proxy":
+      return Promise.resolve(null);
     case "remote_logs":
-      return Promise.resolve({ content: "(预览模式)", exists: false });
+      return Promise.resolve({ content: "预览模式：无日志" });
+    case "remote_doctor":
+      return Promise.resolve({ checks: [{ name: "预览模式", ok: true }] });
     default:
       return Promise.resolve(null);
   }
 }
 
-const $ = (id) => {
-  // 兼容 jQuery 风格（带头 #）和原生风格（不带 #）
-  const cleanId = id.startsWith('#') ? id.slice(1) : id;
-  return document.getElementById(cleanId);
-};
+const $ = (id) => document.getElementById(id);
 const els = {};
-let statusTimer = null;
 let busy = false;
-let mode = "proxy"; // "proxy" 第三方 | "official" 官方
+let mode = "proxy";
+let target = "local";
+let currentProfile = null;
+let remoteProfiles = [];
+let statusTimer = null;
+let editingConnId = null;
+let editingMetaId = null;
+let pendingSkipActivateId = null;
+let pendingConfirm = null;
 
-// P1-7 修复：防止并发操作（用户连续点击按钮导致多个操作同时执行）
-let isOperating = false;
+let state = {
+  profiles: [],
+  templates: [],
+  active_id: "",
+  proxy_port: 18991,
+  sandbox_port: 8990,
+};
 
-// ---- 远程服务器管理状态 ----
-let target = "local";    // "local" | "remote"
-let currentProfile = null; // RemoteHostProfile | null
-let remoteProfiles = [];   // 缓存的 Profile 列表
-
-// ---- 远程状态机（Plan V2 §5.5）----
-const RemoteState = { DISCONNECTED: 'disconnected', CONNECTING: 'connecting', CONNECTED: 'connected', OPERATING: 'operating', ERROR: 'error' };
-let remoteState = RemoteState.DISCONNECTED;
-
-function setRemoteState(newState, data) {
-  remoteState = newState;
-  const dot = $('#remoteHealthDot');
-  const txt = $('#remoteHealthText');
-  if (!dot || !txt) return;
-  switch (newState) {
-    case RemoteState.DISCONNECTED: dot.className = 'lt a'; txt.textContent = '未连接'; break;
-    case RemoteState.CONNECTING: dot.className = 'lt a pulsing'; txt.textContent = '连接中…'; break;
-    case RemoteState.CONNECTED: dot.className = 'lt g'; txt.textContent = data || '已连接'; break;
-    case RemoteState.OPERATING: txt.textContent = '操作中…'; break;
-    case RemoteState.ERROR: dot.className = 'lt r'; txt.textContent = data || '错误'; break;
-  }
-}
-
-// ---- Toast 通知（Plan V2 §5.6）----
-function showToast(message, type, duration) {
-  type = type || 'info'; duration = duration || 3000;
-  var t = document.createElement('div');
-  t.className = 'toast toast-' + type;
-  t.textContent = message;
-  document.body.appendChild(t);
-  setTimeout(function() { t.classList.add('show'); }, 10);
-  setTimeout(function() { t.classList.remove('show'); setTimeout(function() { t.remove(); }, 300); }, duration);
-}
-
-const KEY_LABELS = { deepseek: "DeepSeek API Key", qwen: "DashScope (通义千问) API Key" };
-
-function setMsg(text, kind) {
-  els.msg.textContent = text;
-  els.msg.className = "msg" + (kind ? " " + kind : "");
-}
-
-function setLight(el, state) {
-  // state: "green" | "amber" | "red"
-  const cls = { green: "g", amber: "a", red: "r" }[state] || "a";
-  el.className = "lt " + cls;
-}
-
-function setBusy(on) {
-  busy = on;
-  [els.oneClickBtn, els.stopBtn, els.saveKeyBtn].forEach((b) => (b.disabled = on));
-}
+const CAT_LABELS = { official: "官方", cn_official: "国内", custom: "自定义" };
 
 async function call(cmd, args) {
   return await invoke(cmd, args);
 }
 
+function escapeHtml(s) {
+  return String(s == null ? "" : s).replace(/[&<>"']/g, (c) => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
+function setMsg(text, kind) {
+  if (!els.msg) return;
+  els.msg.textContent = text || "";
+  els.msg.className = "msg" + (kind ? " " + kind : "");
+  const feedback = els.msg.closest(".feedback");
+  if (feedback) feedback.hidden = !text;
+}
+
+function setLight(el, value) {
+  if (!el) return;
+  const cls = { green: "g", amber: "a", red: "r" }[value] || "a";
+  el.className = "lt " + cls;
+}
+
+function setBusy(on) {
+  busy = on;
+  [
+    "oneClickBtn", "stopBtn", "newBtn", "skipActivateBtn",
+    "wizFetchBtn", "wizSaveBtn", "wizCancelBtn",
+    "connFetchBtn", "connSaveBtn", "connClearBtn", "connCancelBtn",
+    "metaSaveBtn", "metaCancelBtn", "manageProfilesBtn", "addProfileBtn",
+    "saveProfileBtn", "testProfileBtn",
+  ].forEach((id) => {
+    if (els[id]) els[id].disabled = on;
+  });
+  if (!on) {
+    refreshWizGate();
+    refreshConnGate();
+  }
+}
+
+function templateById(id) {
+  return (state.templates || []).find((t) => t.id === id) || null;
+}
+
+function activeLocalProfile() {
+  return (state.profiles || []).find((p) => p.id === state.active_id) || null;
+}
+
+function adapterForProfile(profile) {
+  const tpl = templateById(profile && profile.template_id);
+  return (tpl && tpl.adapter) || profile?.template_id || "relay";
+}
+
+function defaultModel(tpl) {
+  return (tpl && tpl.builtin_models && tpl.builtin_models[0]) || "";
+}
+
+function showView(view) {
+  els.panel.classList.toggle("view-form", view !== "list");
+  els.listSec.hidden = view !== "list";
+  els.advSec.hidden = view !== "list";
+  els.wizSec.hidden = view !== "wizard";
+  els.connSec.hidden = view !== "conn";
+  els.metaSec.hidden = view !== "meta";
+  if (view === "list") hideSkip();
+}
+
+function hideSkip() {
+  pendingSkipActivateId = null;
+  if (els.skipActivateBtn) els.skipActivateBtn.hidden = true;
+}
+
+function showSkip(id) {
+  pendingSkipActivateId = id;
+  els.skipActivateBtn.hidden = false;
+}
+
+function confirmAction(token, prompt, fn) {
+  if (pendingConfirm && pendingConfirm.token === token) {
+    clearTimeout(pendingConfirm.timer);
+    pendingConfirm = null;
+    fn();
+    return;
+  }
+  if (pendingConfirm) clearTimeout(pendingConfirm.timer);
+  pendingConfirm = {
+    token,
+    timer: setTimeout(() => {
+      pendingConfirm = null;
+      setMsg("已取消。");
+    }, 4000),
+  };
+  setMsg(prompt + "。4 秒内再点一次确认。", "err");
+}
+
 async function loadConfig() {
   try {
     const cfg = await call("get_config");
-    els.provider.value = cfg.provider || "deepseek";
-    els.proxyPort.value = cfg.proxy_port ?? 18991;
-    els.sandboxPort.value = cfg.sandbox_port ?? 8990;
-    window._keys = cfg.keys || {};
-    reflectProvider();
+    state.profiles = cfg.profiles || [];
+    state.templates = cfg.templates || await call("list_templates");
+    state.active_id = cfg.active_id || "";
+    state.proxy_port = cfg.proxy_port ?? 18991;
+    state.sandbox_port = cfg.sandbox_port ?? 8990;
+    els.proxyPort.value = state.proxy_port;
+    els.sandboxPort.value = state.sandbox_port;
     applyMode(cfg.mode === "official" ? "official" : "proxy");
+    renderList();
+    showView("list");
+    if (cfg.pending_notice) setMsg(cfg.pending_notice, "ok");
   } catch (e) {
     setMsg("读取配置失败：" + e, "err");
   }
 }
 
-// 应用模式到 UI（不落盘）：切 panel class、分段高亮、hero 按钮文案。
-function applyMode(m) {
-  mode = m === "official" ? "official" : "proxy";
-  els.panel.classList.toggle("mode-official", mode === "official");
-  els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
-    b.classList.toggle("active", b.dataset.mode === mode)
-  );
-  els.oneClickBtn.textContent =
-    mode === "official" ? "打开官方 Claude Science ↗" : "⚡ 一键开始";
+function modelSummary(profile) {
+  if (profile.model) return escapeHtml(profile.model);
+  const tpl = templateById(profile.template_id);
+  return tpl && tpl.requires_model_override ? "未选模型" : "内置映射";
 }
 
-// 点分段切换：先落盘（切官方时后端会顺带停第三方链路），成功再翻 UI；失败保持旧模式、如实报错。
-async function switchMode(m) {
-  if (m === mode) return;
-  setBusy(true);
-  try {
-    await call("set_mode", { mode: m });
-  } catch (e) {
-    // 失败不动 UI（旧模式仍生效），错误提示不被后续覆盖。
-    setMsg("切换模式失败：" + e, "err");
-    setBusy(false);
+function renderList() {
+  const profiles = state.profiles || [];
+  if (!profiles.length) {
+    els.profileList.innerHTML = '<div class="empty">还没有配置。点右上「＋ 新建」加一条第三方来源。</div>';
     return;
   }
-  applyMode(m);
-  setBusy(false);
-  setMsg(
-    mode === "official"
-      ? "已切到官方模式：第三方代理/沙箱已停，点上方按钮打开你真实的 Claude Science。"
-      : "已切到第三方模式：填 key 后点「一键开始」。"
-  );
-  await refreshStatus();
+  els.profileList.innerHTML = profiles.map((p) => {
+    const active = p.id === state.active_id;
+    const cat = CAT_LABELS[p.category] || p.category || "";
+    const key = p.key ? escapeHtml(p.key) : "未填 key";
+    const dot = p.icon_color ? ' style="background:' + escapeHtml(p.icon_color) + '"' : "";
+    return (
+      '<div class="prow' + (active ? " pactive" : "") + '" data-id="' + escapeHtml(p.id) + '">' +
+        '<div class="prow-top">' +
+          '<span class="pico"' + dot + "></span>" +
+          '<span class="pname">' + escapeHtml(p.name) + "</span>" +
+          '<span class="badge">' + escapeHtml(cat) + "</span>" +
+          (active ? '<span class="badge on">当前生效</span>' : "") +
+        "</div>" +
+        '<div class="pmeta">' + escapeHtml(p.base_url || "（未填地址）") + "</div>" +
+        '<div class="pmeta">模型：' + modelSummary(p) + " · Key：" + key + "</div>" +
+        '<div class="prow-acts">' +
+          (active ? "" : '<button class="abtn prim" data-act="activate">设为当前</button>') +
+          '<button class="abtn" data-act="editconn">编辑连接</button>' +
+          '<button class="abtn" data-act="editmeta">改名</button>' +
+          '<button class="abtn" data-act="clearkey">清 key</button>' +
+          '<button class="abtn danger" data-act="delete">删除</button>' +
+        "</div>" +
+      "</div>"
+    );
+  }).join("");
 }
 
-// 官方模式的主按钮：干净打开真实 Claude Science（后端用 open，不注入环境变量）。
+function applyMode(nextMode) {
+  mode = nextMode === "official" ? "official" : "proxy";
+  els.panel.classList.toggle("mode-official", mode === "official");
+  els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.mode === mode);
+  });
+  els.oneClickBtn.textContent = mode === "official" ? "打开官方 Claude Science ↗" : "⚡ 一键开始";
+}
+
+async function switchMode(nextMode) {
+  if (nextMode === mode) return;
+  setBusy(true);
+  try {
+    await call("set_mode", { mode: nextMode });
+    applyMode(nextMode);
+    setMsg(nextMode === "official" ? "已切到官方模式。" : "已切到第三方模式。", "ok");
+    await refreshStatus();
+  } catch (e) {
+    setMsg("切换模式失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function persistPorts() {
+  const cfg = {
+    proxy_port: parseInt(els.proxyPort.value, 10) || 18991,
+    sandbox_port: parseInt(els.sandboxPort.value, 10) || 8990,
+  };
+  try {
+    try {
+      await call("set_settings", { cfg });
+    } catch (e) {
+      await call("set_config", { cfg });
+    }
+    state.proxy_port = cfg.proxy_port;
+    state.sandbox_port = cfg.sandbox_port;
+    setMsg("端口设置已保存。", "ok");
+  } catch (e) {
+    setMsg("保存端口失败：" + e, "err");
+  }
+}
+
+function renderTemplateChips() {
+  els.wizTemplateChips.innerHTML = (state.templates || []).map((t) => {
+    const dot = t.icon_color ? ' style="background:' + escapeHtml(t.icon_color) + '"' : "";
+    const cat = CAT_LABELS[t.category] || t.category || "";
+    return (
+      '<button type="button" class="chip" aria-pressed="false" data-tid="' + escapeHtml(t.id) + '">' +
+        '<span class="chip-dot"' + dot + "></span>" +
+        '<span class="chip-name">' + escapeHtml(t.name) + "</span>" +
+        '<span class="chip-cat">' + escapeHtml(cat) + "</span>" +
+      "</button>"
+    );
+  }).join("");
+}
+
+function setModelOptions(input, datalist, models, fallbackValue) {
+  const ids = (models || []).map((m) => typeof m === "string" ? m : m.id).filter(Boolean);
+  datalist.innerHTML = ids.map((id) => '<option value="' + escapeHtml(id) + '"></option>').join("");
+  input.value = fallbackValue || ids[0] || "";
+}
+
+function selectWizTemplate(id) {
+  const tpl = templateById(id) || state.templates[0];
+  if (!tpl) return;
+  els.wizTemplate.value = tpl.id;
+  els.wizTemplateChips.querySelectorAll(".chip").forEach((c) => {
+    const selected = c.dataset.tid === tpl.id;
+    c.classList.toggle("sel", selected);
+    c.setAttribute("aria-pressed", selected ? "true" : "false");
+  });
+  els.wizName.value = tpl.name;
+  els.wizBase.value = tpl.base_url || "";
+  els.wizBase.disabled = !tpl.base_url_editable;
+  els.wizTplHint.textContent = tpl.base_url_editable ? "可按你的套餐或区域端点修改地址。" : "该来源使用内置官方地址。";
+  els.wizBaseHint.textContent = tpl.base_url_editable ? "" : "地址由适配器内置。";
+  setModelOptions(els.wizModel, els.wizModelList, tpl.builtin_models || [], defaultModel(tpl));
+  els.wizModelInfo.hidden = !!tpl.requires_model_override;
+  els.wizModel.hidden = !tpl.requires_model_override;
+  els.wizModelHint.textContent = tpl.requires_model_override ? "请选择或输入上游真实模型名。" : "该来源使用内置模型映射。";
+  if (!tpl.requires_model_override) {
+    els.wizModelInfo.textContent = "使用内置模型映射，无需手动选择。";
+    els.wizModel.value = "";
+  }
+  refreshWizGate();
+}
+
+function refreshWizGate() {
+  if (!els.wizSaveBtn || els.wizSec.hidden) return;
+  const tpl = templateById(els.wizTemplate.value);
+  const needsModel = tpl && tpl.requires_model_override;
+  const needsBase = tpl && tpl.base_url_editable;
+  els.wizSaveBtn.disabled = busy ||
+    !els.wizName.value.trim() ||
+    (needsBase && !els.wizBase.value.trim()) ||
+    (needsModel && !els.wizModel.value.trim());
+}
+
+function openWizard() {
+  hideSkip();
+  renderTemplateChips();
+  selectWizTemplate((state.templates[0] || {}).id || "");
+  els.wizKey.value = "";
+  showView("wizard");
+  setMsg("选择来源，填 key 即可创建。");
+}
+
+async function createProfile() {
+  const tpl = templateById(els.wizTemplate.value);
+  if (!tpl) return;
+  const args = {
+    templateId: tpl.id,
+    name: els.wizName.value.trim() || tpl.name,
+    key: els.wizKey.value.trim() || null,
+    baseUrl: els.wizBase.value.trim() || null,
+    model: tpl.requires_model_override ? els.wizModel.value.trim() : null,
+  };
+  setBusy(true);
+  try {
+    await call("create_profile", args);
+    els.wizKey.value = "";
+    await loadConfig();
+    setMsg("已创建配置。需要使用时点「设为当前」。", "ok");
+  } catch (e) {
+    setMsg("创建失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function openConn(id) {
+  const p = state.profiles.find((x) => x.id === id);
+  if (!p) return;
+  const tpl = templateById(p.template_id) || {};
+  editingConnId = id;
+  els.connTitle.textContent = "编辑连接：" + p.name;
+  els.connBase.value = p.base_url || tpl.base_url || "";
+  els.connBase.disabled = !tpl.base_url_editable;
+  els.connKey.value = "";
+  setModelOptions(els.connModel, els.connModelList, tpl.builtin_models || [], p.model || defaultModel(tpl));
+  els.connModelInfo.hidden = !!tpl.requires_model_override;
+  els.connModel.hidden = !tpl.requires_model_override;
+  els.connModelHint.textContent = tpl.requires_model_override ? "请选择或输入上游真实模型名。" : "该来源使用内置模型映射。";
+  if (!tpl.requires_model_override) {
+    els.connModelInfo.textContent = "使用内置模型映射，无需手动选择。";
+    els.connModel.value = "";
+  }
+  showView("conn");
+  setMsg("留空 key 表示不修改已存 key。");
+  refreshConnGate();
+}
+
+function refreshConnGate() {
+  if (!els.connSaveBtn || els.connSec.hidden || !editingConnId) return;
+  const p = state.profiles.find((x) => x.id === editingConnId);
+  const tpl = templateById(p && p.template_id);
+  const needsModel = tpl && tpl.requires_model_override;
+  const needsBase = tpl && tpl.base_url_editable;
+  els.connSaveBtn.disabled = busy ||
+    (needsBase && !els.connBase.value.trim()) ||
+    (needsModel && !els.connModel.value.trim());
+}
+
+async function saveConn() {
+  const p = state.profiles.find((x) => x.id === editingConnId);
+  const tpl = templateById(p && p.template_id);
+  if (!p || !tpl) return;
+  setBusy(true);
+  try {
+    await call("update_profile_connection", {
+      id: p.id,
+      baseUrl: els.connBase.value.trim(),
+      apiFormat: tpl.api_format,
+      model: tpl.requires_model_override ? els.connModel.value.trim() : "",
+      key: els.connKey.value.trim() || null,
+    });
+    await loadConfig();
+    setMsg("连接已保存。", "ok");
+  } catch (e) {
+    setMsg("保存连接失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+function openMeta(id) {
+  const p = state.profiles.find((x) => x.id === id);
+  if (!p) return;
+  editingMetaId = id;
+  els.metaName.value = p.name || "";
+  els.metaNotes.value = p.notes || "";
+  showView("meta");
+  setMsg("修改名称或备注不会触发代理。");
+}
+
+async function saveMeta() {
+  setBusy(true);
+  try {
+    await call("update_profile_metadata", {
+      id: editingMetaId,
+      name: els.metaName.value.trim() || "未命名",
+      notes: els.metaNotes.value.trim() || null,
+    });
+    await loadConfig();
+    setMsg("已保存。", "ok");
+  } catch (e) {
+    setMsg("保存失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function activateProfile(id, skipVerify) {
+  setBusy(true);
+  try {
+    const result = await call("set_active_profile", { id, skipVerify: !!skipVerify });
+    if (result && result.committed === false) {
+      showSkip(id);
+      setMsg(result.hint || "校验未通过，未切换。", "err");
+      return;
+    }
+    await loadConfig();
+    setMsg((result && result.hint) || "已设为当前。", "ok");
+    await refreshStatus();
+  } catch (e) {
+    setMsg("切换失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearProfileKey(id) {
+  setBusy(true);
+  try {
+    await call("clear_profile_key", { id });
+    await loadConfig();
+    setMsg("Key 已清除。", "ok");
+  } catch (e) {
+    setMsg("清除失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function deleteProfile(id) {
+  setBusy(true);
+  try {
+    await call("delete_profile", { id });
+    await loadConfig();
+    setMsg("配置已删除。", "ok");
+  } catch (e) {
+    setMsg("删除失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function fetchModelsFor(kind) {
+  const isConn = kind === "conn";
+  const p = isConn ? state.profiles.find((x) => x.id === editingConnId) : null;
+  const tpl = templateById(isConn ? p?.template_id : els.wizTemplate.value);
+  if (!tpl) return;
+  const base = (isConn ? els.connBase.value : els.wizBase.value).trim();
+  const key = (isConn ? els.connKey.value : els.wizKey.value).trim();
+  const hint = isConn ? els.connModelHint : els.wizModelHint;
+  const input = isConn ? els.connModel : els.wizModel;
+  const list = isConn ? els.connModelList : els.wizModelList;
+  setBusy(true);
+  hint.textContent = "正在获取模型…";
+  try {
+    const res = await call("fetch_models", {
+      req: {
+        template_id: tpl.id,
+        base_url: base,
+        key,
+        profile_id: p ? p.id : null,
+      },
+    });
+    setModelOptions(input, list, res.models || [], input.value);
+    hint.textContent = "已获取模型列表" + (res.source ? "（" + res.source + "）" : "") + "。";
+  } catch (e) {
+    hint.textContent = "获取失败：" + e;
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function oneClick() {
+  if (mode === "official") {
+    await openOfficial();
+    return;
+  }
+  if (target === "remote") {
+    await remoteOneClick();
+    return;
+  }
+  if (!state.active_id) {
+    setMsg("还没有当前生效的配置。请先「＋ 新建」或在列表点「设为当前」。", "err");
+    return;
+  }
+  setBusy(true);
+  setMsg("一键开始：起代理 → 起沙箱 → 探活…");
+  try {
+    const r = await call("one_click_login");
+    setMsg((r.msg || "已就绪。") + "\n" + (r.url || ""), "ok");
+    await refreshStatus();
+  } catch (e) {
+    setMsg("一键开始失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
 async function openOfficial() {
   setBusy(true);
-  setMsg("正在打开官方 Claude Science…");
   try {
     await call("open_official");
-    setMsg("已打开官方 Claude Science（走你自己的官方登录与订阅）。", "ok");
+    setMsg("已打开官方 Claude Science。", "ok");
   } catch (e) {
     setMsg("打开失败：" + e, "err");
   } finally {
@@ -179,85 +658,16 @@ async function openOfficial() {
   }
 }
 
-// hero 按钮按当前模式分派。
-async function heroClick() {
-  if (mode === "official") {
-    await openOfficial();
-  } else {
-    await oneClick();
-  }
-}
-
-function reflectProvider() {
-  const p = els.provider.value;
-  els.keyLabel.textContent = KEY_LABELS[p] || "API Key";
-  const masked = (window._keys && window._keys[p]) || "";
-  els.keyInput.value = "";
-  els.keyInput.placeholder = masked ? "已存：" + masked : "粘贴第三方 key（只存本地）";
-}
-
-function currentSettings() {
-  return {
-    provider: els.provider.value,
-    proxy_port: parseInt(els.proxyPort.value, 10) || 18991,
-    sandbox_port: parseInt(els.sandboxPort.value, 10) || 8990,
-  };
-}
-
-// 保存设置：失败会【抛出】，让调用方（起代理 / 一键登录）中止，
-// 不再吞掉错误后拿旧配置继续、还误报成功（修 P1-4）。
-async function persistSettings() {
-  await call("set_config", { cfg: currentSettings() });
-}
-
-// 独立 UI 事件（改 provider / 端口）用的兜底版：失败只提示、不抛，避免未捕获拒绝。
-async function persistSettingsSafe() {
-  try {
-    await persistSettings();
-  } catch (e) {
-    setMsg("保存设置失败：" + e, "err");
-  }
-}
-
-async function saveKey() {
-  const key = els.keyInput.value.trim();
-  if (!key) {
-    setMsg("请先粘贴 key。", "err");
-    return;
-  }
-  setBusy(true);
-  try {
-    const masked = await call("save_provider_key", { provider: els.provider.value, key });
-    window._keys[els.provider.value] = masked;
-    reflectProvider();
-    setMsg("已保存，正在启动代理并验证 key…", "ok");
-    await persistSettings();
-    // 存了 key 就自动起代理 + 用最小请求真验一次这把 key（不是「代理起来了」就当成功）。
-    try {
-      const v = await call("verify_key");
-      if (v && v.ok) {
-        setMsg("已保存，key 有效 ✓ 代理已就绪，点「一键开始」即可。", "ok");
-      } else {
-        setMsg("已保存，代理已起；但 key 未通过验证：" + ((v && v.hint) || "上游未接受") + " 可仍试「一键开始」。", "err");
-      }
-    } catch (ve) {
-      // 代理没起来（缺依赖/端口占用），或验证请求发不出去（网络/上游不通）。
-      setMsg("已保存；但未能验证 key：" + ve, "err");
-    }
-  } catch (e) {
-    setMsg("保存失败：" + e, "err");
-  } finally {
-    setBusy(false);
-    await refreshStatus();
-  }
-}
-
 async function stopAll() {
   setBusy(true);
-  setMsg("停止中…");
   try {
-    await call("stop_all");
-    setMsg("已停止代理与沙箱。", "ok");
+    if (target === "remote" && currentProfile) {
+      await call("remote_stop_proxy", { profile: currentProfile });
+      setMsg("远程代理已停止。", "ok");
+    } else {
+      await call("stop_all");
+      setMsg("已停止代理与沙箱。", "ok");
+    }
     await refreshStatus();
   } catch (e) {
     setMsg("停止失败：" + e, "err");
@@ -266,29 +676,17 @@ async function stopAll() {
   }
 }
 
-async function oneClick() {
-  setBusy(true);
-  setMsg("一键开始：起代理 → 起沙箱 → 探活…");
+async function refreshStatus() {
   try {
-    // 「粘贴 key → 直接一键开始」也要能走通：输入框里有新 key 就先存下，
-    // 不强制用户先点「保存」（修 P1：oneClick 之前不读/不存输入框，导致无 key 起代理失败）。
-    const key = els.keyInput.value.trim();
-    if (key) {
-      const masked = await call("save_provider_key", { provider: els.provider.value, key });
-      window._keys[els.provider.value] = masked;
-      els.keyInput.value = "";
-      reflectProvider();
-    }
-    await persistSettings();
-    const r = await call("one_click_login");
-    // 透传后端据实回传的 msg（区分：已重新打开 / 已用新配置重启 / 沿用原有对话 / 已启动 /
-    // 打开失败请手动打开），保证提示不谎报。后端未给 msg 时退回中性兜底。
-    setMsg((r.msg || "已就绪，正在打开面板…") + "\n" + (r.url || ""), "ok");
-    await refreshStatus();
+    const s = target === "remote" && currentProfile
+      ? await call("remote_status", { profile: currentProfile })
+      : await call("status");
+    setLight(els.ltProxy, s.proxy);
+    setLight(els.ltSandbox, s.sandbox);
+    setLight(els.ltUpstream, s.upstream);
+    els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
   } catch (e) {
-    setMsg("一键开始失败：" + e, "err");
-  } finally {
-    setBusy(false);
+    [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((el) => setLight(el, "amber"));
   }
 }
 
@@ -301,581 +699,369 @@ async function openBrowser() {
 }
 
 async function runDoctor() {
-  setMsg("自检中…");
+  setMsg(target === "remote" ? "远程自检中…" : "自检中…");
   try {
-    const out = await call("run_doctor");
-    setMsg(out, out.includes("失败 0") ? "ok" : null);
+    const out = target === "remote" && currentProfile
+      ? await call("remote_doctor", { profile: currentProfile })
+      : await call("run_doctor");
+    setMsg(typeof out === "string" ? out : JSON.stringify(out.checks || out, null, 2), "ok");
   } catch (e) {
     setMsg("自检失败：" + e, "err");
   }
 }
 
-// 简单 semver 比较：a 是否比 b 新。
 function isNewer(a, b) {
-  const pa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
-  const pb = String(b).split(".").map((n) => parseInt(n, 10) || 0);
-  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
-    const x = pa[i] || 0, y = pb[i] || 0;
-    if (x !== y) return x > y;
+  const aa = String(a).split(".").map((n) => parseInt(n, 10) || 0);
+  const bb = String(b).split(".").map((n) => parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
+    if ((aa[i] || 0) !== (bb[i] || 0)) return (aa[i] || 0) > (bb[i] || 0);
   }
   return false;
 }
 
-// 轻量检查更新：查 GitHub 最新 Release 版本号，有新版就提示并打开下载页（不自动装）。
 async function checkUpdate() {
   setMsg("检查更新中…");
   let cur = "";
   try { cur = await call("app_version"); } catch (e) {}
   try {
-    const resp = await fetch(
-      "https://api.github.com/repos/SuperJJ007/CSswitch/releases/latest",
-      { headers: { Accept: "application/vnd.github+json" } }
-    );
+    const resp = await fetch("https://api.github.com/repos/SuperJJ007/CSswitch/releases/latest", {
+      headers: { Accept: "application/vnd.github+json" },
+    });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
-    const latest = (data.tag_name || "").replace(/^v/, "");
-    if (!latest) throw new Error("无版本信息");
-    if (isNewer(latest, cur)) {
-      setMsg("发现新版本 v" + latest + "（当前 v" + cur + "）。正在打开下载页…", "ok");
-      try { await call("open_release_page"); } catch (_) {}
+    const latest = String(data.tag_name || "").replace(/^v/, "");
+    if (latest && isNewer(latest, cur)) {
+      setMsg("发现新版本 v" + latest + "。正在打开下载页。", "ok");
+      await call("open_release_page");
     } else {
       setMsg("已是最新版本（v" + cur + "）。", "ok");
     }
   } catch (e) {
-    setMsg("无法自动检查更新（多为网络或代理限制）。已打开 Releases 页，请手动查看。", "err");
+    setMsg("无法自动检查更新，已打开 Releases 页。", "err");
     try { await call("open_release_page"); } catch (_) {}
   }
 }
 
-async function refreshStatus() {
+async function switchTarget(nextTarget) {
+  if (nextTarget === target) return;
+  target = nextTarget === "remote" ? "remote" : "local";
+  els.panel.classList.toggle("target-remote", target === "remote");
+  els.targetSeg.querySelectorAll(".seg-btn").forEach((b) => {
+    b.classList.toggle("active", b.dataset.target === target);
+  });
+  if (target === "remote") {
+    await loadRemoteProfiles();
+    setMsg("已切换到远程服务器。");
+  } else {
+    setMsg("已切换到本地模式。");
+  }
+  await refreshStatus();
+}
+
+async function loadRemoteProfiles() {
   try {
-    const s = await call("status");
-    setLight(els.ltProxy, s.proxy);
-    setLight(els.ltSandbox, s.sandbox);
-    setLight(els.ltUpstream, s.upstream);
-    const anyGreen = s.proxy === "green" || s.sandbox === "green";
-    els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
+    remoteProfiles = await call("remote_list_profiles");
+    els.profileSelect.innerHTML = '<option value="">-- 选择服务器 --</option>' + remoteProfiles.map((p) =>
+      '<option value="' + escapeHtml(p.id) + '">' + escapeHtml(p.name) + " (" + escapeHtml(p.username) + "@" + escapeHtml(p.host) + ":" + escapeHtml(p.port) + ")</option>"
+    ).join("");
+    if (currentProfile && remoteProfiles.some((p) => p.id === currentProfile.id)) {
+      els.profileSelect.value = currentProfile.id;
+    } else {
+      currentProfile = null;
+    }
+    updateRemoteHealthUI();
   } catch (e) {
-    // 状态探测失败不打断，静默降级为黄灯。
-    [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
+    setMsg("加载服务器失败：" + e, "err");
+  }
+}
+
+async function onProfileChange() {
+  const id = els.profileSelect.value;
+  currentProfile = remoteProfiles.find((p) => p.id === id) || null;
+  updateRemoteHealthUI();
+  if (currentProfile) await checkRemoteHealth();
+}
+
+function updateRemoteHealthUI() {
+  if (!currentProfile) {
+    els.remoteHealthDot.className = "lt a";
+    els.remoteHealthText.textContent = "未连接";
+    return;
+  }
+  els.remoteHealthDot.className = "lt a";
+  els.remoteHealthText.textContent = "已选：" + currentProfile.name;
+}
+
+async function checkRemoteHealth() {
+  if (!currentProfile) return;
+  els.remoteHealthDot.className = "lt a pulsing";
+  els.remoteHealthText.textContent = "连接中…";
+  try {
+    const h = await call("remote_check_health", { profile: currentProfile });
+    if (h.reachable && h.helperInstalled && h.compatible) {
+      els.remoteHealthDot.className = "lt g";
+      els.remoteHealthText.textContent = "已连接 | " + (h.platform || "?") + " " + (h.arch || "?");
+    } else if (h.reachable) {
+      els.remoteHealthDot.className = "lt a";
+      els.remoteHealthText.textContent = h.lastError || "已连接，Helper 需要安装或升级";
+    } else {
+      els.remoteHealthDot.className = "lt r";
+      els.remoteHealthText.textContent = h.lastError || "连接失败";
+    }
+  } catch (e) {
+    els.remoteHealthDot.className = "lt r";
+    els.remoteHealthText.textContent = "检查失败：" + e;
+  }
+}
+
+async function openProfileModal() {
+  await loadRemoteProfiles();
+  const list = document.getElementById("remoteProfileList");
+  list.innerHTML = remoteProfiles.length
+    ? remoteProfiles.map((p) => (
+      '<div class="profile-item">' +
+        '<div><div class="pi-name">' + escapeHtml(p.name) + '</div>' +
+        '<div class="pi-detail">' + escapeHtml(p.username) + "@" + escapeHtml(p.host) + ":" + escapeHtml(p.port) + "</div></div>" +
+        '<div class="pi-actions">' +
+          '<span class="pi-act" data-action="edit" data-id="' + escapeHtml(p.id) + '">编辑</span>' +
+          '<span class="pi-act del" data-action="delete" data-id="' + escapeHtml(p.id) + '">删除</span>' +
+        "</div>" +
+      "</div>"
+    )).join("")
+    : '<div class="hint">暂无服务器。点击「+ 添加」。</div>';
+  els.profileModal.style.display = "flex";
+}
+
+function closeProfileModal() {
+  els.profileModal.style.display = "none";
+}
+
+function openProfileEdit(id) {
+  const p = id ? remoteProfiles.find((x) => x.id === id) : null;
+  els.profileEditModal.dataset.editId = id || "";
+  els.profileEditTitle.textContent = p ? "编辑服务器" : "添加服务器";
+  els.editProfileName.value = p ? p.name : "";
+  els.editProfileHost.value = p ? p.host : "";
+  els.editProfilePort.value = p ? p.port : 22;
+  els.editProfileUsername.value = p ? p.username : "";
+  const auth = p && p.authMethod ? p.authMethod : { type: "sshAgent" };
+  els.editProfileAuth.value = auth.type === "keyFile" ? "key_file" : "ssh_agent";
+  els.editProfileKeyPath.value = auth.path || "~/.ssh/id_ed25519";
+  els.editProfileHelperPath.value = p ? p.helperPath : "~/.csswitch/bin/csswitch-helper";
+  els.profileEditMsg.textContent = "";
+  toggleKeyFileGroup();
+  els.profileEditModal.style.display = "flex";
+}
+
+function closeProfileEdit() {
+  els.profileEditModal.style.display = "none";
+}
+
+function toggleKeyFileGroup() {
+  els.keyFileGroup.style.display = els.editProfileAuth.value === "key_file" ? "" : "none";
+}
+
+function newRemoteId() {
+  return globalThis.crypto && crypto.randomUUID ? crypto.randomUUID() : "r-" + Date.now().toString(16);
+}
+
+async function saveProfile() {
+  const editId = els.profileEditModal.dataset.editId;
+  const authMethod = els.editProfileAuth.value === "key_file"
+    ? { type: "keyFile", path: els.editProfileKeyPath.value.trim() }
+    : { type: "sshAgent" };
+  const profile = {
+    id: editId || newRemoteId(),
+    name: els.editProfileName.value.trim() || "未命名",
+    host: els.editProfileHost.value.trim(),
+    port: parseInt(els.editProfilePort.value, 10) || 22,
+    username: els.editProfileUsername.value.trim(),
+    authMethod,
+    helperPath: els.editProfileHelperPath.value.trim() || "~/.csswitch/bin/csswitch-helper",
+  };
+  if (!profile.host || !profile.username) {
+    els.profileEditMsg.textContent = "服务器地址和用户名不能为空。";
+    els.profileEditMsg.className = "msg err";
+    return;
+  }
+  try {
+    await call("remote_save_profile", { profile });
+    closeProfileEdit();
+    await openProfileModal();
+    await loadRemoteProfiles();
+  } catch (e) {
+    els.profileEditMsg.textContent = "保存失败：" + e;
+    els.profileEditMsg.className = "msg err";
+  }
+}
+
+async function testProfileConnection() {
+  const authMethod = els.editProfileAuth.value === "key_file"
+    ? { type: "keyFile", path: els.editProfileKeyPath.value.trim() }
+    : { type: "sshAgent" };
+  const profile = {
+    id: "_test_",
+    name: "test",
+    host: els.editProfileHost.value.trim(),
+    port: parseInt(els.editProfilePort.value, 10) || 22,
+    username: els.editProfileUsername.value.trim(),
+    authMethod,
+    helperPath: els.editProfileHelperPath.value.trim() || "~/.csswitch/bin/csswitch-helper",
+  };
+  els.testProfileBtn.disabled = true;
+  els.profileEditMsg.textContent = "正在测试连接…";
+  try {
+    const h = await call("remote_check_health", { profile });
+    els.profileEditMsg.textContent = h.reachable ? "连接成功。" : (h.lastError || "连接失败");
+    els.profileEditMsg.className = h.reachable ? "msg ok" : "msg err";
+  } catch (e) {
+    els.profileEditMsg.textContent = "连接失败：" + e;
+    els.profileEditMsg.className = "msg err";
+  } finally {
+    els.testProfileBtn.disabled = false;
+  }
+}
+
+async function remoteOneClick() {
+  if (!currentProfile) {
+    setMsg("请先选择远程服务器。", "err");
+    return;
+  }
+  const active = activeLocalProfile();
+  if (!active) {
+    setMsg("请先在本地配置里选择一条当前生效的模型来源。", "err");
+    return;
+  }
+  setBusy(true);
+  try {
+    const proxyPort = parseInt(els.proxyPort.value, 10) || 18991;
+    const sandboxPort = parseInt(els.sandboxPort.value, 10) || 8990;
+    const r = await call("remote_one_click", {
+      profile: currentProfile,
+      provider: adapterForProfile(active),
+      proxyPort,
+      sandboxPort,
+    });
+    const localUrl = (r && r.local_url) || ("http://127.0.0.1:" + sandboxPort);
+    const tunnelHint = r && r.tunnel_hint ? "\n端口转发：" + r.tunnel_hint : "";
+    setMsg("远程代理与沙箱已启动。\n本地访问：" + localUrl + tunnelHint, "ok");
+    await refreshStatus();
+  } catch (e) {
+    setMsg("远程一键开始失败：" + e, "err");
+  } finally {
+    setBusy(false);
   }
 }
 
 function wire() {
   [
-    "provider", "keyLabel", "keyInput", "saveKeyBtn", "proxyPort", "sandboxPort",
-    "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
-    "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
-    "reportBtn", "logsBtn", "quitBtn", "modeSeg",
-    // 远程模式元素
-    "targetSeg", "profileSelect", "manageProfilesBtn", "remoteHealthDot",
-    "remoteHealthText", "profileModal", "profileList", "addProfileBtn",
-    "closeProfileModal", "profileEditModal", "profileEditTitle",
-    "editProfileName", "editProfileHost", "editProfilePort", "editProfileUsername",
-    "editProfileAuth", "editProfileKeyPath", "editProfileHelperPath",
-    "keyFileGroup", "testProfileBtn", "saveProfileBtn", "cancelProfileEditBtn",
-    "profileEditMsg",
-  ].forEach((id) => (els[id] = $(id)));
+    "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream", "msg", "brandDot",
+    "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel", "reportBtn", "logsBtn", "quitBtn",
+    "modeSeg", "targetSeg", "proxyPort", "sandboxPort", "advSec", "listSec", "profileList",
+    "newBtn", "skipActivateBtn", "wizSec", "wizTemplate", "wizTemplateChips", "wizTplHint",
+    "wizName", "wizBase", "wizBaseHint", "wizFetchBtn", "wizModelInfo", "wizModel",
+    "wizModelList", "wizModelHint", "wizKey", "wizSaveBtn", "wizCancelBtn", "connSec",
+    "connTitle", "connBase", "connBaseHint", "connFetchBtn", "connModelInfo", "connModel",
+    "connModelList", "connModelHint", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
+    "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn", "profileSelect",
+    "manageProfilesBtn", "remoteHealthDot", "remoteHealthText", "profileModal", "addProfileBtn",
+    "closeProfileModal", "profileEditModal", "profileEditTitle", "editProfileName",
+    "editProfileHost", "editProfilePort", "editProfileUsername", "editProfileAuth",
+    "editProfileKeyPath", "editProfileHelperPath", "keyFileGroup", "testProfileBtn",
+    "saveProfileBtn", "cancelProfileEditBtn", "profileEditMsg",
+  ].forEach((id) => { els[id] = $(id); });
   els.panel = document.querySelector(".panel");
 
-  // 已有的事件
-  els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
-    b.addEventListener("click", () => switchMode(b.dataset.mode))
-  );
+  els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => b.addEventListener("click", () => switchMode(b.dataset.mode)));
+  els.targetSeg.querySelectorAll(".seg-btn").forEach((b) => b.addEventListener("click", () => switchTarget(b.dataset.target)));
+  els.proxyPort.addEventListener("change", persistPorts);
+  els.sandboxPort.addEventListener("change", persistPorts);
+  els.newBtn.addEventListener("click", openWizard);
+  els.skipActivateBtn.addEventListener("click", () => pendingSkipActivateId && activateProfile(pendingSkipActivateId, true));
 
-  // 🔴 注意：$ 函数 = document.getElementById，不接受 # 前缀，必须直接传 ID！
-  const d = (id) => document.getElementById(id);
-
-  if (els.targetSeg) {
-    els.targetSeg.querySelectorAll(".seg-btn").forEach((b) =>
-      b.addEventListener("click", () => switchTarget(b.dataset.target))
-    );
-  }
-  // 直接通过 ID 获取并绑定事件
-  const ps = d('profileSelect'); if (ps) ps.addEventListener("change", onProfileChange);
-  const mb = d('manageProfilesBtn'); if (mb) mb.addEventListener("click", openProfileModal);
-  const ab = d('addProfileBtn'); if (ab) ab.addEventListener("click", () => { closeProfileModal(); openProfileEdit(null); });
-  const cp = d('closeProfileModal'); if (cp) cp.addEventListener("click", closeProfileModal);
-  const sp = d('saveProfileBtn'); if (sp) sp.addEventListener("click", saveProfile);
-  const ce = d('cancelProfileEditBtn'); if (ce) ce.addEventListener("click", closeProfileEdit);
-  const tb = d('testProfileBtn'); if (tb) tb.addEventListener("click", testProfileConnection);
-  const ea = d('editProfileAuth'); if (ea) ea.addEventListener("change", toggleKeyFileGroup);
-
-  // 点击弹窗遮罩关闭
-  document.querySelectorAll('.modal-overlay').forEach(ov => {
-    ov.addEventListener('click', (e) => { if (e.target === ov) { ov.style.display = 'none'; } });
+  els.profileList.addEventListener("click", (e) => {
+    if (busy) return;
+    const button = e.target.closest("[data-act]");
+    const row = e.target.closest("[data-id]");
+    if (!button || !row) return;
+    const id = row.dataset.id;
+    const act = button.dataset.act;
+    if (act === "activate") activateProfile(id, false);
+    if (act === "editconn") openConn(id);
+    if (act === "editmeta") openMeta(id);
+    if (act === "clearkey") confirmAction("clear:" + id, "确定清除这条配置的 key", () => clearProfileKey(id));
+    if (act === "delete") confirmAction("delete:" + id, "确定删除这条配置", () => deleteProfile(id));
   });
 
-  els.provider.addEventListener("change", async () => {
-    reflectProvider();
-    await persistSettingsSafe();
+  els.wizTemplateChips.addEventListener("click", (e) => {
+    const chip = e.target.closest("[data-tid]");
+    if (chip) selectWizTemplate(chip.dataset.tid);
   });
-  els.proxyPort.addEventListener("change", persistSettingsSafe);
-  els.sandboxPort.addEventListener("change", persistSettingsSafe);
-  els.saveKeyBtn.addEventListener("click", saveKey);
+  [els.wizName, els.wizBase, els.wizModel].forEach((el) => el.addEventListener("input", refreshWizGate));
+  els.wizFetchBtn.addEventListener("click", () => fetchModelsFor("wiz"));
+  els.wizSaveBtn.addEventListener("click", createProfile);
+  els.wizCancelBtn.addEventListener("click", () => { showView("list"); setMsg(""); });
+
+  [els.connBase, els.connModel].forEach((el) => el.addEventListener("input", refreshConnGate));
+  els.connFetchBtn.addEventListener("click", () => fetchModelsFor("conn"));
+  els.connSaveBtn.addEventListener("click", saveConn);
+  els.connClearBtn.addEventListener("click", () => editingConnId && confirmAction("clear:" + editingConnId, "确定清除这条配置的 key", () => clearProfileKey(editingConnId)));
+  els.connCancelBtn.addEventListener("click", () => { showView("list"); setMsg(""); });
+  els.metaSaveBtn.addEventListener("click", saveMeta);
+  els.metaCancelBtn.addEventListener("click", () => { showView("list"); setMsg(""); });
+
+  els.oneClickBtn.addEventListener("click", oneClick);
   els.stopBtn.addEventListener("click", stopAll);
-  els.oneClickBtn.addEventListener("click", heroClick);
   els.openBrowserBtn.addEventListener("click", openBrowser);
-  els.doctorBtn.addEventListener("click", () => {
-    if (target === 'remote' && currentProfile) {
-      setBusy(true); setMsg("远程诊断中…");
-      call("remote_doctor", { profile: currentProfile })
-        .then(out => { setMsg(typeof out === 'string' ? out : JSON.stringify(out.checks || out, null, 2)); setBusy(false); })
-        .catch(e => { setMsg("诊断失败：" + e, "err"); setBusy(false); });
-    } else {
-      runDoctor();
-    }
-  });
+  els.doctorBtn.addEventListener("click", runDoctor);
   els.updateBtn.addEventListener("click", checkUpdate);
-  els.reportBtn.addEventListener("click", () =>
-    call("report_bug").catch((e) => setMsg("打开反馈页失败：" + e, "err"))
-  );
+  els.reportBtn.addEventListener("click", () => call("report_bug").catch((e) => setMsg("打开反馈页失败：" + e, "err")));
   els.logsBtn.addEventListener("click", () => {
-    if (target === 'remote' && currentProfile) {
-      call("remote_logs", { profile: currentProfile, name: "proxy", lines: 50 })
-        .then(out => setMsg(out && out.content ? out.content : '(日志为空)', 'ok'))
-        .catch(e => setMsg("获取日志失败：" + e, "err"));
+    if (target === "remote" && currentProfile) {
+      call("remote_logs", { profile: currentProfile, name: "proxy", lines: 80 })
+        .then((out) => setMsg((out && out.content) || "日志为空。", "ok"))
+        .catch((e) => setMsg("获取日志失败：" + e, "err"));
     } else {
       call("open_logs").catch((e) => setMsg("打开日志失败：" + e, "err"));
     }
   });
   els.quitBtn.addEventListener("click", () => call("quit_app").catch(() => {}));
-}
 
-// =========================================================================
-// 远程服务器管理
-// =========================================================================
-
-/// 切换本地/远程模式。
-async function switchTarget(t) {
-  if (t === target) return;
-  target = t;
-  // 更新 UI 类
-  const panel = document.querySelector('.panel');
-  if (t === 'remote') {
-    panel.classList.add('target-remote');
-  } else {
-    panel.classList.remove('target-remote');
-  }
-  // 更新分段按钮
-  document.querySelectorAll('#targetSeg .seg-btn').forEach(b =>
-    b.classList.toggle('active', b.dataset.target === t)
-  );
-  if (t === 'remote') {
-    await loadRemoteProfiles();
-    setMsg('已切换到远程模式。请选择服务器。');
-  } else {
-    setMsg('已切换到本地模式。');
-  }
-  await refreshStatus();
-}
-
-/// 加载远程 Profile 列表。
-async function loadRemoteProfiles() {
-  try {
-    remoteProfiles = await call("remote_list_profiles");
-    const sel = document.getElementById('profileSelect');
-    if (!sel) {
-      // 元素可能延迟加载，再尝试一次
-      await new Promise(r => setTimeout(r, 200));
-      const sel2 = document.getElementById('profileSelect');
-      if (!sel2) {
-        console.warn('profileSelect element not found in DOM');
-        return;
-      }
-      sel2.innerHTML = '<option value="">-- 选择服务器 --</option>' +
-        remoteProfiles.map(p =>
-          `<option value="${p.id}">${p.name} (${p.username}@${p.host}:${p.port})</option>`
-        ).join('');
-      if (currentProfile && remoteProfiles.find(p => p.id === currentProfile.id)) {
-        sel2.value = currentProfile.id;
-      }
-      updateRemoteHealthUI();
-      return;
-    }
-    sel.innerHTML = '<option value="">-- 选择服务器 --</option>' +
-      remoteProfiles.map(p =>
-        `<option value="${p.id}">${p.name} (${p.username}@${p.host}:${p.port})</option>`
-      ).join('');
-    // 恢复之前选择的
-    if (currentProfile && remoteProfiles.find(p => p.id === currentProfile.id)) {
-      sel.value = currentProfile.id;
-    }
-    updateRemoteHealthUI();
-  } catch (e) {
-    setMsg("加载服务器列表失败：" + e, "err");
-  }
-}
-
-/// Profile 变更时。
-async function onProfileChange() {
-  const sel = $('#profileSelect');
-  if (!sel) return;
-  const id = sel.value;
-  currentProfile = remoteProfiles.find(p => p.id === id) || null;
-  if (currentProfile) {
-    setMsg(`已选择 ${currentProfile.name}，正在检查连接…`, null);
-    await checkRemoteHealth();
-  } else {
-    updateRemoteHealthUI();
-    setMsg('请选择远程服务器。');
-  }
-}
-
-/// 检查远程健康状态。
-async function checkRemoteHealth() {
-  if (!currentProfile) return;
-  const dot = $('#remoteHealthDot');
-  const txt = $('#remoteHealthText');
-  dot.className = 'lt a pulsing';
-  txt.textContent = '连接中…';
-  try {
-    const health = await call("remote_check_health", { profile: currentProfile });
-    if (health.reachable && health.helperInstalled && health.compatible) {
-      dot.className = 'lt g';
-      txt.textContent = `已连接 | ${health.platform || '?'} ${health.arch || '?'} | Helper ${health.helperVersion || '?'}`;
-    } else if (health.reachable && !health.helperInstalled) {
-      dot.className = 'lt a';
-      txt.textContent = '已连接，Helper 未安装。点击下方「安装 Helper」。';
-    } else if (health.reachable && !health.compatible) {
-      dot.className = 'lt a';
-      txt.textContent = `Helper 版本不兼容：${health.lastError || '请升级'}`;
-    } else {
-      dot.className = 'lt r';
-      txt.textContent = health.lastError || '连接失败';
-    }
-    // 如果远程代理/沙箱在运行，更新状态灯
-    if (health.proxyRunning || health.sandboxRunning) {
-      setLight(els.ltProxy, health.proxyRunning ? 'green' : 'amber');
-      setLight(els.ltSandbox, health.sandboxRunning ? 'green' : 'amber');
-      setLight(els.ltUpstream, 'green');
-    }
-  } catch (e) {
-    dot.className = 'lt r';
-    txt.textContent = '检查失败：' + e;
-  }
-}
-
-/// 更新远程健康 UI（初始/断开状态）。
-function updateRemoteHealthUI() {
-  const dot = $('#remoteHealthDot');
-  const txt = $('#remoteHealthText');
-  if (!dot || !txt) return;
-  if (currentProfile) {
-    dot.className = 'lt a';
-    txt.textContent = `已选：${currentProfile.name}`;
-  } else {
-    dot.className = 'lt a';
-    txt.textContent = '未连接';
-  }
-}
-
-/// 安装远程 Helper。
-async function installRemoteHelper() {
-  if (!currentProfile) { setMsg('请先选择服务器', 'err'); return; }
-  setBusy(true); setMsg('正在安装 Helper，可能需要 1-2 分钟…');
-  try {
-    const health = await call("remote_install_helper", { profile: currentProfile });
-    if (health.helperInstalled) {
-      setMsg(`Helper ${health.helperVersion} 安装成功！`, 'ok');
-      await checkRemoteHealth();
-    } else {
-      setMsg('安装失败：' + (health.lastError || '未知错误'), 'err');
-    }
-  } catch (e) { setMsg('安装失败：' + e, 'err'); }
-  finally { setBusy(false); }
-}
-
-// =========================================================================
-// Profile 管理弹窗
-// =========================================================================
-
-/// 打开 Profile 管理弹窗。
-async function openProfileModal() {
-  // 确保 profiles 已加载
-  try { await loadRemoteProfiles(); } catch(e) { /* 忽略 */ }
-
-  // 直接通过 ID 获取元素（不依赖 els 缓存）
-  const modal = document.getElementById('profileModal');
-  const list = document.getElementById('profileList');
-  if (!modal || !list) {
-    // 诊断：列出哪些远程元素不存在
-    const ids = ['profileModal','profileList','profileSelect','manageProfilesBtn',
-                 'addProfileBtn','profileEditModal','targetSeg'];
-    const missing = ids.filter(id => !document.getElementById(id));
-    console.error('缺少的远程 UI 元素:', missing);
-    setMsg('远程面板未加载，请刷新页面试试（Ctrl+R）', 'err');
-    return;
-  }
-  // 渲染列表
-  list.innerHTML = remoteProfiles.length === 0
-    ? '<div class="hint">暂无服务器。点击「+ 添加」。</div>'
-    : remoteProfiles.map(p => `
-      <div class="profile-item">
-        <div>
-          <div class="pi-name">${escHtml(p.name)}</div>
-          <div class="pi-detail">${escHtml(p.username)}@${escHtml(p.host)}:${p.port} · ${(p.authMethod && p.authMethod.type === 'sshAgent' ? 'SSH Agent' : (p.authMethod && p.authMethod.type === 'keyFile' ? 'KeyFile' : '未知'))}</div>
-        </div>
-        <div class="pi-actions">
-          <span class="pi-act" data-action="edit" data-id="${p.id}">编辑</span>
-          <span class="pi-act del" data-action="delete" data-id="${p.id}">删除</span>
-        </div>
-      </div>
-    `).join('');
-  // 绑定事件
-  list.querySelectorAll('.pi-act').forEach(el => {
-    el.addEventListener('click', async () => {
-      const id = el.dataset.id;
-      if (el.dataset.action === 'edit') {
-        openProfileEdit(id);
-      } else if (el.dataset.action === 'delete') {
-        if (confirm('确定删除此服务器配置？')) {
-          await call("remote_delete_profile", { id: id });
-          await loadRemoteProfiles();
-          if (currentProfile && currentProfile.id === id) currentProfile = null;
-          openProfileModal(); // 刷新列表
-        }
-      }
+  els.profileSelect.addEventListener("change", onProfileChange);
+  els.manageProfilesBtn.addEventListener("click", openProfileModal);
+  els.addProfileBtn.addEventListener("click", () => { closeProfileModal(); openProfileEdit(null); });
+  els.closeProfileModal.addEventListener("click", closeProfileModal);
+  els.saveProfileBtn.addEventListener("click", saveProfile);
+  els.cancelProfileEditBtn.addEventListener("click", closeProfileEdit);
+  els.testProfileBtn.addEventListener("click", testProfileConnection);
+  els.editProfileAuth.addEventListener("change", toggleKeyFileGroup);
+  document.querySelectorAll(".modal-overlay").forEach((overlay) => {
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.style.display = "none";
     });
   });
-  modal.style.display = 'flex';
-}
-
-/// 关闭 Profile 管理弹窗。
-function closeProfileModal() {
-  $('#profileModal').style.display = 'none';
-}
-
-/// 打开 Profile 编辑弹窗（新增或编辑）。
-function openProfileEdit(id) {
-  const modal = $('#profileEditModal');
-  const profile = id ? remoteProfiles.find(p => p.id === id) : null;
-  $('#profileEditTitle').textContent = profile ? '编辑服务器' : '添加服务器';
-  $('#editProfileName').value = profile ? profile.name : '';
-  $('#editProfileHost').value = profile ? profile.host : '';
-  $('#editProfilePort').value = profile ? profile.port : 22;
-  $('#editProfileUsername').value = profile ? profile.username : '';
-  $('#editProfileAuth').value = profile
-    ? (profile.authMethod.type === 'sshAgent' ? 'ssh_agent' : 'key_file')
-    : 'ssh_agent';
-  $('#editProfileKeyPath').value = (profile && profile.authMethod.path) ? profile.authMethod.path : '~/.ssh/id_ed25519';
-  $('#editProfileHelperPath').value = profile ? profile.helperPath : '~/.csswitch/bin/csswitch-helper';
-  $('#profileEditMsg').textContent = '';
-  // 切换认证方式显示
-  toggleKeyFileGroup();
-  // 存储当前编辑的 ID
-  modal.dataset.editId = id || '';
-  modal.style.display = 'flex';
-}
-
-/// 关闭编辑弹窗。
-function closeProfileEdit() {
-  $('#profileEditModal').style.display = 'none';
-}
-
-/// 认证方式切换时显示/隐藏密钥路径。
-function toggleKeyFileGroup() {
-  $('#keyFileGroup').style.display = $('#editProfileAuth').value === 'key_file' ? '' : 'none';
-}
-
-/// 保存 Profile。
-async function saveProfile() {
-  const id = $('#profileEditModal').dataset.editId || crypto.randomUUID ? crypto.randomUUID() : 'p_' + Date.now();
-  const authType = $('#editProfileAuth').value;
-  const profile = {
-    id: id,
-    name: $('#editProfileName').value.trim() || '未命名',
-    host: $('#editProfileHost').value.trim(),
-    port: parseInt($('#editProfilePort').value) || 22,
-    username: $('#editProfileUsername').value.trim(),
-    authMethod: authType === 'key_file'
-      ? { type: 'keyFile', path: $('#editProfileKeyPath').value.trim() }
-      : { type: 'sshAgent' },
-    helperPath: $('#editProfileHelperPath').value.trim() || '~/.csswitch/bin/csswitch-helper',
-  };
-  if (!profile.host || !profile.username) {
-    $('#profileEditMsg').textContent = '服务器地址和用户名不能为空。';
-    $('#profileEditMsg').className = 'msg err';
-    return;
-  }
-  try {
-    await call("remote_save_profile", { profile });
-    await loadRemoteProfiles();
-    closeProfileEdit();
-    openProfileModal(); // 刷新管理列表
-  } catch (e) {
-    $('#profileEditMsg').textContent = '保存失败：' + e;
-    $('#profileEditMsg').className = 'msg err';
-  }
-}
-
-/// 测试连接。
-async function testProfileConnection() {
-  const btn = $('#testProfileBtn');
-  btn.disabled = true;
-  $('#profileEditMsg').textContent = '正在测试连接…';
-  $('#profileEditMsg').className = 'msg';
-  try {
-    // 构建临时 Profile 用于测试
-    const authType = $('#editProfileAuth').value;
-    const tmpProfile = {
-      id: '_test_',
-      name: 'test',
-      host: $('#editProfileHost').value.trim(),
-      port: parseInt($('#editProfilePort').value) || 22,
-      username: $('#editProfileUsername').value.trim(),
-      authMethod: authType === 'key_file'
-        ? { type: 'keyFile', path: $('#editProfileKeyPath').value.trim() }
-        : { type: 'sshAgent' },
-      helperPath: $('#editProfileHelperPath').value.trim() || '~/.csswitch/bin/csswitch-helper',
-    };
-    const health = await call("remote_check_health", { profile: tmpProfile });
-    if (health.reachable) {
-      let msg = `✅ 连接成功！平台：${health.platform || '?'} ${health.arch || '?'}`;
-      if (health.helperInstalled) {
-        msg += ` | Helper：${health.helperVersion || '?'}`;
-      } else {
-        msg += ' | Helper 未安装（保存后可在主面板安装）';
-      }
-      $('#profileEditMsg').textContent = msg;
-      $('#profileEditMsg').className = 'msg ok';
-    } else {
-      $('#profileEditMsg').textContent = `❌ ${health.lastError || '连接失败'}`;
-      $('#profileEditMsg').className = 'msg err';
-    }
-  } catch (e) {
-    $('#profileEditMsg').textContent = '❌ ' + e;
-    $('#profileEditMsg').className = 'msg err';
-  } finally {
-    btn.disabled = false;
-  }
-}
-
-/// HTML 转义。
-function escHtml(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
-// =========================================================================
-// 重写关键操作以支持远程模式分派
-// =========================================================================
-
-/// 保存 Key（本地或远程）。
-const _saveKeyOrig = saveKey;
-saveKey = async function() {
-  if (target === 'remote' && currentProfile) {
-    const key = els.keyInput.value.trim();
-    if (!key) { setMsg("请先粘贴 key。", "err"); return; }
-    setBusy(true);
-    try {
-      await call("remote_save_provider_key", { profile: currentProfile, provider: els.provider.value, key });
-      setMsg("已保存到远程服务器。", "ok");
-    } catch (e) { setMsg("保存失败：" + e, "err"); }
-    finally { setBusy(false); await refreshStatus(); }
-    return;
-  }
-  return _saveKeyOrig();
-};
-
-/// 一键开始（本地或远程）。
-const _oneClickOrig = oneClick;
-oneClick = async function() {
-  // P1-7 修复：检查是否有操作正在进行
-  if (isOperating) {
-    setMsg('操作进行中，请稍候...', 'err');
-    return;
-  }
-
-  if (target === 'remote' && currentProfile) {
-    isOperating = true;
-    setBusy(true); setMsg('远程一键开始：保存 Key → 起代理…');
-    try {
-      const key = els.keyInput.value.trim();
-      const r = await call("remote_one_click", {
-        profile: currentProfile,
-        provider: els.provider.value,
-        key: key,
-        proxyPort: parseInt(els.proxyPort.value) || 18991,
-        sandboxPort: parseInt(els.sandboxPort.value) || 8990,
+  document.getElementById("remoteProfileList").addEventListener("click", async (e) => {
+    const action = e.target.closest("[data-action]");
+    if (!action) return;
+    const id = action.dataset.id;
+    if (action.dataset.action === "edit") openProfileEdit(id);
+    if (action.dataset.action === "delete") {
+      confirmAction("remote-delete:" + id, "确定删除这个远程服务器", async () => {
+        await call("remote_delete_profile", { id });
+        await openProfileModal();
+        await loadRemoteProfiles();
       });
-      setMsg("远程代理已启动！端口：" + (r && r.port) + "。请在浏览器中访问 Science。", "ok");
-      await refreshStatus();
-    } catch (e) { setMsg("远程一键开始失败：" + e, "err"); }
-    finally {
-      setBusy(false);
-      isOperating = false;
     }
-    return;
-  }
-  return _oneClickOrig();
-};
-
-/// 全部停止（本地或远程）。
-const _stopAllOrig = stopAll;
-stopAll = async function() {
-  // P1-7 修复：检查是否有操作正在进行
-  if (isOperating) {
-    setMsg('操作进行中，请稍候...', 'err');
-    return;
-  }
-
-  if (target === 'remote' && currentProfile) {
-    isOperating = true;
-    setBusy(true); setMsg('停止远程服务…');
-    try {
-      await call("remote_stop_proxy", { profile: currentProfile });
-      setMsg("远程代理已停止。", "ok");
-      await refreshStatus();
-    } catch (e) { setMsg("停止失败：" + e, "err"); }
-    finally {
-      setBusy(false);
-      isOperating = false;
-    }
-    return;
-  }
-  return _stopAllOrig();
-};
-
-/// 刷新状态（本地或远程）。
-const _refreshStatusOrig = refreshStatus;
-refreshStatus = async function() {
-  if (target === 'remote' && currentProfile) {
-    try {
-      const s = await call("remote_status", { profile: currentProfile });
-      setLight(els.ltProxy, s.proxy);
-      setLight(els.ltSandbox, s.sandbox);
-      setLight(els.ltUpstream, s.upstream);
-      const anyGreen = s.proxy === "green" || s.sandbox === "green";
-      els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
-    } catch (e) {
-      [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
-    }
-    return;
-  }
-  return _refreshStatusOrig();
-};
-
-/// Hero 按钮（官方/本地/远程分派）。
-const _heroClickOrig = heroClick;
-heroClick = async function() {
-  if (target === 'remote') {
-    if (mode === 'official') {
-      setMsg('远程模式不支持官方 Claude。请用第三方模型。', 'err');
-    } else {
-      await oneClick();
-    }
-    return;
-  }
-  return _heroClickOrig();
-};
+  });
+}
 
 window.addEventListener("DOMContentLoaded", async () => {
   wire();
   await loadConfig();
-  try { els.verLabel.textContent = "v" + (await call("app_version")); } catch (e) {}
+  try { els.verLabel.textContent = "v" + await call("app_version"); } catch (e) {}
   await refreshStatus();
   if (PREVIEW) {
-    setMsg("预览模式：仅看界面，按钮不连后端（真实 app 里会连进程管家）。");
+    setMsg("预览模式：只展示界面，不连接后端。");
   } else {
     statusTimer = setInterval(refreshStatus, 2500);
   }

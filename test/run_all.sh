@@ -6,6 +6,7 @@ echo "== python unittest =="
 python3 -m unittest discover -s test -p 'test_*.py' -v
 echo "== node --test =="
 node --test test/test_make_virtual_oauth.mjs
+node --test test/test_desktop_ui_contract.mjs
 echo "== bash scripts =="
 bash test/test_scripts.sh
 echo "== bash ops scripts (doctor/verify-proxy/self-test) =="

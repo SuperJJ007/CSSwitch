@@ -13,8 +13,9 @@
 //! 4. 便利操作 — 一键开始、日志查看、诊断
 
 use crate::remote::{
-    self, RemoteHealth, RemoteHostProfile, REQUIRED_CAPABILITIES,
+    self, RemoteAuthMethod, RemoteHealth, RemoteHostProfile, REQUIRED_CAPABILITIES,
 };
+use crate::{config, templates};
 use serde_json::{json, Value};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
@@ -236,6 +237,51 @@ pub fn remote_save_provider_key(
 // 4. 代理（SSH，阻塞 I/O）
 // ============================================================================
 
+fn remote_active_config_for_start(
+    provider: &str,
+    proxy_port: u16,
+    sandbox_port: Option<u16>,
+    secret: &str,
+) -> Result<(config::Config, String), String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+    let active = cfg
+        .active_profile()
+        .cloned()
+        .ok_or("没有生效的配置 Profile。请先在本地配置里选择当前模型来源。")?;
+    let adapter = templates::adapter_for(&active.template_id).to_string();
+    if !provider.is_empty() && provider != adapter && provider != active.template_id {
+        return Err(format!(
+            "远程启动来源不匹配：当前 Profile 是 {}，但启动请求是 {provider}。",
+            active.template_id
+        ));
+    }
+    if active.api_key.trim().is_empty() {
+        return Err("当前 Profile 未填写 API Key。请填写后重试。".into());
+    }
+    if adapter == "relay" {
+        if active.base_url.trim().is_empty()
+            || !(active.base_url.starts_with("http://") || active.base_url.starts_with("https://"))
+        {
+            return Err("relay 配置需要 http(s):// 开头的 base_url。".into());
+        }
+        if active.model.trim().is_empty() {
+            return Err("relay 配置需要选择或填写模型。".into());
+        }
+    }
+
+    let remote_cfg = config::Config {
+        schema_version: config::CURRENT_SCHEMA_VERSION,
+        profiles: vec![active.clone()],
+        active_id: active.id.clone(),
+        proxy_port,
+        sandbox_port: sandbox_port.unwrap_or(cfg.sandbox_port),
+        secret: secret.to_string(),
+        mode: cfg.mode,
+        pending_notice: None,
+    };
+    Ok((remote_cfg, adapter))
+}
+
 /// 启动远程代理。
 #[tauri::command]
 pub fn remote_start_proxy(
@@ -244,12 +290,31 @@ pub fn remote_start_proxy(
     port: u16,
     secret: String,
 ) -> Result<Value, String> {
+    let (remote_cfg, adapter) = remote_active_config_for_start(&provider, port, None, &secret)?;
+    let config_json = serde_json::to_string(&remote_cfg).map_err(|e| e.to_string())?;
+
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "config".to_string(),
+            "set".to_string(),
+            config_json,
+        ],
+    )
+    .map_err(|e| format!("同步当前 Profile 到服务器失败：{}", e.message))?;
+
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["proxy".to_string(), "stop".to_string()],
+    )
+    .map_err(|e| format!("停止旧远程代理失败：{}", e.message))?;
+
     remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
         &[
             "proxy".to_string(),
             "start".to_string(),
-            provider,
+            adapter,
             port.to_string(),
             secret,
         ],
@@ -338,62 +403,91 @@ pub fn remote_doctor(profile: RemoteHostProfile) -> Result<Value, String> {
         .map_err(|e| e.message)
 }
 
-/// 远程一键开始：保存 key → 起代理。
-/// 注：完整流程需要在客户端先生成 secret，此处为简化版本。
+fn remote_tunnel_hint(profile: &RemoteHostProfile, sandbox_port: u16) -> String {
+    let mut parts = vec!["ssh".to_string()];
+    if let RemoteAuthMethod::KeyFile { path } = &profile.auth_method {
+        parts.push("-i".to_string());
+        parts.push(path.clone());
+    }
+    parts.push("-p".to_string());
+    parts.push(profile.port.to_string());
+    parts.push("-N".to_string());
+    parts.push("-L".to_string());
+    parts.push(format!("{sandbox_port}:127.0.0.1:{sandbox_port}"));
+    parts.push(format!("{}@{}", profile.username, profile.host));
+    parts.join(" ")
+}
+
+/// 远程一键开始：同步当前 Profile → 起代理 → 起沙箱。
 #[tauri::command]
 pub fn remote_one_click(
     profile: RemoteHostProfile,
     provider: String,
-    key: String,
     proxy_port: u16,
-    _sandbox_port: u16,
+    sandbox_port: u16,
 ) -> Result<Value, String> {
-    // 步骤 1：保存 key
+    let secret = config::new_id();
+    let (remote_cfg, adapter) =
+        remote_active_config_for_start(&provider, proxy_port, Some(sandbox_port), &secret)?;
+    let config_json = serde_json::to_string(&remote_cfg).map_err(|e| e.to_string())?;
+
     remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
         &[
             "config".to_string(),
-            "save-key".to_string(),
-            provider.clone(),
-            key,
+            "set".to_string(),
+            config_json,
         ],
     )
-    .map_err(|e| remote::types::RemoteError {
-        code: e.code,
-        message: format!("保存 Key 失败：{}", e.message),
-        details: e.details,
-        recoverable: false,
-        suggestion: e.suggestion,
-    })
-    .map_err(|e| e.message)?;
+    .map_err(|e| format!("同步当前 Profile 到服务器失败：{}", e.message))?;
 
-    // 步骤 2：起代理
     remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["proxy".to_string(), "stop".to_string()],
+    )
+    .map_err(|e| format!("停止旧远程代理失败：{}", e.message))?;
+
+    remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &["sandbox".to_string(), "stop".to_string()],
+    )
+    .map_err(|e| format!("停止旧远程沙箱失败：{}", e.message))?;
+
+    let proxy_result = remote::ssh::run_helper_json_with_retry::<Value>(
         &profile,
         &[
             "proxy".to_string(),
             "start".to_string(),
-            provider,
+            adapter,
             proxy_port.to_string(),
-            // 审核 P0-1 修复：使用加密随机 32 字符 hex secret 替代硬编码弱 secret。
-            {
-                use rand::RngCore;
-                let mut b = [0u8; 16];
-                rand::rngs::OsRng.fill_bytes(&mut b);
-                b.iter().map(|x| format!("{x:02x}")).collect::<String>()
-            },
+            secret.clone(),
         ],
     )
-    .map_err(|e| remote::types::RemoteError {
-        code: e.code,
-        message: format!("启动代理失败：{}", e.message),
-        details: e.details,
-        recoverable: false,
-        suggestion: e.suggestion,
-    })
-    .map_err(|e| e.message)?;
+    .map_err(|e| format!("启动远程代理失败：{}", e.message))?;
 
-    Ok(json!({ "ok": true, "port": proxy_port }))
+    let proxy_url = format!("http://127.0.0.1:{proxy_port}/{secret}");
+    let sandbox_result = remote::ssh::run_helper_json_with_retry::<Value>(
+        &profile,
+        &[
+            "sandbox".to_string(),
+            "start".to_string(),
+            sandbox_port.to_string(),
+            proxy_url.clone(),
+        ],
+    )
+    .map_err(|e| format!("启动远程沙箱失败：{}", e.message))?;
+
+    Ok(json!({
+        "ok": true,
+        "proxy_port": proxy_port,
+        "sandbox_port": sandbox_port,
+        "proxy_url": proxy_url,
+        "local_url": format!("http://127.0.0.1:{sandbox_port}"),
+        "remote_url": format!("http://{}:{sandbox_port}", profile.host),
+        "tunnel_hint": remote_tunnel_hint(&profile, sandbox_port),
+        "proxy": proxy_result,
+        "sandbox": sandbox_result,
+    }))
 }
 
 // ============================================================================

@@ -35,19 +35,84 @@ fn key_fingerprint(s: &str) -> u64 {
     h.finish()
 }
 
-// ---------- provider 元信息 ----------
-fn key_env(provider: &str) -> &'static str {
-    match provider {
+// ---------- profile / adapter 元信息 ----------
+fn key_env_for_adapter(adapter: &str) -> &'static str {
+    match adapter {
+        "deepseek" => "DEEPSEEK_API_KEY",
         "qwen" => "DASHSCOPE_API_KEY",
-        _ => "DEEPSEEK_API_KEY",
+        _ => "CSSWITCH_RELAY_KEY",
     }
 }
 
-fn upstream_host(provider: &str) -> &'static str {
-    match provider {
-        "qwen" => "dashscope.aliyuncs.com",
-        _ => "api.deepseek.com",
+fn is_native_adapter(adapter: &str) -> bool {
+    adapter == "deepseek" || adapter == "qwen"
+}
+
+fn parse_host(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let host = rest.split(['/', ':', '?', '#']).next().unwrap_or("");
+    if host.is_empty() {
+        None
+    } else {
+        Some(host.to_string())
     }
+}
+
+fn upstream_host(adapter: &str, base_url: &str) -> String {
+    match adapter {
+        "deepseek" => "api.deepseek.com".to_string(),
+        "qwen" => "dashscope.aliyuncs.com".to_string(),
+        _ => parse_host(base_url).unwrap_or_default(),
+    }
+}
+
+struct ProxyLaunch {
+    adapter: String,
+    base_url: String,
+    model: String,
+    key: String,
+    key_env: &'static str,
+    thinking_policy: &'static str,
+}
+
+fn proxy_launch_for(profile: &config::Profile) -> ProxyLaunch {
+    let adapter = templates::adapter_for(&profile.template_id).to_string();
+    ProxyLaunch {
+        key_env: key_env_for_adapter(&adapter),
+        adapter,
+        base_url: profile.base_url.clone(),
+        model: profile.model.clone(),
+        key: profile.api_key.clone(),
+        thinking_policy: templates::thinking_policy_for(&profile.template_id),
+    }
+}
+
+fn assert_profile_runnable(profile: &config::Profile) -> Result<(), String> {
+    match profile.api_format.as_str() {
+        "anthropic" | "openai_chat" => {}
+        other => {
+            return Err(format!(
+                "api_format `{other}` 暂不支持，请选 anthropic 或 openai_chat。"
+            ));
+        }
+    }
+    let launch = proxy_launch_for(profile);
+    if launch.key.trim().is_empty() {
+        return Err("当前 Profile 未填写 API Key。请填写后重试。".into());
+    }
+    if !is_native_adapter(&launch.adapter) {
+        if launch.base_url.trim().is_empty()
+            || !(launch.base_url.starts_with("http://") || launch.base_url.starts_with("https://"))
+        {
+            return Err("relay 配置需要 http(s):// 开头的 base_url。".into());
+        }
+        if launch.model.trim().is_empty() {
+            return Err("relay 配置需要选择或填写模型。".into());
+        }
+    }
+    Ok(())
 }
 
 // ---------- 路径与日志 ----------
@@ -226,13 +291,9 @@ fn ensure_proxy(
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let profile = cfg.active_profile().cloned()
         .ok_or("没有生效的配置 Profile。请先「＋ 新建」或「设为当前」。")?;
-    let provider = templates::adapter_for(&profile.template_id).to_string();
-    let key = if profile.api_key.is_empty() {
-        return Err("当前 Profile 未填写 API Key。请填写后重试。".into());
-    } else {
-        profile.api_key.clone()
-    };
-    let key_fp = key_fingerprint(&key);
+    assert_profile_runnable(&profile)?;
+    let launch = proxy_launch_for(&profile);
+    let key_fp = key_fingerprint(&launch.key);
     let port = cfg.proxy_port;
     let root = asset_root(app)
         .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
@@ -260,7 +321,7 @@ fn ensure_proxy(
         // 只比端口会在「换 provider / 换 key」后误用带旧配置的代理（修 P1-2）。
         if st.proxy.is_some()
             && st.proxy_port == port
-            && st.provider == provider
+            && st.provider == launch.adapter
             && st.key_fp == key_fp
             && proc::http_health(port, Some(&st.secret), 500)
         {
@@ -282,16 +343,26 @@ fn ensure_proxy(
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
         let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
-        let child = Command::new(&py)
-            .arg(&script)
+        let mut cmd = Command::new(&py);
+        cmd.arg(&script)
             .arg("--provider")
-            .arg(&provider)
+            .arg(&launch.adapter)
             .arg("--port")
             .arg(port.to_string())
             .arg("--auth-token")
             .arg(&secret)
             // key 经环境变量注入，绝不作为命令行参数（避免 ps 泄露）。
-            .env(key_env(&provider), &key)
+            .env(launch.key_env, &launch.key);
+        if !is_native_adapter(&launch.adapter) {
+            cmd.env("CSSWITCH_RELAY_BASE_URL", &launch.base_url);
+            if !launch.model.is_empty() {
+                cmd.env("CSSWITCH_RELAY_MODEL", &launch.model);
+            }
+            if !launch.thinking_policy.is_empty() {
+                cmd.env("CSSWITCH_RELAY_THINKING", launch.thinking_policy);
+            }
+        }
+        let child = cmd
             .stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
             .spawn()
@@ -299,7 +370,7 @@ fn ensure_proxy(
         st.proxy = Some(child);
         st.proxy_port = port;
         st.secret = secret.clone();
-        st.provider = provider;
+        st.provider = launch.adapter.clone();
         st.key_fp = key_fp;
     }
 
@@ -383,23 +454,69 @@ fn stop_sandbox_inner(_app: &tauri::AppHandle, st: &mut AppState) -> Result<(), 
 }
 
 // ---------- Tauri commands ----------
-#[tauri::command]
-fn get_config() -> Result<serde_json::Value, String> {
-    let dir = config::default_dir();
-    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+fn build_list_templates() -> Vec<serde_json::Value> {
+    templates::all()
+        .iter()
+        .map(|t| {
+            json!({
+                "id": t.id,
+                "name": t.name,
+                "category": t.category,
+                "api_format": t.api_format,
+                "adapter": t.adapter,
+                "base_url": t.base_url,
+                "base_url_editable": t.base_url_editable,
+                "requires_model_override": t.requires_model_override,
+                "builtin_models": t.builtin_models,
+                "website_url": t.website_url,
+                "icon": t.icon,
+                "icon_color": t.icon_color,
+                "thinking_policy": t.thinking_policy,
+            })
+        })
+        .collect()
+}
+
+fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
+    let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
+    let notice = cfg.pending_notice.clone();
+    if notice.is_some() {
+        config::update(dir, |c| c.pending_notice = None).map_err(|e| e.to_string())?;
+    }
     Ok(json!({
         "schema_version": cfg.schema_version,
         "active_id": cfg.active_id,
         "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port,
         "mode": cfg.mode,
+        "pending_notice": notice,
+        "templates": build_list_templates(),
         "profiles": cfg.profiles.iter().map(|p| json!({
             "id": p.id,
             "name": p.name,
             "template_id": p.template_id,
+            "category": p.category,
+            "api_format": p.api_format,
+            "base_url": p.base_url,
+            "model": p.model,
             "key": config::mask(&p.api_key),
+            "website_url": p.website_url,
+            "icon": p.icon,
+            "icon_color": p.icon_color,
+            "sort_index": p.sort_index,
+            "notes": p.notes,
         })).collect::<Vec<_>>(),
     }))
+}
+
+#[tauri::command]
+fn get_config() -> Result<serde_json::Value, String> {
+    build_get_config(&config::default_dir())
+}
+
+#[tauri::command]
+fn list_templates() -> Vec<serde_json::Value> {
+    build_list_templates()
 }
 
 /// 切换运行模式（"proxy" 第三方 / "official" 官方）。
@@ -505,6 +622,11 @@ fn set_config(cfg: UiSettings) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn set_settings(cfg: UiSettings) -> Result<(), String> {
+    set_config(cfg)
+}
+
+#[tauri::command]
 fn save_provider_key(provider: String, key: String) -> Result<String, String> {
     let dir = config::default_dir();
     let key2 = key.clone();
@@ -518,6 +640,304 @@ fn save_provider_key(provider: String, key: String) -> Result<String, String> {
     })
     .map_err(|e| e.to_string())?;
     Ok(config::mask(&key))
+}
+
+fn template_default_model(tpl: &templates::Template) -> String {
+    tpl.builtin_models.first().map(|s| (*s).to_string()).unwrap_or_default()
+}
+
+fn validate_base_url_for_profile(profile: &config::Profile) -> Result<(), String> {
+    let launch = proxy_launch_for(profile);
+    if !is_native_adapter(&launch.adapter)
+        && (launch.base_url.trim().is_empty()
+            || !(launch.base_url.starts_with("http://") || launch.base_url.starts_with("https://")))
+    {
+        return Err("base_url 必须以 http:// 或 https:// 开头。".into());
+    }
+    Ok(())
+}
+
+fn create_profile_inner(
+    dir: &Path,
+    template_id: &str,
+    name: &str,
+    key: Option<&str>,
+    base_url: Option<&str>,
+    model: Option<&str>,
+) -> Result<String, String> {
+    let tpl = templates::by_id(template_id).ok_or_else(|| format!("未知模板：{template_id}"))?;
+    let id = config::new_id();
+    let mut model_value = model.unwrap_or("").trim().to_string();
+    if tpl.requires_model_override && model_value.is_empty() {
+        model_value = template_default_model(tpl);
+    }
+    if tpl.requires_model_override && model_value.is_empty() {
+        return Err("该来源需要选择或填写模型。".into());
+    }
+    let base = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(tpl.base_url)
+        .to_string();
+    let now = config::now_ms();
+    let mut candidate = config::Profile {
+        id: id.clone(),
+        name: if name.trim().is_empty() { tpl.name.to_string() } else { name.trim().to_string() },
+        template_id: tpl.id.to_string(),
+        category: tpl.category.to_string(),
+        api_format: tpl.api_format.to_string(),
+        base_url: base,
+        api_key: key.unwrap_or("").trim().to_string(),
+        model: model_value,
+        website_url: Some(tpl.website_url.to_string()),
+        icon: Some(tpl.icon.to_string()),
+        icon_color: Some(tpl.icon_color.to_string()),
+        sort_index: None,
+        created_at: Some(now),
+        notes: None,
+    };
+    validate_base_url_for_profile(&candidate)?;
+    config::update(dir, |c| {
+        candidate.sort_index = Some(c.profiles.len() as i64);
+        c.profiles.push(candidate);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(id)
+}
+
+fn update_profile_metadata_inner(
+    dir: &Path,
+    id: &str,
+    name: &str,
+    notes: Option<&str>,
+) -> Result<(), String> {
+    if config::load_from(dir).map_err(|e| e.to_string())?.profile_by_id(id).is_none() {
+        return Err(format!("找不到 profile：{id}"));
+    }
+    config::update(dir, |c| {
+        if let Some(p) = c.profile_by_id_mut(id) {
+            p.name = if name.trim().is_empty() { "未命名".into() } else { name.trim().into() };
+            p.notes = notes.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        }
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn update_profile_connection_inner(
+    dir: &Path,
+    id: &str,
+    base_url: Option<&str>,
+    api_format: Option<&str>,
+    model: Option<&str>,
+    key: Option<&str>,
+) -> Result<(), String> {
+    let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
+    let mut candidate = cfg
+        .profile_by_id(id)
+        .cloned()
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    if let Some(v) = base_url {
+        candidate.base_url = v.trim().to_string();
+    }
+    if let Some(v) = api_format {
+        candidate.api_format = v.trim().to_string();
+    }
+    if let Some(v) = model {
+        candidate.model = v.trim().to_string();
+    }
+    if let Some(v) = key {
+        if !v.trim().is_empty() {
+            candidate.api_key = v.trim().to_string();
+        }
+    }
+    validate_base_url_for_profile(&candidate)?;
+    if templates::by_id(&candidate.template_id)
+        .map(|t| t.requires_model_override)
+        .unwrap_or(true)
+        && candidate.model.trim().is_empty()
+    {
+        return Err("该来源需要选择或填写模型。".into());
+    }
+    config::update(dir, |c| {
+        if let Some(p) = c.profile_by_id_mut(id) {
+            *p = candidate;
+        }
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+fn clear_profile_key_inner(dir: &Path, id: &str) -> Result<(), String> {
+    if config::load_from(dir).map_err(|e| e.to_string())?.profile_by_id(id).is_none() {
+        return Err(format!("找不到 profile：{id}"));
+    }
+    config::update(dir, |c| {
+        if let Some(p) = c.profile_by_id_mut(id) {
+            p.api_key.clear();
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    config::drop_rolling_backup(dir);
+    Ok(())
+}
+
+fn delete_profile_inner(dir: &Path, id: &str) -> Result<(), String> {
+    if config::load_from(dir).map_err(|e| e.to_string())?.profile_by_id(id).is_none() {
+        return Err(format!("找不到 profile：{id}"));
+    }
+    config::update(dir, |c| {
+        c.profiles.retain(|p| p.id != id);
+        if c.active_id == id {
+            c.active_id.clear();
+        }
+    })
+    .map_err(|e| e.to_string())?;
+    config::drop_rolling_backup(dir);
+    Ok(())
+}
+
+fn stop_proxy_state(state: &State<'_, Mutex<AppState>>) {
+    let mut st = lock(state);
+    kill_child(&mut st.proxy);
+    st.provider.clear();
+    st.secret.clear();
+    st.key_fp = 0;
+}
+
+#[tauri::command]
+fn create_profile(
+    template_id: String,
+    name: String,
+    key: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+) -> Result<String, String> {
+    create_profile_inner(
+        &config::default_dir(),
+        &template_id,
+        &name,
+        key.as_deref(),
+        base_url.as_deref(),
+        model.as_deref(),
+    )
+}
+
+#[tauri::command]
+fn update_profile_metadata(id: String, name: String, notes: Option<String>) -> Result<(), String> {
+    update_profile_metadata_inner(&config::default_dir(), &id, &name, notes.as_deref())
+}
+
+#[tauri::command]
+fn update_profile_connection(
+    state: State<'_, Mutex<AppState>>,
+    id: String,
+    base_url: Option<String>,
+    api_format: Option<String>,
+    model: Option<String>,
+    key: Option<String>,
+) -> Result<(), String> {
+    let dir = config::default_dir();
+    let was_active = config::load_from(&dir)
+        .map(|c| c.active_id == id)
+        .unwrap_or(false);
+    update_profile_connection_inner(
+        &dir,
+        &id,
+        base_url.as_deref(),
+        api_format.as_deref(),
+        model.as_deref(),
+        key.as_deref(),
+    )?;
+    if was_active {
+        stop_proxy_state(&state);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn clear_profile_key(state: State<'_, Mutex<AppState>>, id: String) -> Result<(), String> {
+    let dir = config::default_dir();
+    let was_active = config::load_from(&dir)
+        .map(|c| c.active_id == id)
+        .unwrap_or(false);
+    clear_profile_key_inner(&dir, &id)?;
+    if was_active {
+        stop_proxy_state(&state);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_profile(state: State<'_, Mutex<AppState>>, id: String) -> Result<(), String> {
+    let dir = config::default_dir();
+    let was_active = config::load_from(&dir)
+        .map(|c| c.active_id == id)
+        .unwrap_or(false);
+    delete_profile_inner(&dir, &id)?;
+    if was_active {
+        stop_proxy_state(&state);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn set_active_profile(
+    state: State<'_, Mutex<AppState>>,
+    id: String,
+    skip_verify: bool,
+) -> Result<serde_json::Value, String> {
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let profile = cfg
+        .profile_by_id(&id)
+        .cloned()
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    if !skip_verify {
+        if let Err(e) = assert_profile_runnable(&profile) {
+            return Ok(json!({
+                "committed": false,
+                "active_id": cfg.active_id,
+                "hint": e,
+            }));
+        }
+    }
+    config::update(&dir, |c| c.active_id = id.clone()).map_err(|e| e.to_string())?;
+    stop_proxy_state(&state);
+    Ok(json!({
+        "committed": true,
+        "active_id": id,
+        "hint": if skip_verify { "已跳过校验并设为当前。" } else { "已设为当前。" },
+    }))
+}
+
+#[derive(Deserialize)]
+struct FetchModelsReq {
+    template_id: String,
+    #[serde(default)]
+    base_url: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    profile_id: Option<String>,
+}
+
+#[tauri::command]
+fn fetch_models(req: FetchModelsReq) -> Result<serde_json::Value, String> {
+    let tpl = templates::by_id(req.template_id.trim())
+        .ok_or_else(|| format!("未知模板：{}", req.template_id))?;
+    let _ = (&req.base_url, &req.key, &req.profile_id);
+    let models = tpl
+        .builtin_models
+        .iter()
+        .map(|id| json!({ "id": id, "supports_tools": serde_json::Value::Null }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "models": models,
+        "source": "builtin",
+        "error_kind": serde_json::Value::Null,
+        "upstream_status": serde_json::Value::Null,
+    }))
 }
 
 #[tauri::command]
@@ -821,7 +1241,7 @@ fn sandbox_running_ours(port: u16) -> bool {
 #[tauri::command]
 fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     // 只在锁内取值，锁外做阻塞探活。
-    let (pport, secret, sport, provider) = {
+    let (pport, secret, sport, adapter, base_url) = {
         let st = lock(&state);
         let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
         let pport = if st.proxy_port != 0 {
@@ -834,7 +1254,11 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
-        (pport, st.secret.clone(), sport, cfg.active_profile().map(|p| templates::adapter_for(&p.template_id).to_string()).unwrap_or_default())
+        let (adapter, base_url) = cfg
+            .active_profile()
+            .map(|p| (templates::adapter_for(&p.template_id).to_string(), p.base_url.clone()))
+            .unwrap_or_default();
+        (pport, st.secret.clone(), sport, adapter, base_url)
     };
     let proxy = if !secret.is_empty() && proc::http_health(pport, Some(&secret), 300) {
         "green"
@@ -848,7 +1272,7 @@ fn status(state: State<'_, Mutex<AppState>>) -> serde_json::Value {
     } else {
         "amber"
     };
-    let upstream = if proc::tcp_reachable(upstream_host(&provider), 443, 500) {
+    let upstream = if proc::tcp_reachable(&upstream_host(&adapter, &base_url), 443, 500) {
         "green"
     } else {
         "amber"
@@ -866,9 +1290,10 @@ fn open_url(state: State<'_, Mutex<AppState>>) -> Result<(), String> {
 /// 运行诊断脚本 `scripts/doctor.sh`。仅 macOS 本地模式有效。
 /// Windows/其他平台上返回明确提示，引导使用远程模式诊断。
 #[tauri::command]
-fn run_doctor(_app: tauri::AppHandle) -> Result<String, String> {
+fn run_doctor(app: tauri::AppHandle) -> Result<String, String> {
     #[cfg(not(target_os = "macos"))]
     {
+        let _ = &app;
         return Err("本地模式「自检」仅支持 macOS。请切换到「远程服务器」模式使用远程诊断功能。".into());
     }
     #[cfg(target_os = "macos")]
@@ -876,14 +1301,21 @@ fn run_doctor(_app: tauri::AppHandle) -> Result<String, String> {
     let root = asset_root(&app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = config::load_from(&config::default_dir()).unwrap_or_default();
     let doctor = root.join("scripts/doctor.sh");
+    let active = cfg.active_profile().cloned();
+    let adapter = active
+        .as_ref()
+        .map(|p| templates::adapter_for(&p.template_id).to_string())
+        .unwrap_or_default();
     let mut cmd = Command::new("bash");
     cmd.arg(&doctor)
-        .env("CSSWITCH_PROVIDER", &cfg.provider)
+        .env("CSSWITCH_PROVIDER", &adapter)
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
         .env("CSSWITCH_SANDBOX_PORT", cfg.sandbox_port.to_string());
     // doctor 只做 -n 判空来报 key 有无。只让它知道「存在」，绝不把真实 key 传进其环境。
-    if cfg.key_for(&cfg.provider).is_some() {
-        cmd.env(key_env(&cfg.provider), "***present***");
+    if let Some(p) = active.as_ref() {
+        if !p.api_key.is_empty() {
+            cmd.env(key_env_for_adapter(&adapter), "***present***");
+        }
     }
     let out = cmd.output().map_err(|e| e.to_string())?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
@@ -965,10 +1397,19 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             // 本地命令（macOS 本地模式）
             get_config,
+            list_templates,
             set_config,
+            set_settings,
             set_mode,
             open_official,
             save_provider_key,
+            create_profile,
+            update_profile_metadata,
+            update_profile_connection,
+            clear_profile_key,
+            delete_profile,
+            set_active_profile,
+            fetch_models,
             start_proxy,
             verify_key,
             stop_all,

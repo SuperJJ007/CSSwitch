@@ -67,29 +67,58 @@ fn proxy_script_path() -> Result<PathBuf, String> {
 // 辅助函数
 // ============================================================================
 
-/// 从 `~/.csswitch/config.json` 读取指定 provider 的 key。
-fn load_key_from_config(provider: &str) -> Result<Option<String>, String> {
-    let cfg = config_path();
-    if !cfg.exists() {
+struct ProxyLaunch {
+    adapter: String,
+    key: String,
+    key_env: &'static str,
+    base_url: String,
+    model: String,
+    thinking_policy: &'static str,
+}
+
+fn key_env_for_adapter(adapter: &str) -> &'static str {
+    match adapter {
+        "deepseek" => "DEEPSEEK_API_KEY",
+        "qwen" => "DASHSCOPE_API_KEY",
+        _ => "CSSWITCH_RELAY_KEY",
+    }
+}
+
+/// 从 `~/.csswitch/config.json` 读取 active Profile，并派生代理启动参数。
+fn proxy_launch_from_config(provider: &str) -> Result<Option<ProxyLaunch>, String> {
+    let cfg = crate::config::load_from(&config_dir()).map_err(|e| format!("读配置失败：{e}"))?;
+    let Some(profile) = cfg.active_profile() else {
+        return Ok(None);
+    };
+    let adapter = crate::templates::adapter_for(&profile.template_id).to_string();
+    if provider != adapter && provider != profile.template_id {
+        return Err(format!(
+            "当前生效 Profile 是 {}，不能作为 {provider} 启动。",
+            profile.template_id
+        ));
+    }
+    if profile.api_key.trim().is_empty() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&cfg).map_err(|e| format!("读配置失败：{e}"))?;
-    let v: serde_json::Value =
-        serde_json::from_str(&raw).map_err(|e| format!("解析配置失败：{e}"))?;
-    // 新格式：profiles 数组中找 active profile 的 api_key
-    if let Some(profiles) = v.get("profiles").and_then(|p| p.as_array()) {
-        let active_id = v.get("active_id").and_then(|a| a.as_str()).unwrap_or("");
-        for p in profiles {
-            if p.get("id").and_then(|i| i.as_str()) == Some(active_id) {
-                if let Some(key) = p.get("key").or_else(|| p.get("api_key")).and_then(|k| k.as_str()) {
-                    if !key.is_empty() {
-                        return Ok(Some(key.to_string()));
-                    }
-                }
-            }
+    if adapter == "relay" {
+        if profile.base_url.trim().is_empty()
+            || !(profile.base_url.starts_with("http://") || profile.base_url.starts_with("https://"))
+        {
+            return Err("relay 配置需要 http(s):// 开头的 base_url。".to_string());
+        }
+        if profile.model.trim().is_empty() {
+            return Err("relay 配置需要选择或填写模型。".to_string());
         }
     }
-    Ok(None)
+
+    Ok(Some(ProxyLaunch {
+        key_env: key_env_for_adapter(&adapter),
+        adapter,
+        key: profile.api_key.trim().to_string(),
+        base_url: profile.base_url.clone(),
+        model: profile.model.clone(),
+        thinking_policy: crate::templates::thinking_policy_for(&profile.template_id),
+    }))
 }
 
 /// 通过 HTTP GET /health 探活本地代理。
@@ -135,7 +164,7 @@ pub fn cmd_status() -> CliEnvelope {
         "arch": std::env::consts::ARCH,
         "capabilities": capabilities,
         "proxy_running": proxy_running,
-        "sandbox_running": false,
+        "sandbox_running": sandbox_is_running(),
     }))
 }
 
@@ -220,13 +249,22 @@ pub fn cmd_config_save_key(provider: &str, key: &str) -> CliEnvelope {
 /// `proxy start <provider> <port> <secret>` — 启动代理进程。
 pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
     // 检查是否已在运行（通过 TCP 端口探活）
-    if is_port_open(port) && proxy_health(port, secret) {
-        return CliEnvelope::err("proxy_already_running", &format!("代理已在端口 {} 上运行", port));
+    if is_port_open(port) {
+        if proxy_health(port, secret) {
+            return CliEnvelope::err("proxy_already_running", &format!("代理已在端口 {} 上运行", port));
+        }
+        if !clear_unhealthy_proxy_port(port) {
+            return CliEnvelope::err_with_hint(
+                "port_in_use",
+                &format!("端口 {port} 上已有进程，但不是当前可用的 CSSwitch 代理。"),
+                "请先停止占用该端口的进程，或在高级设置中换一个代理端口。",
+            );
+        }
     }
 
-    // 获取需要注入的 key
-    let key = match load_key_from_config(provider) {
-        Ok(Some(k)) => k,
+    // 获取需要注入的 active Profile 连接信息
+    let launch = match proxy_launch_from_config(provider) {
+        Ok(Some(v)) => v,
         Ok(None) => return CliEnvelope::err_with_hint(
             "key_not_found",
             &format!("配置中未找到 {provider} 的 API key"),
@@ -256,24 +294,27 @@ pub fn cmd_proxy_start(provider: &str, port: u16, secret: &str) -> CliEnvelope {
         Err(e) => return CliEnvelope::err("proxy_script_not_found", &e),
     };
 
-    let key_env = match provider {
-        "qwen" => "DASHSCOPE_API_KEY",
-        _ => "DEEPSEEK_API_KEY",
-    };
-
     // 启代理子进程
-    match Command::new(&python)
-        .arg(&script)
+    let mut cmd = Command::new(&python);
+    cmd.arg(&script)
         .arg("--provider")
-        .arg(provider)
+        .arg(&launch.adapter)
         .arg("--port")
         .arg(port.to_string())
         .arg("--auth-token")
         .arg(secret)
-        .env(key_env, &key)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+        .env(launch.key_env, &launch.key);
+    if launch.adapter == "relay" {
+        cmd.env("CSSWITCH_RELAY_BASE_URL", &launch.base_url);
+        if !launch.model.is_empty() {
+            cmd.env("CSSWITCH_RELAY_MODEL", &launch.model);
+        }
+        if !launch.thinking_policy.is_empty() {
+            cmd.env("CSSWITCH_RELAY_THINKING", launch.thinking_policy);
+        }
+    }
+
+    match cmd.stdout(Stdio::null()).stderr(Stdio::null()).spawn()
     {
         Ok(child) => {
             let pid = child.id();
@@ -327,8 +368,6 @@ pub fn cmd_proxy_status() -> CliEnvelope {
 /// `proxy stop` — 停止代理进程。
 /// 无状态实现：通过 `fuser` / `lsof` 找到占用端口的进程并 kill。
 pub fn cmd_proxy_stop() -> CliEnvelope {
-    use std::process::Command;
-
     let port = get_configured_port();
 
     // 先检查端口是否有进程
@@ -336,26 +375,7 @@ pub fn cmd_proxy_stop() -> CliEnvelope {
         return CliEnvelope::ok(json!({ "message": "端口上没有运行中的代理。", "port": port }));
     }
 
-    // 审核 P3 修复：先 SIGTERM 优雅退出（给 Python 清理的机会），1s 后 SIGKILL 强杀。
-    let _term = Command::new("fuser")
-        .args(["-TERM", &format!("{port}/tcp")])
-        .output();
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let _kill = Command::new("fuser")
-        .args(["-k", &format!("{port}/tcp")])
-        .output();
-
-    // 等待端口释放
-    std::thread::sleep(std::time::Duration::from_millis(500));
-    if is_port_open(port) {
-        // fuser 也失败了，尝试 lsof + kill
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(format!("lsof -ti:{port} | xargs -r kill 2>/dev/null; true"))
-            .output();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    let stopped = !is_port_open(port);
+    let stopped = clear_unhealthy_proxy_port(port);
     if stopped {
         super::proc_manager::record_proxy_stop();
         super::logger::info(&format!("proxy stopped on port {port}"));
@@ -370,6 +390,30 @@ pub fn cmd_proxy_stop() -> CliEnvelope {
 // ============================================================================
 // 内部工具函数
 // ============================================================================
+
+fn clear_unhealthy_proxy_port(port: u16) -> bool {
+    let _term = Command::new("fuser")
+        .args(["-TERM", &format!("{port}/tcp")])
+        .output();
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    if is_port_open(port) {
+        let _kill = Command::new("fuser")
+            .args(["-k", &format!("{port}/tcp")])
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    if is_port_open(port) {
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(format!("lsof -ti:{port} | xargs -r kill 2>/dev/null; true"))
+            .output();
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    !is_port_open(port)
+}
 
 /// 获取持久化 proxy secret 的文件路径。
 fn secret_file() -> PathBuf { config_dir().join("proxy.secret") }
@@ -395,18 +439,28 @@ fn save_proxy_secret(secret: &str) -> Result<(), String> {
 }
 
 /// 从配置文件读取代理端口，无配置时返回默认值 18991。
-fn get_configured_port() -> u16 {
+fn get_configured_u16(key: &str, default: u16) -> u16 {
     let cfg = config_path();
     if cfg.exists() {
         if let Ok(raw) = std::fs::read_to_string(&cfg) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(port) = v["proxy_port"].as_u64() {
-                    return port as u16;
+                if let Some(value) = v[key].as_u64() {
+                    return value as u16;
                 }
             }
         }
     }
-    18991
+    default
+}
+
+/// 从配置文件读取代理端口，无配置时返回默认值 18991。
+fn get_configured_port() -> u16 {
+    get_configured_u16("proxy_port", 18991)
+}
+
+/// 从配置文件读取沙箱端口，无配置时返回默认值 8990。
+fn get_configured_sandbox_port() -> u16 {
+    get_configured_u16("sandbox_port", 8990)
 }
 
 /// 检查 TCP 端口是否有进程在监听。
@@ -419,41 +473,31 @@ fn is_port_open(port: u16) -> bool {
     .is_ok()
 }
 
+fn sandbox_process_found() -> bool {
+    let data_dir = config_dir()
+        .join("sandbox")
+        .join("home")
+        .join(".claude-science");
+    let pattern = data_dir.to_string_lossy().to_string();
+    Command::new("pgrep")
+        .args(["-f", &pattern])
+        .output()
+        .map(|o| !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+fn sandbox_is_running() -> bool {
+    let port = get_configured_sandbox_port();
+    is_port_open(port) || sandbox_process_found()
+}
+
 /// `sandbox status` — 检查 Claude Science 沙箱是否在运行。
 /// 通过轮询 `claude-science status` 和端口探活双重确认。
 pub fn cmd_sandbox_status() -> CliEnvelope {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    // 尝试通过进程名检测 Science
-    let claude_bin = find_cmd("claude-science");
-    let process_found = if claude_bin.is_some() {
-        // 用 `ps` 或 `pgrep` 检测（Linux 通用方式）
-        let result = std::process::Command::new("pgrep")
-            .args(["-f", "claude-science serve"])
-            .output();
-        result.map(|o| !o.stdout.is_empty()).unwrap_or(false)
-    } else {
-        false
-    };
-
-    // 尝试常见沙箱端口（用户可在配置中指定）
-    let sandbox_ports = [8990u16, 8765u16, 8080u16];
-    let mut responsive_port: Option<u16> = None;
-    for port in &sandbox_ports {
-        if TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            std::time::Duration::from_millis(500),
-        )
-        .is_ok()
-        {
-            responsive_port = Some(*port);
-            break;
-        }
-    }
-
-    let running = process_found || responsive_port.is_some();
-    let port = responsive_port.unwrap_or(8990);
+    let port = get_configured_sandbox_port();
+    let port_open = is_port_open(port);
+    let process_found = sandbox_process_found();
+    let running = port_open || process_found;
 
     if running {
         CliEnvelope::ok(json!({
@@ -553,6 +597,13 @@ pub fn cmd_sandbox_start(port: u16, proxy_url: &str) -> CliEnvelope {
 
 /// `sandbox stop` — 停止 Claude Science 沙箱。
 pub fn cmd_sandbox_stop() -> CliEnvelope {
+    if !sandbox_is_running() {
+        return CliEnvelope::ok(json!({
+            "message": "沙箱未运行。",
+            "stopped": false,
+        }));
+    }
+
     let bin = match find_cmd("claude-science") {
         Some(b) => b,
         None => {
