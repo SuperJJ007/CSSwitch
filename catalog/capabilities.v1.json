@@ -1,0 +1,421 @@
+{
+  "schema_version": 1,
+  "providers": [
+    {
+      "id": "provider.deepseek.anthropic-native",
+      "scope": "provider",
+      "match": {
+        "provider": "deepseek",
+        "api_format": "anthropic"
+      },
+      "status": "supported",
+      "action": "normalize",
+      "reason": "DeepSeek uses the native Anthropic path; CSSwitch maps Science shell model ids, clamps known token caps, and normalizes thinking/tool_choice quirks.",
+      "evidence": [
+        "proxy/csswitch_proxy.py:51",
+        "proxy/provider_policy.py:69",
+        "docs/verified-facts.md:34"
+      ],
+      "tests": [
+        "test.test_provider_policy.ResolveModelDeepseek",
+        "test.test_provider_policy.ThinkingNormalization.test_deepseek_forced_tool_choice_disables_thinking"
+      ]
+    },
+    {
+      "id": "provider.relay.force-model-shell",
+      "scope": "model",
+      "match": {
+        "provider": "relay",
+        "condition": "relay_force_model present"
+      },
+      "status": "supported",
+      "action": "normalize",
+      "reason": "Formal relay/custom proxies return one Science-visible claude-opus shell model with the real model name in display_name; outbound requests are force-overridden to the selected real model.",
+      "evidence": [
+        "proxy/csswitch_proxy.py:344",
+        "proxy/model_discovery.py:32",
+        "docs/known-issues.md:132"
+      ],
+      "tests": [
+        "test.test_proxy_units.BuildModelsResponse.test_force_returns_single_shell",
+        "test.test_proxy_auth.ProxyOpenAIForcedModels.test_formal_proxy_returns_claude_shell_for_science_selector"
+      ]
+    },
+    {
+      "id": "provider.kimi.relay-thinking-enabled",
+      "scope": "provider",
+      "match": {
+        "provider": "relay",
+        "model_contains": "kimi",
+        "thinking_policy": "enabled"
+      },
+      "status": "limited",
+      "action": "degrade",
+      "reason": "Kimi relay models require enabled thinking, but forced Anthropic tool_choice is removed so the model can choose tools itself.",
+      "evidence": [
+        "desktop/src-tauri/src/templates.rs:120",
+        "proxy/provider_policy.py:103"
+      ],
+      "tests": [
+        "test.test_provider_policy.ThinkingNormalization.test_relay_enabled_policy_drops_forced_tool_choice"
+      ]
+    },
+    {
+      "id": "provider.dashscope.responses-tools-cap",
+      "scope": "provider",
+      "match": {
+        "api_format": "openai_responses",
+        "base_url_contains": "dashscope.aliyuncs.com",
+        "has_tools": true
+      },
+      "status": "limited",
+      "action": "degrade",
+      "reason": "DashScope Responses tool requests use a conservative max_output_tokens cap to avoid provider-side rejection.",
+      "evidence": [
+        "proxy/responses_compat.py:29"
+      ],
+      "tests": [
+        "test.test_proxy_units.ResponsesMapping.test_dashscope_responses_tool_requests_use_conservative_cap"
+      ]
+    }
+  ],
+  "tool_rules": [
+    {
+      "id": "tool.kimi.web_search.server-tool-filter",
+      "scope": "tool",
+      "match": {
+        "provider": "relay",
+        "model_contains": "kimi",
+        "tool_name": "web_search"
+      },
+      "status": "limited",
+      "action": "drop",
+      "reason": "Kimi treats web_search as a provider server tool and may stream server_tool_use/web_search_tool_result blocks; CSSwitch keeps local known_tools but does not advertise web_search upstream and filters server-tool blocks.",
+      "evidence": [
+        "proxy/anthropic_compat.py:84",
+        "proxy/anthropic_compat.py:178"
+      ],
+      "tests": [
+        "test.test_anthropic_compat.TransformRequest.test_kimi_relay_does_not_advertise_web_search_server_tool",
+        "test.test_anthropic_compat.MakeStreamRewriter.test_kimi_filter_drops_server_tool_blocks_and_compacts_indexes"
+      ]
+    },
+    {
+      "id": "tool.relay.input-schema-normalize",
+      "scope": "tool",
+      "match": {
+        "provider": "relay",
+        "schema_field": "input_schema"
+      },
+      "status": "supported",
+      "action": "normalize",
+      "reason": "Anthropic-compatible relay providers can reject empty or loose input_schema values, so CSSwitch normalizes relay tools to object schemas without mutating the caller request.",
+      "evidence": [
+        "proxy/anthropic_compat.py:26",
+        "proxy/anthropic_compat.py:56"
+      ],
+      "tests": [
+        "test.test_anthropic_compat.TransformRequest.test_relay_normalizes_loose_tool_schemas",
+        "test.test_proxy_auth.ProxyRelayTools.test_relay_outbound_tools_are_normalized_before_provider"
+      ]
+    },
+    {
+      "id": "tool.deepseek.forced-tool-choice-disable-thinking",
+      "scope": "tool",
+      "match": {
+        "provider": "deepseek",
+        "tool_choice_type": [
+          "any",
+          "tool"
+        ]
+      },
+      "status": "supported",
+      "action": "normalize",
+      "reason": "DeepSeek rejects forced tool use combined with thinking, so CSSwitch disables thinking for forced Anthropic tool_choice on DeepSeek.",
+      "evidence": [
+        "proxy/provider_policy.py:103",
+        "docs/verified-facts.md:38"
+      ],
+      "tests": [
+        "test.test_provider_policy.ThinkingNormalization.test_deepseek_forced_tool_choice_disables_thinking"
+      ]
+    },
+    {
+      "id": "tool.dashscope.responses.web_search-drop",
+      "scope": "tool",
+      "match": {
+        "api_format": "openai_responses",
+        "base_url_contains": "dashscope.aliyuncs.com",
+        "tool_name": "web_search"
+      },
+      "status": "limited",
+      "action": "drop",
+      "reason": "DashScope Responses-compatible endpoints reject web_search in this path, so CSSwitch drops that tool while preserving other function tools.",
+      "evidence": [
+        "proxy/responses_compat.py:58"
+      ],
+      "tests": [
+        "test.test_proxy_units.ResponsesMapping.test_dashscope_responses_drops_incompatible_web_search_tool"
+      ]
+    },
+    {
+      "id": "tool.dsml.deepseek-tooluse-rewrite",
+      "scope": "tool",
+      "match": {
+        "provider": "deepseek",
+        "shim_mode": "rewrite",
+        "leak_format": "DSML"
+      },
+      "status": "limited",
+      "action": "normalize",
+      "reason": "When explicitly enabled, the DSML shim can turn known leaked DSML tool calls back into Anthropic tool_use blocks; default runtime behavior remains off.",
+      "evidence": [
+        "proxy/dsml_shim.py",
+        "docs/known-issues.md:164"
+      ],
+      "tests": [
+        "test.test_dsml_shim",
+        "test.test_proxy_dsml_e2e"
+      ]
+    }
+  ],
+  "mcp_servers": [
+    {
+      "id": "mcp.hosted-anthropic.hcls-boundary",
+      "scope": "mcp",
+      "match": {
+        "transport": "hosted",
+        "servers": [
+          "pubmed",
+          "clinical-trials",
+          "chembl",
+          "biorxiv"
+        ],
+        "auth": "anthropic-hosted"
+      },
+      "status": "unsupported",
+      "action": "diagnose",
+      "reason": "Anthropic-hosted MCP servers require real claude.ai authorization and user:mcp_servers scope; CSSwitch virtual OAuth cannot make official hosted services available.",
+      "evidence": [
+        "docs/verified-facts.md:13",
+        "docs/known-issues.md:167"
+      ],
+      "tests": []
+    },
+    {
+      "id": "mcp.streamable-http.external-bio",
+      "scope": "mcp",
+      "match": {
+        "transport": "streamable_http",
+        "servers": [
+          "pubmed",
+          "clinical-trials",
+          "chembl",
+          "biorxiv"
+        ]
+      },
+      "status": "limited",
+      "action": "diagnose",
+      "reason": "External Streamable HTTP MCP servers depend on outbound network routing; current CONNECT tunneling is direct unless a future upstream proxy path is added.",
+      "evidence": [
+        "https://github.com/SuperJJ007/CSSwitch/issues/11",
+        "proxy/csswitch_proxy.py:532",
+        "scripts/launch-virtual-sandbox.sh:112"
+      ],
+      "tests": [
+        "test.test_proxy_connect.ProxyConnect.test_connect_passthrough_tunnels_bytes"
+      ]
+    },
+    {
+      "id": "mcp.local-stdio.bio-connectors",
+      "scope": "mcp",
+      "match": {
+        "transport": "stdio",
+        "domain": "bio"
+      },
+      "status": "unknown",
+      "action": "document",
+      "reason": "Local stdio bio connectors are the preferred fallback for hosted MCP boundaries, but installation, discovery, and restart persistence need explicit verification before support can be claimed.",
+      "evidence": [
+        "https://github.com/SuperJJ007/CSSwitch/pull/10"
+      ],
+      "tests": []
+    },
+    {
+      "id": "mcp.directory-connectors.virtual-login",
+      "scope": "mcp",
+      "match": {
+        "capability": "Directory connectors",
+        "auth": "virtual_oauth"
+      },
+      "status": "unsupported",
+      "action": "diagnose",
+      "reason": "Directory connectors are hosted claude.ai capabilities and can report unavailable or session expired under virtual login.",
+      "evidence": [
+        "docs/known-issues.md:170"
+      ],
+      "tests": []
+    }
+  ],
+  "skills": [
+    {
+      "id": "skill.local-or-github.discoverability",
+      "scope": "skill",
+      "match": {
+        "source": [
+          "local",
+          "github"
+        ]
+      },
+      "status": "unknown",
+      "action": "diagnose",
+      "reason": "Local and GitHub skills need post-install discoverability checks; storing or installing a skill is not enough to prove Science can use it.",
+      "evidence": [
+        "docs/known-issues.md:167"
+      ],
+      "tests": []
+    },
+    {
+      "id": "skill.remote-official.virtual-login-boundary",
+      "scope": "skill",
+      "match": {
+        "source": "remote_official",
+        "auth": "virtual_oauth"
+      },
+      "status": "unsupported",
+      "action": "diagnose",
+      "reason": "Official remote skills may depend on claude.ai hosted services and real account state; CSSwitch can document local alternatives but cannot promise hosted remote skill availability.",
+      "evidence": [
+        "docs/known-issues.md:167",
+        "docs/verified-facts.md:13"
+      ],
+      "tests": []
+    }
+  ],
+  "science_versions": [
+    {
+      "id": "science.version.0_1_0_dev_20260630",
+      "scope": "science_version",
+      "match": {
+        "version": "0.1.0-dev.20260630.t212931.sha2bc1ac8"
+      },
+      "status": "supported",
+      "action": "document",
+      "reason": "The installed /Applications Claude Science baseline has verified Info.plist and --version evidence; do not infer newer native routes from this seed.",
+      "evidence": [
+        "docs/verified-facts.md:19",
+        "docs/known-issues.md:34"
+      ],
+      "tests": []
+    },
+    {
+      "id": "science.version.0_1_15_dev.route-diff",
+      "scope": "science_version",
+      "match": {
+        "version": "0.1.15-dev.20260701.t220242.shaaa553de"
+      },
+      "status": "limited",
+      "action": "document",
+      "reason": "Local binary evidence records new auth nonce, auth, conda/pypi remote, token-series, preferences, and skills resync routes; these require isolated retest before runtime claims.",
+      "evidence": [
+        "docs/verified-facts.md:21",
+        "docs/verified-facts.md:22",
+        "docs/known-issues.md:30"
+      ],
+      "tests": []
+    },
+    {
+      "id": "science.auth.virtual-oauth-scope-boundary",
+      "scope": "science_version",
+      "match": {
+        "auth": "virtual_oauth",
+        "scopes_contains": [
+          "user:mcp_servers",
+          "user:plugins"
+        ]
+      },
+      "status": "limited",
+      "action": "document",
+      "reason": "Virtual OAuth can satisfy local Science inference/auth status paths, but listing scopes in local token material does not grant hosted claude.ai capabilities.",
+      "evidence": [
+        "docs/verified-facts.md:13",
+        "desktop/src-tauri/src/oauth_forge.rs:338"
+      ],
+      "tests": []
+    }
+  ],
+  "transport_rules": [
+    {
+      "id": "transport.connect.anthropic-fastfail-401",
+      "scope": "transport",
+      "match": {
+        "method": "CONNECT",
+        "host_suffixes": [
+          "anthropic.com",
+          "claude.ai",
+          "claude.com"
+        ]
+      },
+      "status": "supported",
+      "action": "diagnose",
+      "reason": "Anthropic/Claude hosts are fast-failed with 401 so Science treats virtual login as logged out instead of retrying organization switching.",
+      "evidence": [
+        "proxy/csswitch_proxy.py:206",
+        "proxy/csswitch_proxy.py:532"
+      ],
+      "tests": [
+        "test.test_proxy_connect.ProxyConnect.test_connect_anthropic_domains_fastfail_401",
+        "test.test_proxy_connect.ProxyConnect.test_connect_subdomain_of_blocked_is_blocked"
+      ]
+    },
+    {
+      "id": "transport.connect.non-anthropic-direct-tunnel",
+      "scope": "transport",
+      "match": {
+        "method": "CONNECT",
+        "host": "non_anthropic"
+      },
+      "status": "limited",
+      "action": "document",
+      "reason": "Non-Anthropic CONNECT currently opens a direct TCP tunnel; external MCP access can fail on networks where direct egress is blocked.",
+      "evidence": [
+        "proxy/csswitch_proxy.py:554",
+        "https://github.com/SuperJJ007/CSSwitch/issues/11"
+      ],
+      "tests": [
+        "test.test_proxy_connect.ProxyConnect.test_connect_passthrough_tunnels_bytes"
+      ]
+    },
+    {
+      "id": "transport.http-proxy.not-set-by-default",
+      "scope": "transport",
+      "match": {
+        "env": "http_proxy",
+        "launcher": "launch-virtual-sandbox"
+      },
+      "status": "limited",
+      "action": "document",
+      "reason": "The virtual sandbox intentionally does not set http_proxy because the CSSwitch proxy does not implement ordinary absolute-form HTTP forwarding.",
+      "evidence": [
+        "scripts/launch-virtual-sandbox.sh:115"
+      ],
+      "tests": []
+    },
+    {
+      "id": "transport.upstream-proxy.planned-for-http-mcp",
+      "scope": "transport",
+      "match": {
+        "capability": "upstream_proxy",
+        "use_case": "external_streamable_http_mcp"
+      },
+      "status": "unknown",
+      "action": "document",
+      "reason": "An upstream proxy path is the recommended future fix for external MCP egress, but it is not implemented in the current main branch.",
+      "evidence": [
+        "https://github.com/SuperJJ007/CSSwitch/pull/14",
+        "proxy/http_transport.py"
+      ],
+      "tests": []
+    }
+  ]
+}
