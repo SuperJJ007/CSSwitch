@@ -10,8 +10,15 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DOCTOR="$ROOT/scripts/doctor.sh"
 VERIFY="$ROOT/scripts/verify-proxy.sh"
 SELFTEST="$ROOT/scripts/self-test.sh"
+CLEAN="$ROOT/scripts/clean-bundle-resources.sh"
 PROXY="$ROOT/proxy/csswitch_proxy.py"
 T="$(mktemp -d)"
+cleanup_bundle_test_artifacts() {
+  rm -f "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc" "$ROOT/scripts/csswitch-clean-test.pyc"
+  rm -f "$ROOT/proxy/csswitch-clean-test.pyo" "$ROOT/scripts/csswitch-clean-test.pyo"
+  rmdir "$ROOT/proxy/__pycache__" 2>/dev/null || true
+}
+trap cleanup_bundle_test_artifacts EXIT
 
 # ---------- doctor ----------
 # 正常：依赖齐全（本机有 python3/node），config 指向不存在的临时路径 → 退出 0
@@ -75,6 +82,23 @@ fi   # end verify-proxy loopback-gate
 # 只做静态检查（不实跑，避免和 run_all 递归）：可执行 + 委派给 run_all.sh
 if [ -x "$SELFTEST" ]; then ok "self-test.sh is executable"; else no "self-test.sh not executable"; fi
 if grep -q "run_all.sh" "$SELFTEST"; then ok "self-test delegates to run_all.sh"; else no "self-test does not delegate to run_all.sh"; fi
+
+# ---------- bundle resource cleanup ----------
+mkdir -p "$ROOT/proxy/__pycache__"
+: > "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc"
+: > "$ROOT/scripts/csswitch-clean-test.pyc"
+: > "$ROOT/proxy/csswitch-clean-test.pyo"
+: > "$ROOT/scripts/csswitch-clean-test.pyo"
+out="$("$CLEAN" 2>&1)"; rc=$?
+if [ $rc -eq 0 ]; then ok "clean-bundle-resources exits 0"; else no "clean-bundle-resources failed (rc=$rc): $out"; fi
+if [ ! -e "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc" ] \
+  && [ ! -e "$ROOT/scripts/csswitch-clean-test.pyc" ] \
+  && [ ! -e "$ROOT/proxy/csswitch-clean-test.pyo" ] \
+  && [ ! -e "$ROOT/scripts/csswitch-clean-test.pyo" ]; then
+  ok "clean-bundle-resources removes pycache artifacts from bundled dirs"
+else
+  no "clean-bundle-resources left pycache artifacts behind"
+fi
 
 echo "----"
 if [ $FAILS -eq 0 ]; then echo "ALL PASS"; exit 0; else echo "$FAILS FAILED"; exit 1; fi

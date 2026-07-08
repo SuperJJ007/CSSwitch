@@ -4,7 +4,11 @@ set -euo pipefail
 PROJ="${0:A:h:h}"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
 DATA_DIR="$SANDBOX_HOME/.claude-science"
+REAL_DIR="$HOME/.claude-science"
 BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
+
+_dd="${DATA_DIR:A}"; _rd="${REAL_DIR:A}"
+if [[ "$_dd" == "$_rd" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 
 if [[ ! -d "$DATA_DIR" ]]; then echo "沙箱不存在，无需停止。"; exit 0; fi
 

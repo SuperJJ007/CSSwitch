@@ -18,7 +18,7 @@ from _capability import loopback_available
 
 HERE = os.path.dirname(__file__)
 PROXY = os.path.join(HERE, "..", "proxy", "csswitch_proxy.py")
-PORT = 18976  # S0 全局唯一端口：ProxyConnect
+PORT = 18981  # S0 全局唯一端口：ProxyConnect
 BASE = ("127.0.0.1", PORT)
 
 

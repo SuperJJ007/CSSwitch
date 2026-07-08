@@ -38,7 +38,7 @@ npm run tauri dev
 CSSwitch 以正常窗口打开面板（420×700，已去托盘/菜单栏）。
 
 后端定位 `proxy/` 与 `scripts/` 的顺序（`asset_root()`）：**① 打包后**优先用 Tauri 资源目录
-（`Contents/Resources/`，见下「构建」——`proxy/`、`scripts/` 已被 bundle 进去）；**② 开发态**回退到
+（`Contents/Resources/`，见下「构建」——运行所需的 proxy 与 scripts allowlist 已被 bundle 进去）；**② 开发态**回退到
 从可执行文件位置逐级上溯找仓库根（含 `proxy/csswitch_proxy.py`）。刻意**不看当前工作目录**，
 避免据启动目录找到来路不明的脚本；开发时也可用 `CSSWITCH_REPO=/path/to/CSSwitch` 显式指定。
 
@@ -49,8 +49,9 @@ cd desktop
 npm run tauri build
 ```
 
-产物是 `.app` / `.dmg`。`proxy/` 与 `scripts/` 已通过 `tauri.conf.json` 的 `bundle.resources`
-打进 `Contents/Resources/`，从 Finder 启动的正式 `.app` 也能找到并调用它们（自包含）。
+产物是 `.app` / `.dmg`。运行所需的 proxy 文件与脚本 allowlist 已通过 `tauri.conf.json` 的 `bundle.resources`
+打进 `Contents/Resources/`，从 Finder 启动的正式 `.app` 也能找到并调用它们（自包含）。其中
+`proxy/qwen_proxy.py` 是 legacy/compat 资源，当前主链路由 `proxy/csswitch_proxy.py` 承载。
 沙箱运行状态落在可写的 `~/.csswitch/sandbox/home`（不写进只读的 `.app` 包内）。
 
 > **签名/分发说明**：本版做 **ad-hoc 签名**（`bundle.macOS.signingIdentity: "-"`，正确封装资源），

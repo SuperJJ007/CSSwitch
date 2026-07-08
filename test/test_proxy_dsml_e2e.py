@@ -170,7 +170,7 @@ class DsmlRewriteWired(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.up_url, cls.up_sock = start_dsml_upstream()
-        cls.port = 18974  # S0 全局唯一端口：DsmlRewriteWired
+        cls.port = 18979  # S0 全局唯一端口：DsmlRewriteWired
         cls.proc = launch_proxy(cls.port, "rewrite", cls.up_url)
 
     @classmethod
@@ -208,7 +208,7 @@ class DsmlOffIsVerbatim(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.up_url, cls.up_sock = start_dsml_upstream()
-        cls.port = 18975  # S0 全局唯一端口：DsmlOffIsVerbatim
+        cls.port = 18980  # S0 全局唯一端口：DsmlOffIsVerbatim
         cls.proc = launch_proxy(cls.port, None, cls.up_url)   # 不设 env → 默认 off
 
     @classmethod

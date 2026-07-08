@@ -8,10 +8,21 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use crate::runtime::operation::{self, OperationStage, OperationTrace};
+
 /// 探测类型：Models 验端点+鉴权（透传预设保存/获取模型）；Message 验具体模型（选了模型时）。
 pub enum ProbeKind {
     Models,
     Message,
+}
+
+impl ProbeKind {
+    fn as_str(&self) -> &'static str {
+        match self {
+            ProbeKind::Models => "models",
+            ProbeKind::Message => "message",
+        }
+    }
 }
 
 /// 一次探测的原始结果。
@@ -134,6 +145,7 @@ pub fn scratch_probe(
     script: &Path,
     target: &ScratchTarget,
     kind: ProbeKind,
+    trace: Option<&OperationTrace>,
 ) -> ProbeResult {
     let port = match pick_scratch_port() {
         Some(p) => p,
@@ -154,6 +166,12 @@ pub fn scratch_probe(
         }
     };
     let mut cmd = Command::new(py);
+    if let Some(t) = trace {
+        t.stage(
+            OperationStage::ScratchSpawn,
+            format!("provider={} kind={}", target.provider, kind.as_str()),
+        );
+    }
     cmd.arg(script)
         .arg("--provider")
         .arg(target.provider) // native=deepseek/qwen；中转站=relay（Python 只认这三种）
@@ -186,12 +204,18 @@ pub fn scratch_probe(
     let _guard = ScratchGuard(Some(child)); // 作用域结束必杀
                                             // 探活最多 ~4s。
     let mut alive = false;
-    for _ in 0..40 {
-        std::thread::sleep(Duration::from_millis(100));
-        if crate::proc::http_health(port, Some(&secret), 400) {
+    for _ in 0..(operation::SCRATCH_READY_BUDGET_MS / operation::POLL_INTERVAL_MS) {
+        std::thread::sleep(Duration::from_millis(operation::POLL_INTERVAL_MS));
+        if crate::proc::http_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS) {
             alive = true;
             break;
         }
+    }
+    if let Some(t) = trace {
+        t.stage(
+            OperationStage::ScratchHealth,
+            if alive { "ready" } else { "not_ready" },
+        );
     }
     if !alive {
         return ProbeResult {
@@ -201,7 +225,15 @@ pub fn scratch_probe(
     }
     match kind {
         ProbeKind::Models => {
-            match crate::proc::http_get_body(port, Some(&secret), "/v1/models", 20000) {
+            if let Some(t) = trace {
+                t.stage(OperationStage::ScratchUpstreamProbe, "GET /v1/models");
+            }
+            match crate::proc::http_get_body(
+                port,
+                Some(&secret),
+                "/v1/models",
+                operation::UPSTREAM_PROBE_TIMEOUT_MS,
+            ) {
                 Some((code, body)) => ProbeResult {
                     status: Some(code),
                     body,
@@ -215,8 +247,16 @@ pub fn scratch_probe(
         ProbeKind::Message => {
             // model 由 CSSWITCH_RELAY_MODEL 强制，请求体模型名占位即可（会被 override）。
             let payload = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
-            match crate::proc::http_post_status(port, Some(&secret), "/v1/messages", payload, 20000)
-            {
+            if let Some(t) = trace {
+                t.stage(OperationStage::ScratchUpstreamProbe, "POST /v1/messages");
+            }
+            match crate::proc::http_post_status(
+                port,
+                Some(&secret),
+                "/v1/messages",
+                payload,
+                operation::UPSTREAM_PROBE_TIMEOUT_MS,
+            ) {
                 Some(code) => ProbeResult {
                     status: Some(code),
                     body: String::new(),

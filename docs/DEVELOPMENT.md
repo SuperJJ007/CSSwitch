@@ -53,7 +53,7 @@ desktop/src-tauri/src/
   oauth_forge.rs   Rust 原生虚拟 OAuth 伪造（护栏拒真实目录）
   proc.rs          纯 std：TCP /health 探活（带 path-secret）、which、/dev/urandom secret、上游可达性
   main.rs          入口
-  tauri.conf.json  正常窗口 420×700；bundle.resources 打包 proxy/ 与 scripts/
+  tauri.conf.json  正常窗口 420×700；bundle.resources 打包运行所需 proxy/scripts allowlist；qwen_proxy.py 为 legacy/compat 资源
 ```
 
 ## 前后端 command 契约

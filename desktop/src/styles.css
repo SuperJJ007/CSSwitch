@@ -105,8 +105,13 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
   color:var(--ink);font-size:11px;font-weight:600;cursor:pointer;padding:0 9px;font-family:inherit}
 .abtn:hover{border-color:var(--accent)}
 .abtn:active{transform:translateY(1px)}
+.abtn:disabled{opacity:.5;cursor:default;transform:none}
+.abtn:disabled:hover{border-color:var(--line);color:var(--ink)}
 .abtn.prim{background:var(--accent);color:#fff;border-color:var(--accent)}
+.abtn.prim:disabled{color:#fff;border-color:var(--accent)}
 .abtn.danger:hover{border-color:var(--red);color:var(--red)}
+.abtn.danger:disabled:hover{border-color:var(--line);color:var(--ink)}
+.prow.pworking{border-color:var(--accent);background:#fff9f4}
 /* 表单视图（向导/连接/改名）隐藏运行控制区与页脚；反馈消息区 .feedback 始终可见（P1-3）。 */
 .panel.view-form .list-only{display:none}
 .feedback{border-top:1px solid var(--line)}
