@@ -101,6 +101,60 @@ class TransformRequest(unittest.TestCase):
         up, _ctx = ac.transform_request(body, st)
         self.assertEqual([t["name"] for t in up["tools"]], ["web_search"])
 
+    def test_relay_normalizes_loose_tool_schemas(self):
+        st = _state(dict(cs.PROVIDERS["relay"]), "relay",
+                    relay_force_model="MiniMax-M2")
+        body = {"model": "claude-opus-4-8", "messages": [],
+                "tools": [
+                    {"name": "empty", "input_schema": {}},
+                    {"name": "props_only", "input_schema": {
+                        "properties": {"q": {"type": "string"}},
+                    }},
+                    {"name": "bad_props", "input_schema": {
+                        "type": "object", "properties": [], "required": "q",
+                    }},
+                    {"name": "not_dict", "input_schema": []},
+                    {"name": "", "input_schema": {"type": "object"}},
+                    "bad-tool",
+                ]}
+        up, ctx = ac.transform_request(body, st)
+        schemas = {t["name"]: t["input_schema"] for t in up["tools"]}
+        self.assertEqual(list(schemas), ["empty", "props_only", "bad_props", "not_dict"])
+        self.assertEqual(schemas["empty"], {"type": "object", "properties": {}})
+        self.assertEqual(schemas["props_only"]["type"], "object")
+        self.assertEqual(schemas["props_only"]["properties"]["q"]["type"], "string")
+        self.assertEqual(schemas["bad_props"], {"type": "object", "properties": {}})
+        self.assertEqual(schemas["not_dict"], {"type": "object", "properties": {}})
+        self.assertEqual(set(ctx.known_tools), {"empty", "props_only", "bad_props", "not_dict"})
+        self.assertEqual(body["tools"][0]["input_schema"], {}, "不应原地改调用者请求体")
+
+    def test_relay_tool_choice_for_removed_tool_degrades_to_auto(self):
+        st = _state(dict(cs.PROVIDERS["relay"]), "relay",
+                    relay_force_model="MiniMax-M2")
+        body = {"model": "claude-opus-4-8", "messages": [],
+                "tool_choice": {"type": "tool", "name": "removed"},
+                "tools": [{"name": "", "input_schema": {"type": "object"}}]}
+        up, _ctx = ac.transform_request(body, st)
+        self.assertNotIn("tools", up)
+        self.assertEqual(up["tool_choice"], {"type": "auto"})
+
+    def test_kimi_web_search_tool_choice_degrades_to_auto_after_filter(self):
+        st = _state(dict(cs.PROVIDERS["relay"]), "relay",
+                    relay_force_model="kimi-k2.7-code")
+        body = {"model": "claude-opus-4-8", "messages": [],
+                "tool_choice": {"type": "tool", "name": "web_search"},
+                "tools": [{"name": "web_search", "input_schema": {"type": "object"}}]}
+        up, _ctx = ac.transform_request(body, st)
+        self.assertNotIn("tools", up)
+        self.assertEqual(up["tool_choice"], {"type": "auto"})
+
+    def test_non_relay_tool_schemas_are_not_normalized_here(self):
+        st = _state(cs.PROVIDERS["deepseek"], "deepseek")
+        body = {"model": "claude-opus-4-8", "messages": [],
+                "tools": [{"name": "loose", "input_schema": {}}]}
+        up, _ctx = ac.transform_request(body, st)
+        self.assertEqual(up["tools"][0]["input_schema"], {})
+
     def test_no_max_tokens_left_absent(self):
         st = _state(cs.PROVIDERS["deepseek"], "deepseek")
         up, _ctx = ac.transform_request({"model": "claude-opus-4-8", "messages": []}, st)

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import dsml_shim
 import provider_policy
 
+_EMPTY_OBJECT_SCHEMA = {"type": "object", "properties": {}}
+
 
 @dataclass
 class Ctx:
@@ -21,6 +23,64 @@ class Ctx:
     provider: str
 
 
+def _normalize_relay_input_schema(schema):
+    if not isinstance(schema, dict) or not schema:
+        return dict(_EMPTY_OBJECT_SCHEMA)
+
+    out = dict(schema)
+    props = out.get("properties")
+    typ = out.get("type")
+
+    if typ is None and isinstance(props, dict):
+        out["type"] = "object"
+    elif typ != "object":
+        out = dict(_EMPTY_OBJECT_SCHEMA)
+        props = out["properties"]
+
+    if not isinstance(out.get("properties"), dict):
+        out["properties"] = {}
+    if "required" in out and not isinstance(out["required"], list):
+        out.pop("required", None)
+    return out
+
+
+def _degrade_missing_tool_choice(upstream):
+    choice = upstream.get("tool_choice")
+    if not (isinstance(choice, dict) and choice.get("type") == "tool"):
+        return
+    names = {t.get("name") for t in upstream.get("tools") or [] if isinstance(t, dict)}
+    if choice.get("name") not in names:
+        upstream["tool_choice"] = {"type": "auto"}
+
+
+def _normalize_relay_tools(upstream):
+    """Normalize Anthropic-compatible relay tool schemas before outbound.
+
+    Some Anthropic-compatible relay providers reject Claude Science's empty or loose
+    ``input_schema`` values with a provider-side 400. Keep this limited to relay
+    passthrough; OpenAI/Qwen/Responses conversions have their own mapping rules.
+    """
+    tools = upstream.get("tools")
+    if not isinstance(tools, list):
+        if "tools" in upstream:
+            upstream.pop("tools", None)
+            _degrade_missing_tool_choice(upstream)
+        return
+
+    normalized = []
+    for tool in tools:
+        if not isinstance(tool, dict) or not tool.get("name"):
+            continue
+        clean = dict(tool)
+        clean["input_schema"] = _normalize_relay_input_schema(tool.get("input_schema"))
+        normalized.append(clean)
+    if normalized:
+        upstream["tools"] = normalized
+    else:
+        upstream.pop("tools", None)
+    _degrade_missing_tool_choice(upstream)
+
+
 def _filter_upstream_tools(upstream, target_model, provider):
     """Provider-specific tool compatibility before sending to upstream.
 
@@ -29,7 +89,10 @@ def _filter_upstream_tools(upstream, target_model, provider):
     expects ordinary client tools, so those server-tool blocks make the stream
     retry. Keep the original known_tools in ctx, but do not advertise this one tool upstream.
     """
-    if provider == "relay" and "kimi" in (target_model or "").lower():
+    if provider != "relay":
+        return
+    _normalize_relay_tools(upstream)
+    if "kimi" in (target_model or "").lower():
         tools = upstream.get("tools")
         if isinstance(tools, list):
             filtered = [t for t in tools if not (isinstance(t, dict) and t.get("name") == "web_search")]
@@ -38,6 +101,7 @@ def _filter_upstream_tools(upstream, target_model, provider):
                     upstream["tools"] = filtered
                 else:
                     upstream.pop("tools", None)
+                _degrade_missing_tool_choice(upstream)
 
 
 def transform_request(body, state):

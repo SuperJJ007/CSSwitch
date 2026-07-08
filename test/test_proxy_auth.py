@@ -8,6 +8,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, HERE)
@@ -16,6 +17,43 @@ from _capability import loopback_available
 
 PROXY = os.path.join(HERE, "..", "proxy", "csswitch_proxy.py")
 SEC = "s3cr3t-test-token"
+
+
+def _start_capture_upstream():
+    bodies = []
+
+    class Capture(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            n = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(n)
+            try:
+                bodies.append(json.loads(raw or b"{}"))
+            except Exception:
+                bodies.append(raw.decode("utf-8", "replace"))
+            body = json.dumps({
+                "id": "msg_mock", "type": "message", "role": "assistant",
+                "model": "mock", "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn", "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Capture)
+    port = srv.server_address[1]
+    import threading
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return f"http://127.0.0.1:{port}", bodies, srv.shutdown
 
 
 def _req(url, method="GET", body=None):
@@ -245,6 +283,60 @@ class ProxyQwenUpstreamErrorPassthrough(unittest.TestCase):
                     {"model": "claude-opus-4-8", "max_tokens": 1,
                      "messages": [{"role": "user", "content": "ping"}]})
         self.assertEqual(s, 401, f"qwen 也应保留上游 401，实收 {s} {b[:160]!r}")
+
+
+@unittest.skipUnless(loopback_available(), "env-blocked: loopback bind/connect not permitted")
+class ProxyRelayToolSchemaNormalization(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.up_base, cls.bodies, cls.stop_up = _start_capture_upstream()
+        port = 18997  # S0 全局唯一端口：ProxyRelayToolSchemaNormalization
+        cls.base = f"http://127.0.0.1:{port}"
+        cls.logf = os.path.join(tempfile.gettempdir(), f"csswitch-relay-tools-{port}.log")
+        open(cls.logf, "w").close()
+        env = dict(os.environ, CSSWITCH_RELAY_KEY="fake-relay-key",
+                   CSSWITCH_RELAY_BASE_URL=cls.up_base,
+                   CSSWITCH_RELAY_MODEL="MiniMax-M2")
+        cls.proc = subprocess.Popen(
+            [sys.executable, PROXY, "--provider", "relay",
+             "--port", str(port), "--auth-token", SEC, "--log", cls.logf],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        for _ in range(50):
+            try:
+                s, _b = _req(f"{cls.base}/{SEC}/health")
+                if s == 200:
+                    break
+            except Exception:
+                pass
+            time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.proc.terminate()
+        cls.proc.wait(timeout=5)
+        cls.stop_up()
+
+    def test_relay_outbound_tools_are_normalized_before_provider(self):
+        s, b = _req(f"{self.base}/{SEC}/v1/messages", "POST", {
+            "model": "claude-opus-4-8",
+            "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tool_choice": {"type": "tool", "name": "removed"},
+            "tools": [
+                {"name": "empty", "input_schema": {}},
+                {"name": "bad_required", "input_schema": {
+                    "type": "object", "properties": [], "required": "q",
+                }},
+                {"name": "", "input_schema": {"type": "object"}},
+            ],
+        })
+        self.assertEqual(s, 200, b[:160])
+        out = self.bodies[-1]
+        self.assertEqual(out["model"], "MiniMax-M2")
+        self.assertEqual([t["name"] for t in out["tools"]], ["empty", "bad_required"])
+        self.assertEqual(out["tools"][0]["input_schema"], {"type": "object", "properties": {}})
+        self.assertEqual(out["tools"][1]["input_schema"], {"type": "object", "properties": {}})
+        self.assertEqual(out["tool_choice"], {"type": "auto"})
 
 
 class ProxyOpenAICustomModelsDiscovery(unittest.TestCase):

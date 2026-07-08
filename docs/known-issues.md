@@ -27,6 +27,15 @@
 - **待收集（下次复现时）**：① 完整报错文本；② 它请求的**具体路径**是什么；③ 是否只有 DeepSeek 触发、还是任何 provider 都这样；④ 该自检具体是什么（Science 自带的环境自检？哪个 agent 发起？）。
 - **不改代码**，先记录待查。
 
+## 2a. Claude Science `0.1.15-dev` native 基线漂移（需隔离复核）
+
+> **状态：只读基线已更新，未做真实账号态 / 真实 HOME / GUI E2E。**
+
+- **当前本机安装版**：`/Applications/Claude Science.app` 仍是 `0.1.0-dev.20260630.t212931.sha2bc1ac8`。
+- **本地缓存证据版**：`.science-binaries/README.md` 记录过 `0.1.15-dev.20260701.t220242.shaaa553de`；该缓存只作为本地证据，不随公开包发布。本轮未读取、未复制、未修改真实 `~/.claude-science`。
+- **route diff 新增面**：`/api/auth/nonce`、`/api/auth/` 可能影响虚拟 OAuth / auth status；`/api/conda/conda-remote`、`/api/pypi/pypi-remote/simple`、conda mirror preference/probe 可能影响沙箱包源代理；`/api/frames/:id/token-series`、`/api/skills/:name/resync` 可能影响诊断或技能同步行为。
+- **下一步**：在 `0.1.15-dev` 二进制可控时，用隔离 HOME + 非 `8765` 端口复跑虚拟 OAuth、沙箱启动、包源代理相关最小路径；不要从当前 `0.1.0-dev` 实测外推兼容结论。
+
 ## 3. ✅ 运行中再点主按钮的幂等分派（已随 v0.2.0 发布，已毕业）
 
 > **状态：已随 v0.2.0（2026-07-03，Latest）发布并毕业到 [`../CHANGELOG.md`](../CHANGELOG.md) 的 `[0.2.0]`。** 幂等 forge 落地（org_uuid 只在真首启铸一次、此后 sticky，健康沙箱只重开不重伪造），实机 T1 已验证「会话不会丢」；同时阻止 #6 复发。详细设计与实现计划见本地开发文档（不入库）。原设计如下（历史留存）：
@@ -103,7 +112,7 @@
 
 - **要做什么（用户 2026-07-03）**：像 cc-switch 那样能**存多套命名配置（profile）**、列出来、一键切当前生效的那套（同一家可存多套、可命名、可增删）。现在是**固定槽**（deepseek/qwen/relay-glm/…每家一份），做不到多套 → 数据模型从「固定槽」升级为「用户自管的 profile 列表 + 当前生效指针」。
 - **配置存储：先不换 SQLite（用户要「保持稳定」）。** 多 profile 只是数据模型（JSON 存一个数组即可），跟存储后端解耦。这版继续 JSON、把它硬化（原子写已有 + schema 版本字段 + 覆盖前留 `.bak` + 修面板回显可见性缺口）；SQLite 留到确有扩展需求（多窗口并发 / 大量记录 / 历史）时再迁，届时 JSON→SQLite 迁移很简单。SQLite 价值在可扩展+并发，不在「更稳」。
-- **代理移 Rust（独立轨道）**：翻译代理从 python 移到 Rust（axum），**vendor cc-switch 的 MIT `transform*.rs`** 拿广覆盖（4 种 apiFormat），加我们的 path-secret + 虚拟 OAuth 剥离。cc-switch 代理**不能当 sidecar 直接复用**（焊死它的 SQLite DB，见 `verified-facts.md` 事实 5），复用 = 移植它的翻译模块。这条同时完成 python-ectomy 治本，与「多 profile 配置」解耦。
+- **代理移 Rust（独立轨道）**：翻译代理从 python 移到 Rust（axum），**vendor cc-switch 的 MIT `transform*.rs`** 拿广覆盖（4 种 apiFormat），加我们的 path-secret + 虚拟 OAuth 剥离。cc-switch 代理**不能当 sidecar 直接复用**（焊死它的 SQLite DB，见 `verified-facts.md` 事实 6），复用 = 移植它的翻译模块。这条同时完成 python-ectomy 治本，与「多 profile 配置」解耦。
 - **relay-presets 分支现状**：`feat/relay-presets`（Task1-13 全实现 + opus 终审过）实现了 relay provider + 预设 + 面板选模型，但用**固定槽 + python 代理**，**降为参考/回退，不作为发布基座**（重架后被多 profile + Rust 代理取代）。HEAD `2a5084f`（f148eb2 + P3 hygiene 修）**clippy-green**。GPT 外审逐条核实：P1「保存写错槽+覆盖」= 尖端已修（STALE）；P1b「保存非原子」+ P2a「自愈忽略停沙箱失败 `lib.rs:967`」= 真 Important、折进重架设计（P2a 应像 `set_mode` 停失败即中止）；P2b「python 代理 OSError 全当占用」= 真但代理要换掉；P3「clippy 2 处 + 版本不一致」= 已修（`2a5084f`）。**教训**：验收闸门要含 `cargo clippy --all-targets -D warnings`（比 `cargo test` 的 rustc 警告更严；账本旧称「0 warnings」漏了 clippy）。
 - **隔离层四家实测证据**：`findings/2026-07-03-pr4-relay-provider-testing.md`（GLM/小米/硅基流动/OpenRouter 真机实测，含工具，守铁律4 未启 Science），已随 `c8b9cfe` 提交。
 - **下一步**：① **用户在场做真机整链手测**（构建 + 启动 app，逐项过：迁移后旧对话在不在 / 新建 / 切换 / 一键开始 / 连接编辑 / 清 key / 删除；起沙箱 Science + 登录那步由用户手动，守铁律 2/3/4）；② 过了再谈 merge（现未 push、main 未动）+ 更新 `CHANGELOG.md`（**故意还没写**，避免仓库里提前显「已完成」）；③ 轨道 2 = 代理移 Rust（另起 spec）。spec/计划在 `docs/superpowers/`（gitignore）。
@@ -115,7 +124,7 @@
 - **② 「API 支持」重架（已升级为 #8，2026-07-03）**：原「面板内自定义 OpenAI 端点」升级为 cc-switch 式**多 profile 配置管理**（存多套命名配置 + 一键切）+ 代理移 Rust（vendor cc-switch MIT 翻译模块）。配置层先 JSON 硬化、SQLite 缓议。详见 **#8**。
 
 **其它 roadmap（非 bug）**：
-- **python-ectomy**：翻译代理移到 Rust（axum），拔掉 python（node 已在 v0.1.4 拔除），最终零外部运行时。**落地方式（2026-07-03 定）= vendor cc-switch 的 MIT `transform*.rs` 拿广覆盖**（见 #8、`verified-facts.md` 事实 5）。
+- **python-ectomy**：翻译代理移到 Rust（axum），拔掉 python（node 已在 v0.1.4 拔除），最终零外部运行时。**落地方式（2026-07-03 定）= vendor cc-switch 的 MIT `transform*.rs` 拿广覆盖**（见 #8、`verified-facts.md` 事实 6）。
 - Intel（x86_64）/ universal 构建；可选正式签名 + Apple 公证。
 
 ---
