@@ -42,8 +42,11 @@
       "../../proxy/anthropic_compat.py": "proxy/anthropic_compat.py",
       "../../proxy/csswitch_proxy.py": "proxy/csswitch_proxy.py",
       "../../proxy/dsml_shim.py": "proxy/dsml_shim.py",
+      "../../proxy/model_discovery.py": "proxy/model_discovery.py",
+      "../../proxy/openai_chat_compat.py": "proxy/openai_chat_compat.py",
       "../../proxy/provider_policy.py": "proxy/provider_policy.py",
       "../../proxy/qwen_proxy.py": "proxy/qwen_proxy.py",
+      "../../proxy/responses_compat.py": "proxy/responses_compat.py",
       "../../scripts/doctor.sh": "scripts/doctor.sh",
       "../../scripts/launch-virtual-sandbox.sh": "scripts/launch-virtual-sandbox.sh",
       "../../scripts/stop-science-sandbox.sh": "scripts/stop-science-sandbox.sh"
