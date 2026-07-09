@@ -1,6 +1,8 @@
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use tauri::Runtime;
+
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
     assert_format_supported, is_native_adapter, is_openai_adapter, proxy_args_for,
@@ -36,8 +38,8 @@ fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
 }
 
 /// Ensure the active profile's proxy is running and healthy.
-pub(crate) fn ensure_proxy(
-    app: &tauri::AppHandle,
+pub(crate) fn ensure_proxy<R: Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     trace: Option<&OperationTrace>,
@@ -53,8 +55,8 @@ pub(crate) fn ensure_proxy(
 /// Start or reuse a proxy for a specific profile, without reading the active profile.
 ///
 /// This function does not take the command serializer lock; callers own that boundary.
-pub(crate) fn start_proxy_for(
-    app: &tauri::AppHandle,
+pub(crate) fn start_proxy_for<R: Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     profile: &config::Profile,

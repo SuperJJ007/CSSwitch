@@ -2,6 +2,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 
+use tauri::Runtime;
+
 use crate::{config, proc};
 
 use super::system::{asset_root, kill_child};
@@ -136,8 +138,8 @@ pub(crate) fn sandbox_running_ours(port: u16) -> bool {
 ///
 /// Returns `Err` when the stop script is missing or exits non-zero, so callers
 /// can report that Science may not have stopped cleanly.
-pub(crate) fn stop_sandbox(
-    app: &tauri::AppHandle,
+pub(crate) fn stop_sandbox<R: Runtime>(
+    app: &tauri::AppHandle<R>,
     sandbox: &mut Option<Child>,
     sandbox_url: &mut Option<String>,
 ) -> Result<(), String> {

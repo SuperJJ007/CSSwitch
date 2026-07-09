@@ -18,6 +18,10 @@ while [ $# -gt 0 ]; do
 done
 
 [[ "$PORT" =~ ^[0-9]+$ ]] || { echo "✗ 端口非法整数：$PORT"; exit 2; }
+if [ "$((10#$PORT))" -eq 8765 ]; then
+  echo "✗ 端口 8765 是真实 Science 实例保留端口，verify-proxy 拒绝访问。"
+  exit 2
+fi
 PREFIX=""
 [ -n "$SECRET" ] && PREFIX="/$SECRET"
 BASE="http://$HOST:$PORT$PREFIX"

@@ -2,7 +2,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 
-use tauri::Manager;
+use tauri::{Manager, Runtime};
 
 use crate::config;
 
@@ -36,7 +36,7 @@ pub(crate) fn repo_root() -> Option<PathBuf> {
 
 /// Locate the asset root containing `proxy/` and `scripts/`.
 /// Packaged apps use `Contents/Resources`; dev builds fall back to repo root.
-pub(crate) fn asset_root(app: &tauri::AppHandle) -> Option<PathBuf> {
+pub(crate) fn asset_root<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
     let marker = Path::new("proxy/csswitch_proxy.py");
     if let Ok(res) = app.path().resource_dir() {
         if res.join(marker).is_file() {

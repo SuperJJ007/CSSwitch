@@ -2,6 +2,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tauri::Runtime;
 
 use crate::runtime::operation::{
     self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,
@@ -12,15 +13,18 @@ use crate::runtime::science::{sandbox_home, sandbox_running_ours, sandbox_url, s
 use crate::runtime::system::{asset_root, log_path, open_in_browser, open_log, redact, tail_file};
 use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
 
-fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+fn stop_sandbox_state<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    st: &mut AppState,
+) -> Result<(), String> {
     stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
 }
 
 /// One-click session startup: active proxy, virtual login, sandbox, browser.
 ///
 /// Callers must hold the command serializer lock.
-pub(crate) fn one_click_login(
-    app: tauri::AppHandle,
+pub(crate) fn one_click_login<R: Runtime>(
+    app: tauri::AppHandle<R>,
     state: SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
 ) -> Result<Value, String> {

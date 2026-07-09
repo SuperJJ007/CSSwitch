@@ -29,3 +29,6 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }

@@ -69,6 +69,18 @@ class ProxyPackagingSmoke(unittest.TestCase):
             finally:
                 sys.dont_write_bytecode = old_dont_write
 
+    def test_tauri_bundle_includes_ops_scripts_for_packaged_smoke(self):
+        conf = json.loads(TAURI_CONF.read_text())
+        resources = set(conf["bundle"]["resources"].values())
+        self.assertTrue(
+            {
+                "scripts/doctor.sh",
+                "scripts/verify-proxy.sh",
+                "scripts/launch-virtual-sandbox.sh",
+                "scripts/stop-science-sandbox.sh",
+            }.issubset(resources)
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

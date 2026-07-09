@@ -77,6 +77,9 @@ out="$(CSSWITCH_CONFIG="$CFGLINK" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "doctor rejects symlinked config"; else no "doctor accepted symlinked config (rc=$rc): $out"; fi
 
 # ---------- verify-proxy ----------
+out="$("$VERIFY" --port 8765 --secret anything 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "8765"; then ok "verify-proxy rejects reserved port 8765"; else no "verify-proxy did not reject 8765 (rc=$rc): $out"; fi
+
 if [ "$(python3 "$ROOT/test/_capability.py")" != "1" ]; then
   echo "skip - verify-proxy 段 env-blocked（loopback 被禁，无法起临时代理）"
 else

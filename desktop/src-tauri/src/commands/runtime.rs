@@ -448,6 +448,23 @@ pub(crate) fn quit_app(
 #[cfg(test)]
 mod tests {
     use super::{config_last_error_json, status_response_for_config_error};
+    use crate::{
+        config::{self, Config, Profile},
+        lifecycle, lock,
+        runtime::{sandbox_session, science},
+        AppState, SharedAppState,
+    };
+    use std::{
+        env, fs,
+        io::{Read, Write},
+        net::{TcpListener, TcpStream},
+        os::unix::fs::PermissionsExt,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        thread,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+    use tauri::Manager;
 
     #[test]
     fn config_last_error_json_preserves_typed_config_error() {
@@ -472,5 +489,326 @@ mod tests {
         assert_eq!(v["science"]["sandbox"]["port"], 0);
         assert_eq!(v["last_error"]["type"], "config_error");
         assert_eq!(v["last_error"]["message"], "bad config");
+    }
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<std::ffi::OsString>)>,
+    }
+
+    impl EnvGuard {
+        fn new() -> Self {
+            Self { saved: Vec::new() }
+        }
+
+        fn set(&mut self, key: &str, value: impl AsRef<std::ffi::OsStr>) {
+            self.saved.push((key.to_string(), env::var_os(key)));
+            env::set_var(key, value);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(v) => env::set_var(key, v),
+                    None => env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn tmpdir(label: &str) -> PathBuf {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("csswitch-{label}-{}-{now}", std::process::id()))
+    }
+
+    fn free_port() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, 8765);
+        port
+    }
+
+    fn write_executable(path: &Path, body: &str) {
+        fs::write(path, body).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn write_test_bins(dir: &Path) -> PathBuf {
+        fs::create_dir_all(dir).unwrap();
+        write_executable(
+            &dir.join("open"),
+            r#"#!/bin/sh
+if [ -n "${CSSWITCH_FAKE_OPEN_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$CSSWITCH_FAKE_OPEN_LOG"
+fi
+exit 0
+"#,
+        );
+        write_executable(
+            &dir.join("security"),
+            r#"#!/bin/sh
+exit 0
+"#,
+        );
+        let science_bin = dir.join("claude-science");
+        write_executable(
+            &science_bin,
+            r#"#!/bin/sh
+set -eu
+cmd="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+data_dir=""
+port=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --data-dir) data_dir="$2"; shift 2 ;;
+    --port) port="$2"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+state="$data_dir/fake-science"
+mkdir -p "$state"
+case "$cmd" in
+  serve)
+    count="$(cat "$state/serve-count" 2>/dev/null || echo 0)"
+    count=$((count + 1))
+    printf '%s' "$count" > "$state/serve-count"
+    printf '%s' "$port" > "$state/port"
+    python3 - "$port" "$state/pid" >/dev/null 2>&1 <<'PY' &
+import http.server
+import os
+import socketserver
+import sys
+port = int(sys.argv[1])
+pidfile = sys.argv[2]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+    def do_GET(self):
+        if self.path.startswith("/health"):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"status":"ok"}')
+        else:
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"fake science")
+with open(pidfile, "w", encoding="utf-8") as f:
+    f.write(str(os.getpid()))
+with socketserver.TCPServer(("127.0.0.1", port), Handler) as httpd:
+    httpd.serve_forever()
+PY
+    exit 0
+    ;;
+  status)
+    pid="$(cat "$state/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      echo '{"running":true}'
+    else
+      echo '{"running":false}'
+      exit 1
+    fi
+    ;;
+  url)
+    p="$(cat "$state/port")"
+    echo "http://127.0.0.1:$p"
+    ;;
+  stop)
+    pid="$(cat "$state/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+    rm -f "$state/pid"
+    echo "stopped"
+    ;;
+  *)
+    echo "unsupported fake science command: $cmd" >&2
+    exit 2
+    ;;
+esac
+"#,
+        );
+        science_bin
+    }
+
+    fn start_mock_upstream() -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, 8765);
+        thread::spawn(move || {
+            for mut s in listener.incoming().flatten() {
+                let mut buf = [0; 512];
+                let _ = s.read(&mut buf);
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+            }
+        });
+        port
+    }
+
+    fn wait_http_health(port: u16) {
+        for _ in 0..50 {
+            if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        panic!("mock service on port {port} did not become reachable");
+    }
+
+    #[test]
+    #[ignore = "explicit isolated runtime smoke; uses fake Science and local loopback ports"]
+    fn isolated_one_click_reuse_status_smoke_with_fake_science() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let tmp = tmpdir("isolated-runtime-smoke");
+        let home = tmp.join("home");
+        let bin_dir = tmp.join("bin");
+        fs::create_dir_all(&home).unwrap();
+        let fake_science = write_test_bins(&bin_dir);
+        let open_log = tmp.join("open.log");
+        let mock_upstream_port = start_mock_upstream();
+        let proxy_port = free_port();
+        let sandbox_port = free_port();
+        assert_ne!(proxy_port, sandbox_port);
+
+        let mut env_guard = EnvGuard::new();
+        env_guard.set("HOME", &home);
+        env_guard.set("CSSWITCH_REPO", &root);
+        env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
+        env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
+        env_guard.set(
+            "PATH",
+            format!(
+                "{}:/usr/bin:/bin:/usr/sbin:/sbin",
+                bin_dir.to_string_lossy()
+            ),
+        );
+
+        let fake_key = "csswitch-isolated-fake-key-never-log";
+        let profile = Profile {
+            id: "mock-relay".into(),
+            name: "Mock Relay".into(),
+            template_id: "custom".into(),
+            category: "custom".into(),
+            api_format: "anthropic".into(),
+            base_url: format!("http://127.0.0.1:{mock_upstream_port}/anthropic"),
+            api_key: fake_key.into(),
+            model: "mock-model".into(),
+            ..Default::default()
+        };
+        let cfg = Config {
+            profiles: vec![profile],
+            active_id: "mock-relay".into(),
+            proxy_port,
+            sandbox_port,
+            ..Default::default()
+        };
+        let config_dir = config::default_dir();
+        config::save_to(&config_dir, &cfg).unwrap();
+
+        let state: SharedAppState = Arc::new(Mutex::new(AppState::default()));
+        let lifecycle = Arc::new(lifecycle::Lifecycle::new());
+        let app = tauri::test::mock_builder()
+            .manage(state.clone())
+            .manage(lifecycle.clone())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let handle = app.handle().clone();
+
+        let first =
+            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
+                .expect("first one-click should start proxy and sandbox");
+        assert_eq!(first["action"], "started");
+        assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        wait_http_health(sandbox_port);
+        let fake_state_dir = home
+            .join(".csswitch")
+            .join("sandbox")
+            .join("home")
+            .join(".claude-science")
+            .join("fake-science");
+        let first_pid = fs::read_to_string(fake_state_dir.join("pid")).unwrap();
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "1"
+        );
+
+        let second =
+            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
+                .expect("second one-click should reuse running sandbox");
+        assert_eq!(second["action"], "reopened");
+        assert_eq!(second["url"], format!("http://127.0.0.1:{sandbox_port}"));
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
+            first_pid
+        );
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
+            "1"
+        );
+
+        let status = super::status(app.state::<SharedAppState>());
+        assert_eq!(status["proxy"], "green");
+        assert_eq!(status["sandbox"], "green");
+        assert_eq!(status["upstream"], "green");
+        assert_eq!(status["active_profile"]["id"], "mock-relay");
+        assert_eq!(status["science"]["sandbox"]["port"], sandbox_port);
+        assert_eq!(status["science"]["auth"]["real_account_verified"], false);
+        assert_eq!(status["science"]["auth"]["real_home_verified"], false);
+        assert!(status["last_error"].is_null());
+
+        let doctor = std::process::Command::new(root.join("scripts/doctor.sh"))
+            .env("HOME", &home)
+            .env("SCIENCE_BIN", &fake_science)
+            .env("CSSWITCH_CONFIG", config_dir.join("config.json"))
+            .env("CSSWITCH_PROXY_PORT", proxy_port.to_string())
+            .env("CSSWITCH_SANDBOX_PORT", sandbox_port.to_string())
+            .output()
+            .expect("doctor should run");
+        assert!(doctor.status.success());
+        let doctor_out = String::from_utf8_lossy(&doctor.stdout);
+        assert!(doctor_out.contains("真实 HOME 检查默认跳过"));
+        assert!(!doctor_out.contains(&format!("{}/.claude-science", home.display())));
+
+        let cfg_after = config::load_from(&config_dir).unwrap();
+        let secret = cfg_after.secret;
+        assert!(!secret.is_empty());
+        let doctor_err = String::from_utf8_lossy(&doctor.stderr);
+        assert!(!doctor_out.contains(fake_key));
+        assert!(!doctor_out.contains(&secret));
+        assert!(!doctor_err.contains(fake_key));
+        assert!(!doctor_err.contains(&secret));
+        assert!(!first.to_string().contains(fake_key));
+        assert!(!first.to_string().contains(&secret));
+        assert!(!second.to_string().contains(fake_key));
+        assert!(!second.to_string().contains(&secret));
+        let opened = fs::read_to_string(&open_log).unwrap_or_default();
+        assert!(!opened.contains(fake_key));
+        assert!(!opened.contains(&secret));
+        for name in ["proxy.log", "sandbox.log", "operation.log"] {
+            let body = fs::read_to_string(config_dir.join("logs").join(name))
+                .unwrap_or_else(|e| panic!("expected {name} to exist: {e}"));
+            assert!(!body.contains(fake_key), "{name} leaked fake key");
+            assert!(!body.contains(&secret), "{name} leaked path secret");
+        }
+
+        {
+            let mut st = lock(&state);
+            let AppState {
+                sandbox,
+                sandbox_url,
+                ..
+            } = &mut *st;
+            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url);
+            st.stop_proxy();
+        }
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

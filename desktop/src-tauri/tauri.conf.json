@@ -50,7 +50,8 @@
       "../../proxy/responses_compat.py": "proxy/responses_compat.py",
       "../../scripts/doctor.sh": "scripts/doctor.sh",
       "../../scripts/launch-virtual-sandbox.sh": "scripts/launch-virtual-sandbox.sh",
-      "../../scripts/stop-science-sandbox.sh": "scripts/stop-science-sandbox.sh"
+      "../../scripts/stop-science-sandbox.sh": "scripts/stop-science-sandbox.sh",
+      "../../scripts/verify-proxy.sh": "scripts/verify-proxy.sh"
     },
     "macOS": {
       "signingIdentity": "-"
