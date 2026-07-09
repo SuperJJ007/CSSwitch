@@ -7,8 +7,8 @@ use tauri::State;
 
 use crate::runtime::capability_catalog::diagnostics_for_profile;
 use crate::runtime::diagnostics::{
-    build_status_response, science_diagnostics, status_lights, ScienceDiagnosticsInput,
-    StatusProbeInput,
+    build_status_response, proxy_status_last_error, science_diagnostics, status_lights,
+    ScienceDiagnosticsInput, StatusProbeInput,
 };
 use crate::runtime::operation::{self, OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::profile_capabilities;
@@ -399,6 +399,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     let upstream = upstream_endpoint(&adapter, &base_url);
     let proxy_ok = !secret.is_empty()
         && proc::http_health(pport, Some(&secret), operation::STATUS_HEALTH_TIMEOUT_MS);
+    let last_error = proxy_status_last_error(!secret.is_empty(), proxy_ok, pport);
     let sandbox_ok = proc::http_health(sport, None, operation::STATUS_HEALTH_TIMEOUT_MS);
     let upstream_ok = upstream
         .as_ref()
@@ -420,7 +421,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             sandbox_port: sport,
             sandbox_ok,
         }),
-        None,
+        last_error,
     )
 }
 
