@@ -108,7 +108,20 @@ mod tests {
         build_status_response, proxy_status_last_error, science_diagnostics, status_lights,
         ScienceDiagnosticsInput, StatusProbeInput,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+
+    fn assert_object_keys(v: &Value, expected: &[&str]) {
+        let mut actual = v
+            .as_object()
+            .unwrap_or_else(|| panic!("expected object, got {v}"))
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = expected.to_vec();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
 
     #[test]
     fn status_lights_map_bools_to_existing_strings() {
@@ -180,6 +193,118 @@ mod tests {
     }
 
     #[test]
+    fn status_contract_freezes_healthy_active_profile_runtime_and_null_error_shape() {
+        let v = build_status_response(
+            status_lights(StatusProbeInput {
+                proxy_ok: true,
+                sandbox_ok: true,
+                upstream_ok: true,
+            }),
+            json!({
+                "id": "p1",
+                "name": "GLM",
+                "template_id": "glm",
+                "api_format": "anthropic",
+                "model": "glm-5.2",
+                "capabilities": {
+                    "base_url_required": true,
+                    "model_required": true,
+                    "model_discovery": "builtin_static",
+                    "supports_thinking_policy": true,
+                    "thinking_policy": "adaptive",
+                    "supports_tools_hint": "native",
+                },
+            }),
+            "python",
+            "detect",
+            json!({
+                "schema_version": 1,
+                "status": "loaded",
+                "active_rules": [],
+                "boundary_rules": [],
+            }),
+            science_diagnostics(ScienceDiagnosticsInput {
+                sandbox_port: 18990,
+                sandbox_ok: true,
+            }),
+            None,
+        );
+
+        assert_object_keys(
+            &v,
+            &[
+                "active_profile",
+                "catalog",
+                "last_error",
+                "proxy",
+                "runtime",
+                "sandbox",
+                "science",
+                "upstream",
+            ],
+        );
+        assert_object_keys(
+            &v["active_profile"],
+            &[
+                "api_format",
+                "capabilities",
+                "id",
+                "model",
+                "name",
+                "template_id",
+            ],
+        );
+        assert_object_keys(&v["runtime"], &["gateway_kind", "shim_mode"]);
+        assert_eq!(v["active_profile"]["id"], "p1");
+        assert_eq!(
+            v["active_profile"]["capabilities"]["thinking_policy"],
+            "adaptive"
+        );
+        assert_eq!(v["runtime"]["gateway_kind"], "python");
+        assert_eq!(v["runtime"]["shim_mode"], "detect");
+        assert!(v["last_error"].is_null());
+    }
+
+    #[test]
+    fn status_contract_freezes_config_error_fail_closed_shape() {
+        let v = build_status_response(
+            status_lights(StatusProbeInput {
+                proxy_ok: false,
+                sandbox_ok: false,
+                upstream_ok: false,
+            }),
+            Value::Null,
+            "",
+            "off",
+            json!({
+                "schema_version": 1,
+                "status": "unavailable",
+                "active_rules": [],
+                "boundary_rules": [],
+            }),
+            science_diagnostics(ScienceDiagnosticsInput {
+                sandbox_port: 0,
+                sandbox_ok: false,
+            }),
+            Some(json!({
+                "type": "config_error",
+                "message": "config unreadable",
+            })),
+        );
+
+        assert_eq!(v["proxy"], "amber");
+        assert_eq!(v["sandbox"], "amber");
+        assert_eq!(v["upstream"], "amber");
+        assert!(v["active_profile"].is_null());
+        assert_object_keys(&v["runtime"], &["gateway_kind", "shim_mode"]);
+        assert_eq!(v["runtime"]["gateway_kind"], "");
+        assert_eq!(v["runtime"]["shim_mode"], "off");
+        assert_object_keys(&v["last_error"], &["message", "type"]);
+        assert_eq!(v["last_error"]["type"], "config_error");
+        assert_eq!(v["last_error"]["message"], "config unreadable");
+    }
+
+    #[test]
     fn status_response_can_surface_typed_last_error() {
         let v = build_status_response(
             status_lights(StatusProbeInput {
@@ -241,5 +366,37 @@ mod tests {
         assert_eq!(v["upstream"], "green");
         assert_eq!(v["last_error"]["type"], "proxy_unhealthy");
         assert_eq!(v["last_error"]["port"], 18991);
+    }
+
+    #[test]
+    fn status_contract_freezes_proxy_unhealthy_last_error_shape() {
+        let v = build_status_response(
+            status_lights(StatusProbeInput {
+                proxy_ok: false,
+                sandbox_ok: true,
+                upstream_ok: true,
+            }),
+            Value::Null,
+            "python",
+            "off",
+            json!({"schema_version": 1}),
+            science_diagnostics(ScienceDiagnosticsInput {
+                sandbox_port: 18990,
+                sandbox_ok: true,
+            }),
+            proxy_status_last_error(true, false, 18991),
+        );
+
+        assert!(v["active_profile"].is_null());
+        assert_object_keys(&v["runtime"], &["gateway_kind", "shim_mode"]);
+        assert_eq!(v["runtime"]["gateway_kind"], "python");
+        assert_eq!(v["runtime"]["shim_mode"], "off");
+        assert_object_keys(&v["last_error"], &["message", "port", "type"]);
+        assert_eq!(v["last_error"]["type"], "proxy_unhealthy");
+        assert_eq!(v["last_error"]["port"], 18991);
+        assert!(v["last_error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("代理进程不可达"));
     }
 }
