@@ -7,8 +7,8 @@
 #   「完全零 Anthropic 接触」这类绝对说法（与 README「免责声明」一致）。
 #
 # 铁律保障（见 CLAUDE.md）:
-#   - 独立 HOME + 独立 data-dir + 独立端口，绝不碰真实 ~/.claude-science 与端口 8765
-#   - 只 APFS 克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何真实登录凭证
+#   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
+#   - 只从真实 ~/.claude-science 只读 APFS 克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何真实登录凭证或用户数据
 #   - 写入沙箱的是【自造的假凭证】(make-virtual-oauth.mjs)，与真实 OAuth 无关
 #   - encryption.key 的 keychain 镜像账号按【路径哈希】派生，沙箱与真实天然隔离
 #

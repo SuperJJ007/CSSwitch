@@ -4,11 +4,12 @@
 
 ## 铁律（最高优先级，任何改动不得违反）
 
-见 [`../CLAUDE.md`](../CLAUDE.md) 第一节。核心四条：
-1. 绝不复制/修改/删除真实 `~/.claude-science`（含 `.oauth-tokens`/`encryption.key`/`active-org.json`）。
-2. 绝不把真实 OAuth token 复制进沙箱；沙箱只用本地自造的虚拟令牌。
-3. 绝不用改过的环境去起真实实例；真实端口 8765，沙箱一律独立 HOME+端口+data-dir。
-4. 测试默认不碰 Science；整链冒烟须用户明确同意、且在场（碰 Science 的手测）。
+见 [`../CLAUDE.md`](../CLAUDE.md) 第一节。核心约束：
+1. 绝不复制、读取、修改或删除真实 Claude 登录凭证、OAuth token、账号状态或用户数据（含 `.oauth-tokens`/`encryption.key`/`active-org.json`）。
+2. 首次沙箱初始化允许只读克隆真实 `~/.claude-science` 下的运行时资源（`bin`/`conda`/`runtime`/`seed-assets`），但不得复制凭证或对话数据。
+3. 绝不把真实 OAuth token 复制进沙箱；沙箱只用本地自造的虚拟令牌。
+4. 绝不用改过的环境去起真实实例；真实端口 8765，沙箱一律独立 HOME+端口+data-dir。
+5. 测试默认不碰 Science；整链冒烟须用户明确同意、且在场（碰 Science 的手测）。
 
 ## 命名规范
 
@@ -89,7 +90,7 @@ cd desktop/src-tauri && cargo test          # Rust 后端单测；配 cargo clip
 node --check desktop/src/main.js            # 前端语法（不加 node 测试依赖，前端逻辑预览手验）
 ```
 
-## 整链冒烟（碰 Science，须用户同意 + 在场，守铁律 2/3/4）
+## 整链冒烟（碰 Science，须用户同意 + 在场，守沙箱隔离、凭证隔离和端口隔离）
 
 不必驱动 GUI，直接跑 app 编排的同一条链（独立 HOME + 端口 + data-dir，绝不碰 8765）：
 ```bash

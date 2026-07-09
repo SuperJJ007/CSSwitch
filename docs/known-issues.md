@@ -118,7 +118,7 @@
 - **代理移 Rust（独立轨道）**：翻译代理从 python 移到 Rust（axum），**vendor cc-switch 的 MIT `transform*.rs`** 拿广覆盖（4 种 apiFormat），加我们的 path-secret + 虚拟 OAuth 剥离。cc-switch 代理**不能当 sidecar 直接复用**（焊死它的 SQLite DB，见 `verified-facts.md` 事实 6），复用 = 移植它的翻译模块。这条同时完成 python-ectomy 治本，与「多 profile 配置」解耦。
 - **relay-presets 分支现状**：`feat/relay-presets`（Task1-13 全实现 + opus 终审过）实现了 relay provider + 预设 + 面板选模型，但用**固定槽 + python 代理**，**降为参考/回退，不作为发布基座**（重架后被多 profile + Rust 代理取代）。HEAD `2a5084f`（f148eb2 + P3 hygiene 修）**clippy-green**。GPT 外审逐条核实：P1「保存写错槽+覆盖」= 尖端已修（STALE）；P1b「保存非原子」+ P2a「自愈忽略停沙箱失败 `lib.rs:967`」= 真 Important、折进重架设计（P2a 应像 `set_mode` 停失败即中止）；P2b「python 代理 OSError 全当占用」= 真但代理要换掉；P3「clippy 2 处 + 版本不一致」= 已修（`2a5084f`）。**教训**：验收闸门要含 `cargo clippy --all-targets -D warnings`（比 `cargo test` 的 rustc 警告更严；账本旧称「0 warnings」漏了 clippy）。
 - **隔离层四家实测证据**：`findings/2026-07-03-pr4-relay-provider-testing.md`（GLM/小米/硅基流动/OpenRouter 真机实测，含工具，守铁律4 未启 Science），已随 `c8b9cfe` 提交。
-- **下一步**：① **用户在场做真机整链手测**（构建 + 启动 app，逐项过：迁移后旧对话在不在 / 新建 / 切换 / 一键开始 / 连接编辑 / 清 key / 删除；起沙箱 Science + 登录那步由用户手动，守铁律 2/3/4）；② 过了再谈 merge（现未 push、main 未动）+ 更新 `CHANGELOG.md`（**故意还没写**，避免仓库里提前显「已完成」）；③ 轨道 2 = 代理移 Rust（另起 spec）。spec/计划在 `docs/superpowers/`（gitignore）。
+- **下一步**：① **用户在场做真机整链手测**（构建 + 启动 app，逐项过：迁移后旧对话在不在 / 新建 / 切换 / 一键开始 / 连接编辑 / 清 key / 删除；起沙箱 Science + 登录那步由用户手动，守沙箱隔离、凭证隔离和端口隔离）；② 过了再谈 merge（现未 push、main 未动）+ 更新 `CHANGELOG.md`（**故意还没写**，避免仓库里提前显「已完成」）；③ 轨道 2 = 代理移 Rust（另起 spec）。spec/计划在 `docs/superpowers/`（gitignore）。
 
 ---
 

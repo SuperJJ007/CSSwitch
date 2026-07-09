@@ -123,9 +123,10 @@ Status lights are local observations only. For example, the sandbox light is loc
 
 ## How it protects your real account
 
-CSSwitch's core boundary is simple: third-party model mode only operates inside the sandbox. It does not take over your real Claude account.
+CSSwitch's core boundary is simple: third-party model mode keeps credentials, data directories, and proxy routing inside the sandbox. It does not take over your real Claude account.
 
-- It does not copy, read, or modify your real `~/.claude-science`.
+- It does not copy, read, or modify real Claude login credentials, OAuth tokens, account state, or user data.
+- On first sandbox initialization, it may read-only clone Science runtime assets from the real `~/.claude-science` path, such as `bin`, `conda`, `runtime`, and `seed-assets`; these are not account credentials or conversation data.
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
 - Keys are passed to the local proxy through environment variables, not command-line arguments or logs.

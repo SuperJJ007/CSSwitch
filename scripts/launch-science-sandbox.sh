@@ -2,8 +2,8 @@
 # 启动一个【隔离、无登录】的 Claude Science 沙箱，推理指向本项目翻译代理。
 #
 # 铁律保障（见 CLAUDE.md）:
-#   - 独立 HOME + 独立 data-dir + 独立端口，绝不碰真实 ~/.claude-science 与端口 8765
-#   - 只 APFS 克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何登录凭证
+#   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
+#   - 只从真实 ~/.claude-science 只读 APFS 克隆运行时资产（bin/conda/runtime/seed-assets），绝不复制任何登录凭证
 #     （.oauth-tokens / encryption.key / active-org.json / orgs / .key-backups）
 #   - 因此沙箱启动即【未登录】。要推理需在沙箱里【全新独立登录】（对真实登录零影响）
 #
