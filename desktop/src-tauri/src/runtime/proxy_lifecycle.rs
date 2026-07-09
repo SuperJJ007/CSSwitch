@@ -64,18 +64,31 @@ fn find_gateway_in(dir: &Path) -> Option<PathBuf> {
 }
 
 fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os("CSSWITCH_GATEWAY_BIN") {
-        let path = PathBuf::from(raw);
+    gateway_bin_path_from(
+        std::env::var_os("CSSWITCH_GATEWAY_BIN").map(PathBuf::from),
+        std::env::current_exe().ok(),
+        app.path().resource_dir().ok(),
+        repo_root(),
+    )
+}
+
+fn gateway_bin_path_from(
+    env_bin: Option<PathBuf>,
+    current_exe: Option<PathBuf>,
+    resource_dir: Option<PathBuf>,
+    repo_root: Option<PathBuf>,
+) -> Option<PathBuf> {
+    if let Some(path) = env_bin {
         if path.is_file() {
             return Some(path);
         }
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = current_exe {
         if let Some(dir) = exe.parent().and_then(find_gateway_in) {
             return Some(dir);
         }
     }
-    if let Ok(res) = app.path().resource_dir() {
+    if let Some(res) = resource_dir {
         if let Some(path) = find_gateway_in(&res) {
             return Some(path);
         }
@@ -83,7 +96,7 @@ fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
             return Some(path);
         }
     }
-    if let Some(root) = repo_root() {
+    if let Some(root) = repo_root {
         for dir in [
             root.join("desktop/gateway/target/release"),
             root.join("desktop/gateway/target/debug"),
@@ -280,7 +293,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_gateway_in, formal_proxy_env};
+    use super::{find_gateway_in, formal_proxy_env, gateway_bin_path_from};
     use crate::runtime::provider::ProxyLaunch;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -352,14 +365,7 @@ mod tests {
 
     #[test]
     fn find_gateway_in_accepts_plain_or_tauri_suffixed_binary() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "csswitch-gateway-find-test-{}-{unique}",
-            std::process::id()
-        ));
+        let dir = temp_dir("find-test");
         fs::create_dir_all(&dir).unwrap();
         let name = if cfg!(windows) {
             "csswitch-gateway-aarch64-pc-windows-msvc.exe"
@@ -371,5 +377,102 @@ mod tests {
         assert_eq!(find_gateway_in(&dir), Some(path.clone()));
         let _ = fs::remove_file(path);
         let _ = fs::remove_dir(dir);
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "csswitch-gateway-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn sidecar_name() -> &'static str {
+        if cfg!(windows) {
+            "csswitch-gateway-aarch64-pc-windows-msvc.exe"
+        } else {
+            "csswitch-gateway-aarch64-apple-darwin"
+        }
+    }
+
+    fn write_marker(path: &std::path::Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"bin").unwrap();
+    }
+
+    #[test]
+    fn gateway_lookup_prefers_explicit_env_binary() {
+        let dir = temp_dir("env-override");
+        let env_bin = dir.join("custom-gateway");
+        write_marker(&env_bin);
+        let found = gateway_bin_path_from(Some(env_bin.clone()), None, None, None);
+        assert_eq!(found, Some(env_bin.clone()));
+        let _ = fs::remove_file(env_bin);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gateway_lookup_finds_packaged_resource_sidecar_layouts() {
+        let dir = temp_dir("packaged-resource");
+        let direct = dir.join(sidecar_name());
+        write_marker(&direct);
+        assert_eq!(
+            gateway_bin_path_from(None, None, Some(dir.clone()), None),
+            Some(direct.clone())
+        );
+        fs::remove_file(&direct).unwrap();
+
+        let nested = dir.join("binaries").join(sidecar_name());
+        write_marker(&nested);
+        assert_eq!(
+            gateway_bin_path_from(None, None, Some(dir.clone()), None),
+            Some(nested.clone())
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn gateway_lookup_finds_dev_repo_and_staged_sidecar_layouts() {
+        let root = temp_dir("dev-repo");
+        let debug = root
+            .join("desktop/gateway/target/debug")
+            .join(if cfg!(windows) {
+                "csswitch-gateway.exe"
+            } else {
+                "csswitch-gateway"
+            });
+        write_marker(&debug);
+        assert_eq!(
+            gateway_bin_path_from(None, None, None, Some(root.clone())),
+            Some(debug.clone())
+        );
+        fs::remove_file(&debug).unwrap();
+
+        let staged = root.join("desktop/src-tauri/binaries").join(sidecar_name());
+        write_marker(&staged);
+        assert_eq!(
+            gateway_bin_path_from(None, None, None, Some(root.clone())),
+            Some(staged.clone())
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn build_rs_stages_executable_sidecar_for_tauri_external_bin() {
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let staged_dir = manifest_dir.join("binaries");
+        let staged = find_gateway_in(&staged_dir)
+            .unwrap_or_else(|| panic!("missing staged sidecar in {}", staged_dir.display()));
+        let name = staged.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(name.starts_with("csswitch-gateway-"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&staged).unwrap().permissions().mode();
+            assert_ne!(mode & 0o111, 0, "{} is not executable", staged.display());
+        }
     }
 }
