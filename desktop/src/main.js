@@ -121,6 +121,7 @@ let statusTimer = null;
 let busy = false;
 let busyOp = null;
 let busyMsgTimers = [];
+let statusRecoveryMsg = "";
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
 let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990 };
@@ -187,6 +188,7 @@ const MODEL_HINT = {
   follow: "留空＝跟随 Science 选择器（保留 opus/haiku 各档）；选一个＝固定用于所有请求。",
   fixed: "该来源需选一个模型（不认 claude-*，将用于所有请求含后台任务）。",
 };
+const PROXY_UNHEALTHY_MSG = "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。";
 
 // 据能力渲染模型字段。native：只读信息 + 隐藏下拉/获取按钮，但把既有 model 留在隐藏下拉里
 // （避免保存时被空值覆盖，守「零运行语义变化」）；relay：走下拉。
@@ -234,6 +236,28 @@ function setMsg(text, kind) {
 function setLight(el, s) {
   const cls = { green: "g", amber: "a", red: "r" }[s] || "a";
   el.className = "lt " + cls;
+}
+
+function proxyRecoveryMessage(status) {
+  const err = status && status.last_error;
+  if (err && err.type === "proxy_unhealthy") return err.message || PROXY_UNHEALTHY_MSG;
+  return "";
+}
+
+function setStatusRecoveryMsg(text) {
+  if (busy) return;
+  const current = els.msg.textContent || "";
+  if (text) {
+    if (!current || current === statusRecoveryMsg) {
+      setMsg(text, "err");
+      statusRecoveryMsg = text;
+    }
+    return;
+  }
+  if (statusRecoveryMsg && current === statusRecoveryMsg) {
+    setMsg("");
+  }
+  statusRecoveryMsg = "";
 }
 
 function clearBusyMsgTimers() {
@@ -1040,6 +1064,7 @@ async function refreshStatus() {
     setLight(els.ltSandbox, s.sandbox);
     setLight(els.ltUpstream, s.upstream);
     els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
+    setStatusRecoveryMsg(proxyRecoveryMessage(s));
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
   }

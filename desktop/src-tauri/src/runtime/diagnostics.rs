@@ -62,6 +62,22 @@ pub(crate) fn science_diagnostics(input: ScienceDiagnosticsInput) -> serde_json:
     })
 }
 
+pub(crate) fn proxy_status_last_error(
+    secret_present: bool,
+    proxy_ok: bool,
+    proxy_port: u16,
+) -> Option<serde_json::Value> {
+    if secret_present && !proxy_ok {
+        Some(json!({
+            "type": "proxy_unhealthy",
+            "message": "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。",
+            "port": proxy_port,
+        }))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn build_status_response(
     lights: StatusLights,
     active_profile: serde_json::Value,
@@ -89,8 +105,8 @@ pub(crate) fn build_status_response(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_status_response, science_diagnostics, status_lights, ScienceDiagnosticsInput,
-        StatusProbeInput,
+        build_status_response, proxy_status_last_error, science_diagnostics, status_lights,
+        ScienceDiagnosticsInput, StatusProbeInput,
     };
     use serde_json::json;
 
@@ -186,5 +202,44 @@ mod tests {
         );
         assert_eq!(v["last_error"]["type"], "config_error");
         assert_eq!(v["last_error"]["message"], "config unreadable");
+    }
+
+    #[test]
+    fn proxy_status_last_error_only_when_secreted_proxy_is_unhealthy() {
+        assert!(proxy_status_last_error(false, false, 18991).is_none());
+        assert!(proxy_status_last_error(true, true, 18991).is_none());
+
+        let err = proxy_status_last_error(true, false, 18991).unwrap();
+        assert_eq!(err["type"], "proxy_unhealthy");
+        assert_eq!(err["port"], 18991);
+        assert!(
+            err["message"].as_str().unwrap().contains("代理进程不可达"),
+            "should not imply an API key failure: {err}"
+        );
+    }
+
+    #[test]
+    fn status_response_can_surface_proxy_unhealthy_last_error() {
+        let v = build_status_response(
+            status_lights(StatusProbeInput {
+                proxy_ok: false,
+                sandbox_ok: true,
+                upstream_ok: true,
+            }),
+            serde_json::Value::Null,
+            "python",
+            "off",
+            json!({"schema_version": 1}),
+            science_diagnostics(ScienceDiagnosticsInput {
+                sandbox_port: 8990,
+                sandbox_ok: true,
+            }),
+            proxy_status_last_error(true, false, 18991),
+        );
+        assert_eq!(v["proxy"], "amber");
+        assert_eq!(v["sandbox"], "green");
+        assert_eq!(v["upstream"], "green");
+        assert_eq!(v["last_error"]["type"], "proxy_unhealthy");
+        assert_eq!(v["last_error"]["port"], 18991);
     }
 }
