@@ -7,11 +7,10 @@ use crate::runtime::provider::{
     reject_openai_custom_anthropic_base, relay_missing_model, should_scratch_candidate,
 };
 use crate::runtime::proxy_lifecycle::start_proxy_for;
-use crate::runtime::system::asset_root;
 use crate::runtime::transaction::{
     decide_switch, rollback_status_clause, skip_scratch_verify, SwitchOutcome,
 };
-use crate::{config, lifecycle, proc, scratch, SharedAppState};
+use crate::{config, lifecycle, scratch, SharedAppState};
 
 /// Validate a non-active candidate without touching config, AppState, or the active proxy.
 pub(crate) fn scratch_validate_candidate(
@@ -30,12 +29,9 @@ pub(crate) fn scratch_validate_candidate(
         trace.finish("skipped reason=missing_key_or_base");
         return Ok(false);
     }
-    let root = asset_root(app).ok_or("找不到代理脚本 proxy/csswitch_proxy.py。")?;
-    let py = proc::find_exe("python3").ok_or("缺少依赖 python3（起临时代理需要）。")?;
-    let script = root.join("proxy/csswitch_proxy.py");
+    let backend = scratch::backend_for_app(app, &launch.adapter)?;
     let res = scratch::scratch_probe(
-        &py,
-        &script,
+        &backend,
         &scratch::ScratchTarget {
             provider: &launch.adapter,
             key_env: launch.key_env,
@@ -111,12 +107,9 @@ pub(crate) fn set_active_profile_txn(
         trace.stage(OperationStage::ScratchUpstreamProbe, "skipped_by_user");
         true
     } else {
-        let root = asset_root(app).ok_or("找不到代理脚本 proxy/csswitch_proxy.py。")?;
-        let py = proc::find_exe("python3").ok_or("缺少依赖 python3（起临时代理需要）。")?;
-        let script = root.join("proxy/csswitch_proxy.py");
+        let backend = scratch::backend_for_app(app, &launch.adapter)?;
         let res = scratch::scratch_probe(
-            &py,
-            &script,
+            &backend,
             &scratch::ScratchTarget {
                 provider: &launch.adapter,
                 key_env: launch.key_env,

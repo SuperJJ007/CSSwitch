@@ -11,18 +11,16 @@ DOCTOR="$ROOT/scripts/doctor.sh"
 VERIFY="$ROOT/scripts/verify-proxy.sh"
 SELFTEST="$ROOT/scripts/self-test.sh"
 CLEAN="$ROOT/scripts/clean-bundle-resources.sh"
-PROXY="$ROOT/proxy/csswitch_proxy.py"
+GATEWAY="$ROOT/desktop/gateway/target/debug/csswitch-gateway"
 T="$(mktemp -d)"
 cleanup_bundle_test_artifacts() {
-  rm -f "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc" "$ROOT/scripts/csswitch-clean-test.pyc"
-  rm -f "$ROOT/proxy/csswitch-clean-test.pyo" "$ROOT/scripts/csswitch-clean-test.pyo"
-  rmdir "$ROOT/proxy/__pycache__" 2>/dev/null || true
+  rm -f "$ROOT/scripts/csswitch-clean-test.pyc" "$ROOT/scripts/csswitch-clean-test.pyo"
 }
 trap cleanup_bundle_test_artifacts EXIT
 
 # ---------- doctor ----------
 # 正常：依赖齐全（本机有 python3/node），config 指向不存在的临时路径 → 退出 0
-out="$(CSSWITCH_CONFIG="$T/nope.json" SCIENCE_BIN="$T/no-bin" "$DOCTOR" 2>&1)"; rc=$?
+out="$(CSSWITCH_GATEWAY_BIN="$GATEWAY" CSSWITCH_CONFIG="$T/nope.json" SCIENCE_BIN="$T/no-bin" "$DOCTOR" 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then ok "doctor exits 0 when deps present"; else no "doctor failed with deps present (rc=$rc): $out"; fi
 if echo "$out" | grep -q "$HOME/.claude-science"; then no "doctor default probed real HOME path"; else ok "doctor skips real HOME check by default"; fi
 REAL_HOME_TMP="$T/real-home-optin"; mkdir -p "$REAL_HOME_TMP/.claude-science"
@@ -86,8 +84,9 @@ else
 # 找一个空闲端口，起一个真代理（假 key，上游 URL 是假的但不会被 /health、/v1/models 触及）
 P="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 SEC="verify-test-secret"
-DEEPSEEK_API_KEY=fake CSSWITCH_UPSTREAM_URL="http://127.0.0.1:1/never" \
-  python3 "$PROXY" --provider deepseek --port "$P" --auth-token "$SEC" \
+DEEPSEEK_API_KEY=fake CSSWITCH_AUTH_TOKEN="$SEC" CSSWITCH_LAUNCH_ID=ops-test \
+  CSSWITCH_TOOLUSE_SHIM=off CSSWITCH_UPSTREAM_URL="http://127.0.0.1:1/never" \
+  "$GATEWAY" --provider deepseek --port "$P" \
   >/dev/null 2>&1 &
 PROXY_PID=$!
 # 等健康
@@ -115,16 +114,11 @@ if [ -x "$SELFTEST" ]; then ok "self-test.sh is executable"; else no "self-test.
 if grep -q "run_all.sh" "$SELFTEST"; then ok "self-test delegates to run_all.sh"; else no "self-test does not delegate to run_all.sh"; fi
 
 # ---------- bundle resource cleanup ----------
-mkdir -p "$ROOT/proxy/__pycache__"
-: > "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc"
 : > "$ROOT/scripts/csswitch-clean-test.pyc"
-: > "$ROOT/proxy/csswitch-clean-test.pyo"
 : > "$ROOT/scripts/csswitch-clean-test.pyo"
 out="$("$CLEAN" 2>&1)"; rc=$?
 if [ $rc -eq 0 ]; then ok "clean-bundle-resources exits 0"; else no "clean-bundle-resources failed (rc=$rc): $out"; fi
-if [ ! -e "$ROOT/proxy/__pycache__/csswitch-clean-test.pyc" ] \
-  && [ ! -e "$ROOT/scripts/csswitch-clean-test.pyc" ] \
-  && [ ! -e "$ROOT/proxy/csswitch-clean-test.pyo" ] \
+if [ ! -e "$ROOT/scripts/csswitch-clean-test.pyc" ] \
   && [ ! -e "$ROOT/scripts/csswitch-clean-test.pyo" ]; then
   ok "clean-bundle-resources removes pycache artifacts from bundled dirs"
 else

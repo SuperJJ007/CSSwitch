@@ -11,8 +11,10 @@
 html,body{margin:0;padding:0;background:transparent}
 body{
   font-family:-apple-system,BlinkMacSystemFont,"SF Pro Text","Helvetica Neue","NotoSerifCJK SC",sans-serif;
-  color:var(--ink);-webkit-user-select:none;user-select:none;
+  color:var(--ink);-webkit-user-select:text;user-select:text;
 }
+[data-tauri-drag-region],button,select,summary,.gear{
+  -webkit-user-select:none;user-select:none}
 .panel{width:100%;min-height:100vh;background:var(--panel);overflow:hidden}
 .hd{display:flex;align-items:center;justify-content:space-between;padding:12px 14px 10px}
 /* 模式分段切换（第三方 / 官方） */
@@ -38,7 +40,7 @@ body{
 .sec{padding:10px 14px;border-top:1px solid var(--line)}
 label{display:block;font-size:11px;color:var(--sub);margin:0 0 5px;letter-spacing:.02em}
 .row{display:flex;gap:8px;align-items:center}
-select,input,.pill{width:100%;height:32px;border:1px solid var(--line);background:var(--field);
+select,input,textarea,.pill{width:100%;height:32px;border:1px solid var(--line);background:var(--field);
   border-radius:9px;padding:0 10px;font-size:13px;color:var(--ink);outline:none;font-family:inherit;
   -webkit-user-select:text;user-select:text}
 select{appearance:none;cursor:pointer;

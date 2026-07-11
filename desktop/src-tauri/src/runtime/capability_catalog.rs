@@ -215,13 +215,6 @@ fn rule_summary(rule: &CatalogRule) -> Value {
 
 fn boundary_rule_ids() -> &'static [&'static str] {
     &[
-        "mcp.hosted-anthropic.hcls-boundary",
-        "mcp.streamable-http.external-bio",
-        "mcp.directory-connectors.virtual-login",
-        "skill.remote-official.virtual-login-boundary",
-        "science.version.0_1_15_dev.route-diff",
-        "science.auth.refresh-hardcoded-0_1_15",
-        "science.auth.virtual-oauth-scope-boundary",
         "transport.connect.anthropic-fastfail-401",
         "transport.connect.non-anthropic-direct-tunnel",
         "transport.http-proxy.not-set-by-default",
@@ -326,10 +319,10 @@ mod tests {
         assert!(active.contains(&"provider.kimi.relay-thinking-enabled".to_string()));
         assert!(!active.contains(&"tool.kimi.web_search.server-tool-filter".to_string()));
         assert!(!active.contains(&"tool.relay.input-schema-normalize".to_string()));
+        assert!(!active.contains(&"tool.siliconflow.forced-named-to-any".to_string()));
 
         let boundaries = ids(&v, "boundary_rules");
-        assert!(boundaries.contains(&"mcp.hosted-anthropic.hcls-boundary".to_string()));
-        assert!(boundaries.contains(&"science.auth.refresh-hardcoded-0_1_15".to_string()));
+        assert!(boundaries.contains(&"transport.connect.anthropic-fastfail-401".to_string()));
         assert!(boundaries.contains(&"transport.upstream-proxy.planned-for-http-mcp".to_string()));
     }
 
@@ -339,12 +332,27 @@ mod tests {
             template_id: "custom-openai-responses".into(),
             api_format: "openai_responses".into(),
             base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1".into(),
-            model: "qwen-max".into(),
+            model: "qwen3.7-max".into(),
             ..Default::default()
         };
         let v = diagnostics_for_profile(Some(&p), "off");
         let active = ids(&v, "active_rules");
         assert!(!active.contains(&"provider.dashscope.responses-tools-cap".to_string()));
         assert!(!active.contains(&"tool.dashscope.responses.web_search-drop".to_string()));
+    }
+
+    #[test]
+    fn siliconflow_request_shape_rule_stays_out_of_runtime_active_rules() {
+        let p = Profile {
+            template_id: "siliconflow".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://api.siliconflow.cn".into(),
+            model: "deepseek-ai/DeepSeek-V4-Pro".into(),
+            ..Default::default()
+        };
+        let v = diagnostics_for_profile(Some(&p), "off");
+        let active = ids(&v, "active_rules");
+        assert!(active.contains(&"provider.relay.force-model-shell".to_string()));
+        assert!(!active.contains(&"tool.siliconflow.forced-named-to-any".to_string()));
     }
 }

@@ -15,7 +15,7 @@ blocked=0
 cargo fmt --check || fail=1
 cargo clippy --all-targets -- -D warnings || fail=1
 # 端口 bind 测试名单（Step 1 定位于 scratch.rs；无 loopback 时 skip 并标 env-blocked）
-PORT_TESTS="pick_scratch_port_returns_usable_nonreserved_port two_picks_are_bindable"
+PORT_TESTS="pick_scratch_port_returns_usable_nonreserved_port two_picks_are_bindable loopback_port_occupancy_probe_detects_listener_without_http"
 if [ "$(python3 "$ROOT/test/_capability.py")" = "1" ]; then
   cargo test || fail=1
 else

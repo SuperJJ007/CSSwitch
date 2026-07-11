@@ -8,7 +8,7 @@ pub struct Template {
     pub name: &'static str,
     pub category: &'static str,   // official | cn_official | custom
     pub api_format: &'static str, // anthropic | openai_chat | openai_responses | gemini_native
-    pub adapter: &'static str, // 运行行为 → python 代理 --provider：deepseek | qwen | relay | openai-custom | openai-responses
+    pub adapter: &'static str, // Rust gateway provider：deepseek | qwen | relay | openai-custom | openai-responses
     pub base_url: &'static str, // 默认；空=用户填
     pub base_url_editable: bool,
     pub requires_model_override: bool,
@@ -174,7 +174,7 @@ static TEMPLATES: &[Template] = &[
         base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         base_url_editable: false,
         requires_model_override: false,
-        builtin_models: &["qwen-max", "qwen-plus", "qwen-turbo"],
+        builtin_models: &["qwen3.7-max", "qwen-plus-latest", "qwen-turbo"],
         website_url: "https://dashscope.aliyun.com",
         icon: "qwen",
         icon_color: "#615CED",
@@ -405,7 +405,7 @@ mod tests {
                 "{id} 的 base_url 应可编辑"
             );
         }
-        // native adapter（deepseek/qwen）上游 URL 在 python 代理里硬编码，运行时不吃自定义
+        // native adapter（deepseek/qwen）上游 URL 在 gateway 中固定，运行时不吃自定义
         // base_url，故保持只读，避免「能填但不生效」的假象。
         for id in ["deepseek", "qwen"] {
             assert!(

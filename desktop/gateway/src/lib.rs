@@ -1,7 +1,11 @@
+pub mod anthropic_compat;
 pub mod auth;
 pub mod config;
 pub mod connect;
+pub mod dsml_shim;
 pub mod messages;
 pub mod models;
+pub mod openai_chat;
+pub mod openai_responses;
 pub mod policy;
 pub mod server;

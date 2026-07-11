@@ -6,11 +6,11 @@ use tauri::{Manager, Runtime};
 
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
-    assert_format_supported, current_shim_mode_for_adapter, gateway_kind_for_adapter,
-    is_native_adapter, is_openai_adapter, proxy_args_for, proxy_fingerprint, ProxyLaunch,
+    assert_format_supported, current_shim_mode_for_adapter, is_native_adapter, is_openai_adapter,
+    normalize_shim_mode, proxy_args_for, proxy_fingerprint_with_runtime, ProxyLaunch,
 };
-use crate::runtime::proxy::{ere_escape, health_timeout_reason, should_write_back, ProxyAction};
-use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
+use crate::runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
+use crate::runtime::system::{log_path, open_log, redact, repo_root, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
 fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
@@ -38,6 +38,31 @@ fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
     env
 }
 
+pub(crate) fn configure_managed_proxy_command(
+    cmd: &mut Command,
+    provider: &str,
+    shim_mode: &str,
+    port: u16,
+    secret: &str,
+    launch_id: &str,
+) {
+    let shim_mode = normalize_shim_mode(provider, Some(shim_mode));
+    cmd.arg("--provider")
+        .arg(provider)
+        .arg("--port")
+        .arg(port.to_string())
+        .env("CSSWITCH_AUTH_TOKEN", secret)
+        .env("CSSWITCH_LAUNCH_ID", launch_id)
+        .env("CSSWITCH_TOOLUSE_SHIM", shim_mode);
+    // CSSWITCH_UPSTREAM_URL is a native-provider test/diagnostic override. A stale
+    // value inherited from the desktop process must never replace a candidate relay
+    // or custom OpenAI base URL (or receive that candidate's key). Apply this at the
+    // Shared command boundary keeps formal and scratch Rust launches aligned.
+    if !is_native_adapter(provider) {
+        cmd.env_remove("CSSWITCH_UPSTREAM_URL");
+    }
+}
+
 fn find_gateway_in(dir: &Path) -> Option<PathBuf> {
     let exact = dir.join(if cfg!(windows) {
         "csswitch-gateway.exe"
@@ -63,7 +88,7 @@ fn find_gateway_in(dir: &Path) -> Option<PathBuf> {
     None
 }
 
-fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
+pub(crate) fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
     gateway_bin_path_from(
         std::env::var_os("CSSWITCH_GATEWAY_BIN").map(PathBuf::from),
         std::env::current_exe().ok(),
@@ -79,9 +104,7 @@ fn gateway_bin_path_from(
     repo_root: Option<PathBuf>,
 ) -> Option<PathBuf> {
     if let Some(path) = env_bin {
-        if path.is_file() {
-            return Some(path);
-        }
+        return explicit_gateway_bin_is_safe(&path).then_some(path);
     }
     if let Some(exe) = current_exe {
         if let Some(dir) = exe.parent().and_then(find_gateway_in) {
@@ -110,12 +133,34 @@ fn gateway_bin_path_from(
     None
 }
 
-fn stop_packaged_python_proxy_on_port<R: Runtime>(app: &tauri::AppHandle<R>, port: u16) {
-    if let Some(root) = asset_root(app) {
-        let script = root.join("proxy/csswitch_proxy.py");
-        let pat = format!("{}.*--port {port}", ere_escape(&script.to_string_lossy()));
-        let _ = Command::new("pkill").arg("-f").arg(&pat).status();
+fn explicit_gateway_bin_is_safe(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
     }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        let Ok(metadata) = std::fs::symlink_metadata(&current) else {
+            return false;
+        };
+        if metadata.file_type().is_symlink() {
+            return false;
+        }
+    }
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return false;
+        }
+    }
+    true
 }
 
 /// Ensure the active profile's proxy is running and healthy.
@@ -158,9 +203,9 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         );
     }
 
-    let gateway_kind = gateway_kind_for_adapter(&launch.adapter);
     let shim_mode = current_shim_mode_for_adapter(&launch.adapter);
-    let key_fp = proxy_fingerprint(profile, &launch);
+    let gateway_kind = "rust";
+    let key_fp = proxy_fingerprint_with_runtime(profile, &launch, gateway_kind, shim_mode);
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
     let port = cfg.proxy_port;
@@ -176,9 +221,10 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
     let gen = lifecycle.current_generation();
 
-    let child = {
+    let (mut child, launch_id) = {
         let mut st = lock(state);
-        if st.proxy.is_some()
+        let tracked_child_running = proc::tracked_child_is_running(&mut st.proxy);
+        if tracked_child_running
             && st.proxy_port == port
             && st.provider == launch.adapter
             && st.gateway_kind == gateway_kind
@@ -189,6 +235,9 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 Some(&st.secret),
                 operation::PROXY_REUSE_HEALTH_TIMEOUT_MS,
                 gateway_kind,
+                Some(&launch.adapter),
+                Some(st.shim_mode.as_str()),
+                Some(st.launch_id.as_str()),
             )
         {
             if let Some(t) = trace {
@@ -204,6 +253,11 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         }
 
         st.stop_proxy();
+        if proc::loopback_port_in_use(port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
+            return Err(format!(
+                "端口 {port} 已被未知或旧 listener 占用；为避免发送鉴权信息或接管/结束非本轮进程，已拒绝启动。请手工确认后改用空闲端口。"
+            ));
+        }
         st.secret = secret.clone();
 
         let logf = open_log("proxy.log").map_err(|e| format!("建日志失败：{e}"))?;
@@ -217,55 +271,57 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 ),
             );
         }
-        stop_packaged_python_proxy_on_port(app, port);
-        let mut cmd = if gateway_kind == "rust" {
-            let bin = gateway_bin_path(app)
-                .ok_or("找不到 csswitch-gateway 二进制；请先构建 desktop/gateway，或设置 CSSWITCH_GATEWAY_BIN。")?;
-            let mut cmd = Command::new(bin);
-            cmd.arg("--provider")
-                .arg("deepseek")
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--auth-token")
-                .arg(&secret)
-                .env(launch.key_env, &launch.key);
-            cmd
-        } else {
-            let root = asset_root(app)
-                .ok_or("找不到代理脚本 proxy/csswitch_proxy.py（打包资源或仓库根均未命中）。开发态可设 CSSWITCH_REPO。")?;
-            let py = proc::find_exe("python3")
-                .ok_or("缺少依赖 python3（起翻译代理需要）。已查 PATH、常见目录与登录 shell 仍未找到；macOS 一般自带 /usr/bin/python3（装 Xcode 命令行工具：xcode-select --install）。")?;
-            let script = root.join("proxy/csswitch_proxy.py");
-            let mut cmd = Command::new(&py);
-            cmd.arg(&script)
-                .arg("--provider")
-                .arg(&launch.adapter)
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--auth-token")
-                .arg(&secret);
-            for (k, v) in formal_proxy_env(&launch) {
-                cmd.env(k, v);
-            }
-            cmd
-        };
-        if gateway_kind == "rust" {
-            cmd.env("CSSWITCH_AUTH_TOKEN", &secret);
+        let launch_id =
+            proc::gen_secret().map_err(|e| format!("无法生成 gateway launch_id：{e}"))?;
+        let bin = gateway_bin_path(app)
+            .ok_or("找不到 csswitch-gateway 二进制；请重新安装完整应用，开发态可设置绝对 CSSWITCH_GATEWAY_BIN。")?;
+        let mut cmd = Command::new(bin);
+        configure_managed_proxy_command(
+            &mut cmd,
+            &launch.adapter,
+            shim_mode,
+            port,
+            &secret,
+            &launch_id,
+        );
+        for (k, v) in formal_proxy_env(&launch) {
+            cmd.env(k, v);
         }
-        cmd.stdout(Stdio::from(logf))
+        let child = cmd
+            .stdout(Stdio::from(logf))
             .stderr(Stdio::from(logf2))
             .spawn()
-            .map_err(|e| format!("启动代理失败：{e}"))?
+            .map_err(|e| format!("启动代理失败：{e}"))?;
+        (child, launch_id)
     };
 
     let mut ok = false;
+    let mut early_exit = None;
     for _ in 0..(operation::PROXY_HEALTH_BUDGET_MS / POLL_INTERVAL_MS) {
         std::thread::sleep(Duration::from_millis(POLL_INTERVAL_MS));
+        match proc::poll_child_liveness(&mut child) {
+            proc::ChildLiveness::Exited(status) => {
+                early_exit = Some(format!(
+                    "新启动的 {gateway_kind} gateway 提前退出（{status}）"
+                ));
+                break;
+            }
+            proc::ChildLiveness::Running => {}
+            proc::ChildLiveness::Unknown(error) => {
+                early_exit = Some(format!(
+                    "无法确认新启动的 {gateway_kind} gateway 是否存活：{error}"
+                ));
+                break;
+            }
+        }
         if proc::http_health_gateway(
             port,
             Some(&secret),
             operation::LOCAL_HEALTH_TIMEOUT_MS,
             gateway_kind,
+            Some(&launch.adapter),
+            Some(shim_mode),
+            Some(&launch_id),
         ) {
             ok = true;
             break;
@@ -278,11 +334,26 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         );
     }
     if !ok {
-        let mut c = child;
-        let _ = c.kill();
-        let _ = c.wait();
+        let _ = child.kill();
+        let _ = child.wait();
         let tail = redact(&tail_file(&log_path("proxy.log"), 500), &secret);
-        return Err(format!("{}\n{tail}", health_timeout_reason(port, &tail)));
+        // Never authenticate to an unowned listener during failure diagnosis.
+        // A bare TCP connect carries no path secret and is enough to report the
+        // occupied-port class while leaving the unknown process untouched.
+        let listener = if proc::loopback_port_in_use(port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
+            format!("端口 {port} 仍有未知或旧 listener；未发送鉴权信息、未接管且未结束该进程。")
+        } else {
+            String::new()
+        };
+        let primary = early_exit.unwrap_or_else(|| health_timeout_reason(port, &tail));
+        let mut details = vec![primary];
+        if !listener.is_empty() {
+            details.push(listener);
+        }
+        if !tail.is_empty() {
+            details.push(tail);
+        }
+        return Err(details.join("\n"));
     }
 
     {
@@ -293,12 +364,21 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             let _ = c.wait();
             return Err("代理启动期间配置已变更（被更晚的操作取代），本次启动未生效。".into());
         }
+        if let Err(error) = proc::require_child_running(
+            &mut child,
+            &format!("新启动的 {gateway_kind} gateway 在发布 AppState 前"),
+        ) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         st.proxy = Some(child);
         st.proxy_port = port;
         st.secret = secret.clone();
         st.provider = launch.adapter.clone();
         st.gateway_kind = gateway_kind.to_string();
         st.shim_mode = shim_mode.to_string();
+        st.launch_id = launch_id;
         st.key_fp = key_fp;
     }
     Ok((port, secret, ProxyAction::Restarted))
@@ -306,9 +386,12 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{find_gateway_in, formal_proxy_env, gateway_bin_path_from};
+    use super::{
+        configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
+    };
     use crate::runtime::provider::ProxyLaunch;
     use std::fs;
+    use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn launch(adapter: &str, model: &str) -> ProxyLaunch {
@@ -342,6 +425,73 @@ mod tests {
             "https://upstream.example/api".to_string()
         )));
         assert!(env.contains(&("CSSWITCH_RELAY_MODEL", "glm-5.2".to_string())));
+    }
+
+    #[test]
+    fn managed_proxy_command_keeps_secret_out_of_argv_and_injects_canonical_shim() {
+        let fake_secret = "fake-managed-secret";
+        for (provider, raw_shim, expected_shim, removes_upstream) in [
+            ("deepseek", " Rewrite ", "rewrite", false),
+            ("deepseek", "DETECT", "detect", false),
+            ("qwen", " Rewrite ", "off", false),
+            ("qwen", "off", "off", false),
+            ("openai-custom", "DETECT", "off", true),
+            ("openai-custom", "off", "off", true),
+            ("openai-responses", "rewrite", "off", true),
+            ("openai-responses", "off", "off", true),
+            ("relay", "rewrite", "off", true),
+            ("relay", "off", "off", true),
+        ] {
+            let mut cmd = Command::new("csswitch-gateway");
+            configure_managed_proxy_command(
+                &mut cmd,
+                provider,
+                raw_shim,
+                18991,
+                fake_secret,
+                "fake-launch-id",
+            );
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            assert!(!args.iter().any(|arg| arg == "--auth-token"));
+            assert!(!args.iter().any(|arg| arg == fake_secret));
+            assert!(cmd.get_envs().any(|(key, value)| {
+                key == "CSSWITCH_AUTH_TOKEN"
+                    && value
+                        .map(|value| value.to_string_lossy() == fake_secret)
+                        .unwrap_or(false)
+            }));
+            assert!(cmd.get_envs().any(|(key, value)| {
+                key == "CSSWITCH_TOOLUSE_SHIM"
+                    && value
+                        .map(|value| value.to_string_lossy() == expected_shim)
+                        .unwrap_or(false)
+            }));
+            assert!(cmd.get_envs().any(|(key, value)| {
+                key == "CSSWITCH_LAUNCH_ID"
+                    && value
+                        .map(|value| value.to_string_lossy() == "fake-launch-id")
+                        .unwrap_or(false)
+            }));
+            let upstream_override = cmd
+                .get_envs()
+                .find(|(key, _)| *key == "CSSWITCH_UPSTREAM_URL")
+                .map(|(_, value)| value);
+            if removes_upstream {
+                assert_eq!(
+                    upstream_override,
+                    Some(None),
+                    "{provider} must remove inherited CSSWITCH_UPSTREAM_URL"
+                );
+            } else {
+                assert_eq!(
+                    upstream_override, None,
+                    "native provider {provider} must preserve the explicit override contract"
+                );
+            }
+        }
     }
 
     #[test]
@@ -414,6 +564,11 @@ mod tests {
     fn write_marker(path: &std::path::Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"bin").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
     }
 
     #[test]
@@ -421,9 +576,54 @@ mod tests {
         let dir = temp_dir("env-override");
         let env_bin = dir.join("custom-gateway");
         write_marker(&env_bin);
-        let found = gateway_bin_path_from(Some(env_bin.clone()), None, None, None);
-        assert_eq!(found, Some(env_bin.clone()));
+        let canonical_env_bin = env_bin.canonicalize().unwrap();
+        let found = gateway_bin_path_from(Some(canonical_env_bin.clone()), None, None, None);
+        assert_eq!(found, Some(canonical_env_bin));
         let _ = fs::remove_file(env_bin);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn invalid_explicit_gateway_binary_fails_closed_without_fallback() {
+        let dir = temp_dir("invalid-env-override");
+        let fallback = dir.join(sidecar_name());
+        write_marker(&fallback);
+        assert_eq!(
+            gateway_bin_path_from(
+                Some(std::path::PathBuf::from("relative-gateway")),
+                None,
+                Some(dir.clone()),
+                None,
+            ),
+            None
+        );
+        assert_eq!(
+            gateway_bin_path_from(
+                Some(dir.join("missing-gateway")),
+                None,
+                Some(dir.clone()),
+                None,
+            ),
+            None
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_gateway_binary_rejects_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let dir = temp_dir("symlink-env-override");
+        let real_dir = dir.join("real");
+        let real_bin = real_dir.join("gateway");
+        write_marker(&real_bin);
+        let linked_dir = dir.join("linked");
+        symlink(&real_dir, &linked_dir).unwrap();
+        assert_eq!(
+            gateway_bin_path_from(Some(linked_dir.join("gateway")), None, None, None),
+            None
+        );
         let _ = fs::remove_dir_all(dir);
     }
 

@@ -8,13 +8,14 @@ use crate::config;
 
 const OPERATION_LOG_MAX_BYTES: u64 = 1_048_576;
 
-/// Locate the CSSwitch repository root containing `proxy/csswitch_proxy.py`.
+/// Locate the CSSwitch repository root containing the Rust gateway and scripts.
 /// Prefer `CSSWITCH_REPO`; otherwise walk upwards from the executable path.
 pub(crate) fn repo_root() -> Option<PathBuf> {
-    let marker = Path::new("proxy/csswitch_proxy.py");
+    let gateway_marker = Path::new("desktop/gateway/Cargo.toml");
+    let script_marker = Path::new("scripts/doctor.sh");
     if let Some(r) = std::env::var_os("CSSWITCH_REPO") {
         if let Ok(p) = std::fs::canonicalize(PathBuf::from(r)) {
-            if p.join(marker).is_file() {
+            if p.join(gateway_marker).is_file() && p.join(script_marker).is_file() {
                 return Some(p);
             }
         }
@@ -25,7 +26,7 @@ pub(crate) fn repo_root() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         let mut dir: Option<&Path> = exe.parent();
         while let Some(d) = dir {
-            if d.join(marker).is_file() {
+            if d.join(gateway_marker).is_file() && d.join(script_marker).is_file() {
                 return Some(d.to_path_buf());
             }
             dir = d.parent();
@@ -34,10 +35,10 @@ pub(crate) fn repo_root() -> Option<PathBuf> {
     None
 }
 
-/// Locate the asset root containing `proxy/` and `scripts/`.
+/// Locate the asset root containing packaged scripts.
 /// Packaged apps use `Contents/Resources`; dev builds fall back to repo root.
 pub(crate) fn asset_root<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<PathBuf> {
-    let marker = Path::new("proxy/csswitch_proxy.py");
+    let marker = Path::new("scripts/doctor.sh");
     if let Ok(res) = app.path().resource_dir() {
         if res.join(marker).is_file() {
             return Some(res);

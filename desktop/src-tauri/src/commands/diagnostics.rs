@@ -31,6 +31,9 @@ fn run_doctor_inner_cmd(app: tauri::AppHandle) -> Result<String, String> {
         .env("CSSWITCH_KEY_PRESENT", if has_key { "1" } else { "0" })
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
         .env("CSSWITCH_SANDBOX_PORT", cfg.sandbox_port.to_string());
+    if let Some(gateway) = crate::runtime::proxy_lifecycle::gateway_bin_path(&app) {
+        cmd.env("CSSWITCH_GATEWAY_BIN", gateway);
+    }
     let out = cmd.output().map_err(|e| e.to_string())?;
     let mut text = String::from_utf8_lossy(&out.stdout).to_string();
     let err = String::from_utf8_lossy(&out.stderr);

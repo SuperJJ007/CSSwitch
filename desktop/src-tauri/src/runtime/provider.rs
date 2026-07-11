@@ -8,7 +8,7 @@ pub(crate) fn key_fingerprint(s: &str) -> u64 {
     h.finish()
 }
 
-/// adapter -> 该 adapter 期望的 key 环境变量名（python 代理侧 PROVIDERS[...]["key_env"]）。
+/// adapter -> 该 adapter 期望的 key 环境变量名。
 pub(crate) fn key_env_for_adapter(adapter: &str) -> &'static str {
     match adapter {
         "deepseek" => "DEEPSEEK_API_KEY",
@@ -53,6 +53,7 @@ pub(crate) fn proxy_args_for(p: &config::Profile) -> ProxyLaunch {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn proxy_fingerprint(p: &config::Profile, launch: &ProxyLaunch) -> u64 {
     proxy_fingerprint_with_runtime(
         p,
@@ -68,6 +69,7 @@ pub(crate) fn proxy_fingerprint_with_runtime(
     gateway_kind: &str,
     shim_mode: &str,
 ) -> u64 {
+    let shim_mode = normalize_shim_mode(&launch.adapter, Some(shim_mode));
     key_fingerprint(&format!(
         "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         p.template_id,
@@ -82,12 +84,12 @@ pub(crate) fn proxy_fingerprint_with_runtime(
     ))
 }
 
-/// 本轨支持 anthropic / openai_chat / openai_responses；其余进 schema 但激活拒绝（待轨道 2：Rust 代理）。
+/// 当前支持 anthropic / openai_chat / openai_responses；其它 schema 值激活时失败关闭。
 pub(crate) fn assert_format_supported(p: &config::Profile) -> Result<(), String> {
     match p.api_format.as_str() {
         "anthropic" | "openai_chat" | "openai_responses" => Ok(()),
         other => Err(format!(
-            "api_format `{other}` 暂不支持（待 Rust 代理），请选 anthropic、openai_chat 或 openai_responses。"
+            "api_format `{other}` 暂不支持，请选 anthropic、openai_chat 或 openai_responses。"
         )),
     }
 }
@@ -108,7 +110,7 @@ pub(crate) fn reject_openai_custom_anthropic_base(
     }
 }
 
-/// deepseek/qwen 走各自固定官方端点（python 侧硬编码）；其余 = relay 家族，需带 base_url。
+/// deepseek/qwen 走各自固定官方端点；其余 = relay 家族，需带 base_url。
 pub(crate) fn is_native_adapter(adapter: &str) -> bool {
     adapter == "deepseek" || adapter == "qwen"
 }
@@ -117,34 +119,15 @@ pub(crate) fn is_openai_adapter(adapter: &str) -> bool {
     matches!(adapter, "openai-custom" | "openai-responses")
 }
 
-pub(crate) fn gateway_kind_for(
-    adapter: &str,
-    shim_mode: &str,
-    gateway_flag: Option<&str>,
-) -> &'static str {
-    let wants_rust = gateway_flag
-        .map(|v| v.trim().eq_ignore_ascii_case("rust"))
-        .unwrap_or(false);
-    if wants_rust && adapter == "deepseek" && shim_mode == "off" {
-        "rust"
-    } else {
-        "python"
-    }
-}
-
-pub(crate) fn gateway_kind_for_adapter(adapter: &str) -> &'static str {
-    gateway_kind_for(
-        adapter,
-        current_shim_mode_for_adapter(adapter),
-        std::env::var("CSSWITCH_GATEWAY").ok().as_deref(),
-    )
+pub(crate) fn gateway_kind_for_adapter(_adapter: &str) -> &'static str {
+    "rust"
 }
 
 pub(crate) fn normalize_shim_mode(adapter: &str, raw: Option<&str>) -> &'static str {
     if adapter != "deepseek" {
         return "off";
     }
-    match raw.unwrap_or("").trim() {
+    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
         "detect" => "detect",
         "rewrite" => "rewrite",
         _ => "off",
@@ -179,6 +162,37 @@ pub(crate) fn upstream_endpoint(adapter: &str, base_url: &str) -> Option<Upstrea
     }
 }
 
+/// Status accepts the explicit diagnostic override for every adapter, but only
+/// when it names loopback. This is deliberately status-only for relay/custom:
+/// managed gateway commands remove `CSSWITCH_UPSTREAM_URL` for those adapters,
+/// so a stale diagnostic value cannot replace the profile endpoint or receive
+/// its key. If the override is malformed or external, fail closed instead of
+/// silently probing the real provider host during an isolated/local-mock run.
+pub(crate) fn status_upstream_endpoint(
+    adapter: &str,
+    base_url: &str,
+    diagnostic_override: Option<&std::ffi::OsStr>,
+) -> Option<UpstreamEndpoint> {
+    if adapter.is_empty() {
+        return None;
+    }
+    if let Some(raw_os) = diagnostic_override {
+        // `var_os` at the call site preserves the distinction between absent and
+        // explicitly non-UTF-8. An invalid explicit value must fail closed here,
+        // never collapse into the production endpoint fallback.
+        let raw = raw_os.to_str()?;
+        let endpoint = parse_endpoint(raw)?;
+        let host = endpoint.host.trim_end_matches('.');
+        let explicit_loopback = host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::IpAddr>()
+                .map(|ip| ip.is_loopback())
+                .unwrap_or(false);
+        return explicit_loopback.then_some(endpoint);
+    }
+    upstream_endpoint(adapter, base_url)
+}
+
 /// 从 `http(s)://host[:port]/path` 里抽出 host + port。解析不出返回 None（不引 url crate）。
 pub(crate) fn parse_endpoint(url: &str) -> Option<UpstreamEndpoint> {
     let (rest, default_port) = url
@@ -191,10 +205,12 @@ pub(crate) fn parse_endpoint(url: &str) -> Option<UpstreamEndpoint> {
     }
     let (host, port) = if let Some(after_open) = authority.strip_prefix('[') {
         let (host, rest) = after_open.split_once(']')?;
-        let port = match rest.strip_prefix(':') {
-            Some(raw) if !raw.is_empty() => raw.parse().ok()?,
-            Some(_) => return None,
-            None => default_port,
+        let port = match rest {
+            "" => default_port,
+            _ => match rest.strip_prefix(':') {
+                Some(raw) if !raw.is_empty() => raw.parse().ok()?,
+                _ => return None,
+            },
         };
         (host.to_string(), port)
     } else {
@@ -236,10 +252,11 @@ pub(crate) fn relay_missing_model(adapter: &str, model: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_for_profile, assert_format_supported, gateway_kind_for, gateway_kind_for_adapter,
+        adapter_for_profile, assert_format_supported, gateway_kind_for_adapter,
         key_env_for_adapter, key_fingerprint, normalize_shim_mode, parse_endpoint, proxy_args_for,
         proxy_fingerprint, proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base,
-        relay_missing_base_url, relay_missing_model, should_scratch_candidate, upstream_endpoint,
+        relay_missing_base_url, relay_missing_model, should_scratch_candidate,
+        status_upstream_endpoint, upstream_endpoint,
     };
     use crate::config::Profile;
 
@@ -420,7 +437,7 @@ mod tests {
     }
 
     #[test]
-    fn proxy_fingerprint_includes_gateway_and_shim_identity() {
+    fn proxy_fingerprint_includes_runtime_and_shim_identity() {
         let p = Profile {
             template_id: "deepseek".into(),
             api_format: "anthropic".into(),
@@ -430,11 +447,32 @@ mod tests {
             ..Default::default()
         };
         let launch = proxy_args_for(&p);
-        let python_off = proxy_fingerprint_with_runtime(&p, &launch, "python", "off");
+        let other_runtime_off = proxy_fingerprint_with_runtime(&p, &launch, "other", "off");
         let rust_off = proxy_fingerprint_with_runtime(&p, &launch, "rust", "off");
-        let python_detect = proxy_fingerprint_with_runtime(&p, &launch, "python", "detect");
-        assert_ne!(python_off, rust_off, "gateway 切换必须阻止误复用");
-        assert_ne!(python_off, python_detect, "shim 切换必须阻止误复用");
+        let other_runtime_detect = proxy_fingerprint_with_runtime(&p, &launch, "other", "detect");
+        assert_ne!(
+            other_runtime_off, rust_off,
+            "runtime identity 变化必须阻止误复用"
+        );
+        assert_ne!(
+            other_runtime_off, other_runtime_detect,
+            "shim 切换必须阻止误复用"
+        );
+
+        let relay_profile = Profile {
+            template_id: "glm".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://relay.example/v1".into(),
+            api_key: "same-key".into(),
+            model: "same-model".into(),
+            ..Default::default()
+        };
+        let relay_launch = proxy_args_for(&relay_profile);
+        assert_eq!(
+            proxy_fingerprint_with_runtime(&relay_profile, &relay_launch, "rust", "off"),
+            proxy_fingerprint_with_runtime(&relay_profile, &relay_launch, "rust", " Rewrite "),
+            "非 DSML provider 的污染 shim 必须先 canonicalize 为 off"
+        );
     }
 
     #[test]
@@ -461,6 +499,8 @@ mod tests {
             })
         );
         assert_eq!(parse_endpoint("https://relay.example.com:"), None);
+        assert_eq!(parse_endpoint("http://[::1]garbage"), None);
+        assert_eq!(parse_endpoint("http://[::1]@external.example"), None);
     }
 
     #[test]
@@ -476,29 +516,130 @@ mod tests {
     }
 
     #[test]
-    fn runtime_identity_contract_defaults_to_python_and_deepseek_only_shim() {
-        assert_eq!(gateway_kind_for_adapter("deepseek"), "python");
-        assert_eq!(gateway_kind_for_adapter("openai-custom"), "python");
-        assert_eq!(gateway_kind_for("deepseek", "off", Some("rust")), "rust");
+    fn status_diagnostic_override_accepts_only_explicit_loopback_and_never_falls_through() {
         assert_eq!(
-            gateway_kind_for("deepseek", "detect", Some("rust")),
-            "python"
+            status_upstream_endpoint(
+                "deepseek",
+                "https://api.deepseek.com/anthropic",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:32123/mock")),
+            ),
+            Some(super::UpstreamEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 32123,
+            })
         );
         assert_eq!(
-            gateway_kind_for("deepseek", "rewrite", Some("rust")),
-            "python"
+            status_upstream_endpoint(
+                "qwen",
+                "https://dashscope.aliyuncs.com/compatible-mode/v1",
+                Some(std::ffi::OsStr::new("http://[::1]:32124/mock")),
+            ),
+            Some(super::UpstreamEndpoint {
+                host: "::1".to_string(),
+                port: 32124,
+            })
         );
-        assert_eq!(gateway_kind_for("qwen", "off", Some("rust")), "python");
-        assert_eq!(gateway_kind_for("relay", "off", Some("rust")), "python");
         assert_eq!(
-            gateway_kind_for("deepseek", "off", Some("python")),
-            "python"
+            status_upstream_endpoint(
+                "relay",
+                "https://api.siliconflow.cn",
+                Some(std::ffi::OsStr::new("https://provider.invalid/mock")),
+            ),
+            None,
+            "an explicit external override must not fall through to the real provider host"
         );
-        assert_eq!(normalize_shim_mode("deepseek", Some("detect")), "detect");
-        assert_eq!(normalize_shim_mode("deepseek", Some("rewrite")), "rewrite");
+        assert_eq!(
+            status_upstream_endpoint(
+                "openai-custom",
+                "https://provider.example/v1",
+                Some(std::ffi::OsStr::new("not-a-url")),
+            ),
+            None,
+            "a malformed explicit override must fail closed"
+        );
+    }
+
+    #[test]
+    fn status_without_override_uses_normal_production_or_profile_endpoints() {
+        assert_eq!(
+            status_upstream_endpoint("deepseek", "https://ignored.example", None,),
+            Some(super::UpstreamEndpoint {
+                host: "api.deepseek.com".to_string(),
+                port: 443,
+            })
+        );
+        assert_eq!(
+            status_upstream_endpoint("relay", "http://127.0.0.1:32125/anthropic", None,),
+            Some(super::UpstreamEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 32125,
+            }),
+            "relay/custom status must follow the candidate profile base URL without an override"
+        );
+        assert_eq!(
+            status_upstream_endpoint(
+                "relay",
+                "http://api.siliconflow.cn",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:32126/status-only",)),
+            ),
+            Some(super::UpstreamEndpoint {
+                host: "127.0.0.1".to_string(),
+                port: 32126,
+            }),
+            "an explicit loopback diagnostic must keep relay status from probing the provider host"
+        );
+        assert_eq!(
+            status_upstream_endpoint(
+                "",
+                "https://provider.example",
+                Some(std::ffi::OsStr::new("http://127.0.0.1:32127/status-only")),
+            ),
+            None,
+            "no active adapter must never acquire an upstream light from a diagnostic override"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_non_utf8_diagnostic_override_fails_closed() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        assert_eq!(
+            status_upstream_endpoint(
+                "relay",
+                "https://provider.example",
+                Some(invalid.as_os_str()),
+            ),
+            None,
+            "an explicit non-UTF-8 override must not fall through to the profile endpoint"
+        );
+    }
+
+    #[test]
+    fn runtime_identity_contract_is_rust_only() {
+        assert_eq!(gateway_kind_for_adapter("deepseek"), "rust");
+        assert_eq!(gateway_kind_for_adapter("openai-custom"), "rust");
+        assert_eq!(gateway_kind_for_adapter("relay"), "rust");
+        assert_eq!(normalize_shim_mode("deepseek", Some(" detect ")), "detect");
+        assert_eq!(normalize_shim_mode("deepseek", Some("DETECT")), "detect");
+        assert_eq!(
+            normalize_shim_mode("deepseek", Some(" Rewrite ")),
+            "rewrite"
+        );
         assert_eq!(normalize_shim_mode("deepseek", Some("bad")), "off");
+        assert_eq!(normalize_shim_mode("deepseek", Some("")), "off");
         assert_eq!(normalize_shim_mode("relay", Some("rewrite")), "off");
         assert_eq!(normalize_shim_mode("qwen", Some("detect")), "off");
+        assert_eq!(
+            normalize_shim_mode("openai-custom", Some(" Rewrite ")),
+            "off"
+        );
+        assert_eq!(
+            normalize_shim_mode("openai-responses", Some("DETECT")),
+            "off"
+        );
+        assert_eq!(normalize_shim_mode("unknown", Some("rewrite")), "off");
     }
 
     #[test]

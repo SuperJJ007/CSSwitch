@@ -12,12 +12,30 @@ if [ "$(python3 test/_capability.py)" != "1" ]; then
   echo "S0_LAYER loopback env-blocked (loopback not permitted)"; exit 0
 fi
 
+# The normal gate must exercise a binary built from the current gateway source.
+# The injected command exists only for the runner's deterministic retry tests.
+if [ -z "${CSSWITCH_LOOPBACK_TEST_CMD:-}" ]; then
+  if ! command -v cargo >/dev/null 2>&1; then
+    [ -x "$HOME/.cargo/bin/cargo" ] && export PATH="$HOME/.cargo/bin:$PATH"
+  fi
+  if ! command -v cargo >/dev/null 2>&1; then
+    echo "S0_LAYER loopback env-blocked (no cargo for current Rust gateway build)"; exit 0
+  fi
+  if ! cargo build --manifest-path desktop/gateway/Cargo.toml; then
+    echo "S0_LAYER loopback fail (current Rust gateway build failed)"; exit 1
+  fi
+  export CSSWITCH_GATEWAY_BIN="$ROOT/desktop/gateway/target/debug/csswitch-gateway"
+  if [ ! -x "$CSSWITCH_GATEWAY_BIN" ]; then
+    echo "S0_LAYER loopback fail (current Rust gateway binary missing)"; exit 1
+  fi
+fi
+
 # CSSWITCH_LOOPBACK_TEST_CMD 仅测试用：注入确定性 pass/fail 桩以验证重试逻辑，不用于正常运行。
 run_loopback_once() {
   if [ -n "${CSSWITCH_LOOPBACK_TEST_CMD:-}" ]; then
     eval "$CSSWITCH_LOOPBACK_TEST_CMD"
   else
-    python3 -m unittest test.test_proxy_connect test.test_proxy_stream test.test_proxy_dsml_e2e test.test_proxy_auth test.test_proxy_golden test.test_gateway_rust -v
+    python3 -m unittest test.test_gateway_rust test.test_provider_mock_scenarios test.test_installed_provider_matrix -v
   fi
 }
 

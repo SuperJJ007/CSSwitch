@@ -4,7 +4,7 @@
 //! 探完杀净。**绝不写 config、不改 AppState、不碰正在服务 Science 的正式代理。**
 //! 与 native-entry spec 的 validate_and_save 共用同一内核（绝不各写一份）。
 
-use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
@@ -85,6 +85,24 @@ impl Drop for ScratchGuard {
     }
 }
 
+impl ScratchGuard {
+    fn liveness(&mut self) -> crate::proc::ChildLiveness {
+        match self.0.as_mut() {
+            Some(child) => crate::proc::poll_child_liveness(child),
+            None => crate::proc::ChildLiveness::Unknown("scratch child already released".into()),
+        }
+    }
+
+    fn require_running(&mut self, context: &str) -> Result<(), String> {
+        match self.0.as_mut() {
+            Some(child) => crate::proc::require_child_running(child, context),
+            None => Err(format!(
+                "{context}存活状态未知：scratch child already released"
+            )),
+        }
+    }
+}
+
 /// 临时代理的环境注入清单（纯函数，便于测试）：候选 key 注入指定 `key_env`；`base_url` 非空
 /// 才注入对应 adapter 的 base env（native=deepseek/qwen 传空 → 不注入，走各自硬编码官方端点）；
 /// `model` 非空注入对应 adapter 的 model env。修真机 P1：让 native 也能被临时代理探测。
@@ -137,12 +155,40 @@ pub struct ScratchTarget<'a> {
     pub relay_thinking: &'a str, // relay thinking 策略（模板 thinking_policy），非空注入 CSSWITCH_RELAY_THINKING
 }
 
+pub struct ScratchBackend {
+    bin: PathBuf,
+    shim_mode: String,
+}
+
+pub(crate) fn backend_for_app<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    adapter: &str,
+) -> Result<ScratchBackend, String> {
+    let shim_mode = crate::runtime::provider::current_shim_mode_for_adapter(adapter);
+    let bin = crate::runtime::proxy_lifecycle::gateway_bin_path(app).ok_or(
+        "找不到 csswitch-gateway 二进制；请重新安装完整应用，开发态可设置绝对 CSSWITCH_GATEWAY_BIN。",
+    )?;
+    Ok(ScratchBackend {
+        bin,
+        shim_mode: shim_mode.to_string(),
+    })
+}
+
+impl ScratchBackend {
+    fn gateway_kind(&self) -> &'static str {
+        "rust"
+    }
+
+    fn shim_mode(&self) -> &str {
+        &self.shim_mode
+    }
+}
+
 /// 起一个临时代理并探测，探完杀净。**不碰 config / AppState / 正式代理**（修 P1-1/P1-2）。
-/// py/script 由调用方经 asset_root + find_exe 提供；`target` 描述要探测的候选连接
-/// （key 经 env 注入，绝不进 argv）。修真机 P1：provider 由调用方给（native 用 deepseek/qwen 探上游）。
+/// Rust sidecar 由调用方解析；`target` 描述要探测的候选连接（key 经 env 注入，绝不进
+/// argv）。provider 由调用方给（native 用 deepseek/qwen 探上游）。
 pub fn scratch_probe(
-    py: &Path,
-    script: &Path,
+    backend: &ScratchBackend,
     target: &ScratchTarget,
     kind: ProbeKind,
     trace: Option<&OperationTrace>,
@@ -165,22 +211,36 @@ pub fn scratch_probe(
             }
         }
     };
-    let mut cmd = Command::new(py);
+    let launch_id = match crate::proc::gen_secret() {
+        Ok(id) => id,
+        Err(e) => {
+            return ProbeResult {
+                status: None,
+                body: format!("无法生成临时 gateway launch_id：{e}"),
+            }
+        }
+    };
+    let mut cmd = Command::new(&backend.bin);
     if let Some(t) = trace {
         t.stage(
             OperationStage::ScratchSpawn,
-            format!("provider={} kind={}", target.provider, kind.as_str()),
+            format!(
+                "provider={} kind={} gateway={}",
+                target.provider,
+                kind.as_str(),
+                backend.gateway_kind()
+            ),
         );
     }
-    cmd.arg(script)
-        .arg("--provider")
-        .arg(target.provider) // native=deepseek/qwen；中转站=relay（Python 只认这三种）
-        .arg("--port")
-        .arg(port.to_string())
-        .arg("--auth-token")
-        .arg(&secret)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    crate::runtime::proxy_lifecycle::configure_managed_proxy_command(
+        &mut cmd,
+        target.provider,
+        backend.shim_mode(),
+        port,
+        &secret,
+        &launch_id,
+    );
+    cmd.stdout(Stdio::null()).stderr(Stdio::null());
     // key/base_url/model 经 env 注入（绝不进 argv，避免 ps 泄露）；native 不带 relay base。
     for (k, v) in scratch_env(
         target.provider,
@@ -201,12 +261,39 @@ pub fn scratch_probe(
             }
         }
     };
-    let _guard = ScratchGuard(Some(child)); // 作用域结束必杀
-                                            // 探活最多 ~4s。
+    let mut guard = ScratchGuard(Some(child)); // 作用域结束必杀
+                                               // 探活最多 ~4s。
     let mut alive = false;
+    let mut early_exit = None;
     for _ in 0..(operation::SCRATCH_READY_BUDGET_MS / operation::POLL_INTERVAL_MS) {
         std::thread::sleep(Duration::from_millis(operation::POLL_INTERVAL_MS));
-        if crate::proc::http_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS) {
+        match guard.liveness() {
+            crate::proc::ChildLiveness::Exited(status) => {
+                early_exit = Some(format!(
+                    "临时 {} gateway 提前退出（{status}）；若端口被旧实例占用，已拒绝接管而不会误杀旧进程。",
+                    backend.gateway_kind()
+                ));
+                break;
+            }
+            crate::proc::ChildLiveness::Running => {}
+            crate::proc::ChildLiveness::Unknown(error) => {
+                early_exit = Some(format!(
+                    "无法确认临时 {} gateway 是否存活：{error}",
+                    backend.gateway_kind()
+                ));
+                break;
+            }
+        }
+        let healthy = crate::proc::http_health_gateway(
+            port,
+            Some(&secret),
+            operation::LOCAL_HEALTH_TIMEOUT_MS,
+            backend.gateway_kind(),
+            Some(target.provider),
+            Some(backend.shim_mode()),
+            Some(&launch_id),
+        );
+        if healthy {
             alive = true;
             break;
         }
@@ -220,7 +307,18 @@ pub fn scratch_probe(
     if !alive {
         return ProbeResult {
             status: None,
-            body: "临时代理未就绪（多为 key/base_url 无效或依赖缺失）".into(),
+            body: early_exit.unwrap_or_else(|| {
+                "临时代理未就绪（多为 key/base_url 无效、依赖缺失或端口被旧实例占用）".into()
+            }),
+        };
+    }
+    if let Err(error) = guard.require_running(&format!(
+        "临时 {} gateway 在上游探测前",
+        backend.gateway_kind()
+    )) {
+        return ProbeResult {
+            status: None,
+            body: error,
         };
     }
     match kind {
@@ -268,12 +366,81 @@ pub fn scratch_probe(
             }
         }
     }
-    // _guard drop → 杀临时代理。
+    // guard drop → 杀临时代理。
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+
+    #[test]
+    fn scratch_probe_can_use_rust_backend_for_message_probe() {
+        let bin = std::env::var_os("CSSWITCH_GATEWAY_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("../gateway/target/debug/csswitch-gateway")
+            });
+        if !bin.is_file() {
+            panic!(
+                "csswitch-gateway binary not built; run `cargo build --manifest-path desktop/gateway/Cargo.toml` or set CSSWITCH_GATEWAY_BIN"
+            );
+        }
+
+        let upstream = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let upstream_port = upstream.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = upstream.accept().unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let head = String::from_utf8_lossy(&buf).to_string();
+            let _ = tx.send(head.lines().next().unwrap_or("").to_string());
+            let body = br#"{"choices":[{"message":{"content":"pong"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.write_all(body).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let backend = ScratchBackend {
+            bin,
+            shim_mode: "off".into(),
+        };
+        let result = scratch_probe(
+            &backend,
+            &ScratchTarget {
+                provider: "openai-custom",
+                key_env: "CSSWITCH_OPENAI_KEY",
+                base_url: &format!("http://127.0.0.1:{upstream_port}/up"),
+                key: "test-key",
+                model: Some("mock-model"),
+                relay_thinking: "",
+            },
+            ProbeKind::Message,
+            None,
+        );
+        assert_eq!(result.status, Some(200));
+        let request_line = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(request_line, "POST /up/v1/chat/completions HTTP/1.1");
+    }
 
     #[test]
     fn classify_maps_status_to_outcome() {

@@ -1,14 +1,10 @@
 import json
 import pathlib
-import sys
 import unittest
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 CATALOG = ROOT / "catalog" / "capabilities.v1.json"
-sys.path.insert(0, str(ROOT / "proxy"))
-import provider_policy as pp
-
 SECTIONS = [
     "providers",
     "tool_rules",
@@ -64,20 +60,20 @@ REQUIRED_RULE_IDS = {
     "tool.relay.input-schema-normalize",
     "tool.deepseek.forced-tool-choice-disable-thinking",
     "tool.dashscope.responses.web_search-drop",
-    "mcp.hosted-anthropic.hcls-boundary",
-    "science.version.0_1_15_dev.route-diff",
-    "science.auth.refresh-hardcoded-0_1_15",
+    "tool.siliconflow.forced-named-to-any",
     "transport.connect.anthropic-fastfail-401",
+    "transport.connect.non-anthropic-direct-tunnel",
 }
 
-PROXY_RULE_ID_CONSTANTS = {
-    pp.RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL,
-    pp.RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED,
-    pp.RULE_PROVIDER_DASHSCOPE_RESPONSES_TOOLS_CAP,
-    pp.RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER,
-    pp.RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE,
-    pp.RULE_TOOL_DEEPSEEK_FORCED_TOOL_CHOICE_DISABLE_THINKING,
-    pp.RULE_TOOL_DASHSCOPE_RESPONSES_WEB_SEARCH_DROP,
+RUNTIME_OBSERVABILITY_RULE_IDS = {
+    "provider.relay.force-model-shell",
+    "provider.kimi.relay-thinking-enabled",
+    "provider.dashscope.responses-tools-cap",
+    "tool.kimi.web_search.server-tool-filter",
+    "tool.relay.input-schema-normalize",
+    "tool.deepseek.forced-tool-choice-disable-thinking",
+    "tool.dashscope.responses.web_search-drop",
+    "tool.siliconflow.forced-named-to-any",
 }
 
 
@@ -131,7 +127,125 @@ class CapabilityCatalogSchema(unittest.TestCase):
             for section in SECTIONS
             for entry in data[section]
         }
-        self.assertTrue(PROXY_RULE_ID_CONSTANTS.issubset(ids))
+        self.assertTrue(RUNTIME_OBSERVABILITY_RULE_IDS.issubset(ids))
+
+    def test_dashscope_rules_use_exact_request_shape_hosts(self):
+        data = load_catalog()
+        rules = {
+            entry["id"]: entry
+            for section in SECTIONS
+            for entry in data[section]
+        }
+        for rule_id in (
+            "provider.dashscope.responses-tools-cap",
+            "tool.dashscope.responses.web_search-drop",
+        ):
+            with self.subTest(rule_id=rule_id):
+                match = rules[rule_id]["match"]
+                self.assertEqual(match["provider"], "openai-responses")
+                self.assertEqual(match["endpoint_hosts"], ["dashscope.aliyuncs.com"])
+                self.assertNotIn("base_url_contains", match)
+
+    def test_migrated_rules_include_rust_evidence_and_tests(self):
+        data = load_catalog()
+        rules = {
+            entry["id"]: entry
+            for section in SECTIONS
+            for entry in data[section]
+        }
+        migrated = {
+            "provider.deepseek.anthropic-native",
+            "provider.relay.force-model-shell",
+            "provider.kimi.relay-thinking-enabled",
+            "provider.dashscope.responses-tools-cap",
+            "tool.kimi.web_search.server-tool-filter",
+            "tool.relay.input-schema-normalize",
+            "tool.siliconflow.forced-named-to-any",
+            "tool.deepseek.forced-tool-choice-disable-thinking",
+            "tool.dashscope.responses.web_search-drop",
+            "tool.dsml.deepseek-tooluse-rewrite",
+            "transport.connect.anthropic-fastfail-401",
+            "transport.connect.non-anthropic-direct-tunnel",
+        }
+        for rule_id in migrated:
+            with self.subTest(rule_id=rule_id):
+                self.assertTrue(
+                    any(item.startswith("desktop/gateway/") for item in rules[rule_id]["evidence"]),
+                    f"{rule_id} lacks Rust gateway evidence",
+                )
+                self.assertTrue(
+                    any(
+                        item.startswith("desktop/gateway/")
+                        or "test_gateway_rust" in item
+                        for item in rules[rule_id]["tests"]
+                    ),
+                    f"{rule_id} lacks a Rust test reference",
+                )
+
+    def test_local_evidence_uses_stable_paths_without_line_numbers(self):
+        data = load_catalog()
+        for section in SECTIONS:
+            for entry in data[section]:
+                for evidence in entry["evidence"]:
+                    with self.subTest(rule_id=entry["id"], evidence=evidence):
+                        if evidence.startswith(("http://", "https://")):
+                            continue
+                        suffix = evidence.rpartition(":")[2]
+                        self.assertFalse(
+                            suffix.isdigit(),
+                            "local evidence should use a stable path without a line number",
+                        )
+
+    def test_python_unittest_references_resolve(self):
+        python_refs = []
+
+        def collect(value):
+            if isinstance(value, str):
+                if value.startswith("test."):
+                    python_refs.append(value)
+            elif isinstance(value, dict):
+                for item in value.values():
+                    collect(item)
+            elif isinstance(value, list):
+                for item in value:
+                    collect(item)
+
+        def test_cases(suite):
+            for item in suite:
+                if isinstance(item, unittest.TestSuite):
+                    yield from test_cases(item)
+                else:
+                    yield item
+
+        collect(load_catalog())
+        refs = sorted(set(python_refs))
+        self.assertTrue(refs, "catalog must contain Python unittest references")
+
+        loader = unittest.defaultTestLoader
+        failures = []
+        for ref in refs:
+            errors_before = len(loader.errors)
+            suite = loader.loadTestsFromName(ref)
+            loader_errors = loader.errors[errors_before:]
+            failed_tests = [
+                str(case)
+                for case in test_cases(suite)
+                if isinstance(case, unittest.loader._FailedTest)
+            ]
+            details = []
+            if suite.countTestCases() == 0:
+                details.append("loaded zero test cases")
+            if failed_tests:
+                details.append(f"failed loader cases: {failed_tests}")
+            if loader_errors:
+                details.append(f"loader errors: {loader_errors}")
+            if details:
+                failures.append(f"{ref}: {'; '.join(details)}")
+
+        self.assertFalse(
+            failures,
+            "unloadable catalog unittest references:\n" + "\n".join(failures),
+        )
 
 
 if __name__ == "__main__":

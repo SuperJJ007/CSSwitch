@@ -47,15 +47,29 @@ fn is_executable_file(path: &Path) -> bool {
             .unwrap_or(false)
 }
 
+fn is_explicit_executable_file(path: &Path) -> bool {
+    if !path.is_absolute() {
+        return false;
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => return false,
+            Ok(_) => {}
+            Err(_) => return false,
+        }
+    }
+    is_executable_file(path)
+}
+
 fn science_bin_for_paths(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
     app_bin: &Path,
 ) -> Option<PathBuf> {
     if let Some(bin) = explicit_bin {
-        if is_executable_file(bin) {
-            return Some(bin.to_path_buf());
-        }
+        return is_explicit_executable_file(bin).then(|| bin.to_path_buf());
     }
     let sandbox_bin = data_dir.join("bin").join("claude-science");
     if is_executable_file(&sandbox_bin) {
@@ -184,6 +198,7 @@ pub(crate) fn stop_sandbox<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::os::unix::fs::symlink;
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
@@ -296,20 +311,46 @@ mod tests {
         fs::set_permissions(&explicit_bin, fs::Permissions::from_mode(0o644))?;
         assert_eq!(
             science_bin_for_paths(&data_dir, Some(&explicit_bin), &app_bin).as_deref(),
+            None,
+            "an invalid explicit override must not fall through to sandbox or system Science"
+        );
+
+        assert_eq!(
+            science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
             Some(sandbox_bin.as_path())
+        );
+
+        let explicit_link = root.join("explicit-link");
+        symlink(&app_bin, &explicit_link)?;
+        assert_eq!(
+            science_bin_for_paths(&data_dir, Some(&explicit_link), &app_bin),
+            None,
+            "an explicit symlink must fail closed"
+        );
+
+        let real_parent = root.join("real-parent");
+        let linked_parent = root.join("linked-parent");
+        let parent_bin = real_parent.join("claude-science");
+        write_fake_bin(&parent_bin, 0o755)?;
+        symlink(&real_parent, &linked_parent)?;
+        assert_eq!(
+            science_bin_for_paths(
+                &data_dir,
+                Some(&linked_parent.join("claude-science")),
+                &app_bin,
+            ),
+            None,
+            "an explicit path with a symlinked parent must fail closed"
         );
 
         fs::set_permissions(&sandbox_bin, fs::Permissions::from_mode(0o644))?;
         assert_eq!(
-            science_bin_for_paths(&data_dir, Some(&explicit_bin), &app_bin).as_deref(),
+            science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
             Some(app_bin.as_path())
         );
 
         fs::set_permissions(&app_bin, fs::Permissions::from_mode(0o644))?;
-        assert_eq!(
-            science_bin_for_paths(&data_dir, Some(&explicit_bin), &app_bin),
-            None
-        );
+        assert_eq!(science_bin_for_paths(&data_dir, None, &app_bin), None);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -359,7 +400,7 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&p)?;
-        Ok(p)
+        p.canonicalize()
     }
 
     fn write_fake_bin(path: &std::path::Path, mode: u32) -> std::io::Result<()> {

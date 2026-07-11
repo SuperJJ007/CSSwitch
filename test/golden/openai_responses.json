@@ -1,0 +1,364 @@
+{
+  "anthropic": {
+    "content": [
+      {
+        "text": "hello",
+        "type": "text"
+      },
+      {
+        "id": "call_2",
+        "input": {
+          "q": "y"
+        },
+        "name": "lookup",
+        "type": "tool_use"
+      }
+    ],
+    "id": "resp_1",
+    "model": "claude-opus-4-8",
+    "role": "assistant",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 5
+    }
+  },
+  "dashscope_mapped": {
+    "input": [
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "max_output_tokens": 8192,
+    "model": "gpt-5.2",
+    "stream": false,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "description": "",
+        "name": "lookup",
+        "parameters": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "type": "function"
+      }
+    ]
+  },
+  "dashscope_metadata": {
+    "rule_ids": [
+      "tool.dashscope.responses.web_search-drop",
+      "provider.dashscope.responses-tools-cap"
+    ]
+  },
+  "dashscope_host_cases": [
+    {
+      "name": "exact_https",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+      "matches": true
+    },
+    {
+      "name": "uppercase_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://DASHSCOPE.ALIYUNCS.COM/compatible-mode/v1/responses",
+      "matches": true
+    },
+    {
+      "name": "single_trailing_dot_with_port",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "http://DashScope.AliyunCS.Com.:8080/v1/responses",
+      "matches": true
+    },
+    {
+      "name": "wrong_provider_and_api_format",
+      "provider": "qwen",
+      "api_format": "openai_chat_completions",
+      "url": "https://dashscope.aliyuncs.com/compatible-mode/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "subdomain",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://api.dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "evil_suffix",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope.aliyuncs.com.evil.example/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "host_only_in_userinfo",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope.aliyuncs.com@evil.example/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "nonempty_userinfo_on_official_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://user@dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "empty_userinfo_on_official_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://@dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "password_only_userinfo_on_official_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://:password@dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "empty_password_userinfo_on_official_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://user:@dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "unicode_long_s_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://daſhscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "unicode_fullwidth_dot_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope．aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "unicode_ideographic_dot_host",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope。aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "host_only_in_path",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://evil.example/dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "unsupported_scheme",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "ftp://dashscope.aliyuncs.com/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "multiple_trailing_dots",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope.aliyuncs.com../v1/responses",
+      "matches": false
+    },
+    {
+      "name": "invalid_url",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://[not-an-ipv6]/v1/responses",
+      "matches": false
+    },
+    {
+      "name": "invalid_port",
+      "provider": "openai-responses",
+      "api_format": "openai_responses",
+      "url": "https://dashscope.aliyuncs.com:not-a-port/v1/responses",
+      "matches": false
+    }
+  ],
+  "dashscope_request": {
+    "max_tokens": 999999,
+    "messages": [
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "model": "claude-opus-4-8",
+    "tools": [
+      {
+        "input_schema": {
+          "type": "object"
+        },
+        "name": "web_search"
+      },
+      {
+        "input_schema": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        },
+        "name": "lookup"
+      }
+    ]
+  },
+  "mapped": {
+    "input": [
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "checking",
+        "role": "assistant"
+      },
+      {
+        "arguments": "{\"q\": \"x\"}",
+        "call_id": "call_1",
+        "name": "lookup",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call_1",
+        "output": "found",
+        "type": "function_call_output"
+      }
+    ],
+    "instructions": "be brief",
+    "max_output_tokens": 65536,
+    "model": "gpt-5.2",
+    "stream": false,
+    "temperature": 0.2,
+    "tool_choice": "auto",
+    "tools": [
+      {
+        "description": "search",
+        "name": "lookup",
+        "parameters": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "type": "function"
+      }
+    ],
+    "top_p": 0.9
+  },
+  "metadata": {
+    "rule_ids": []
+  },
+  "request": {
+    "max_tokens": 999999,
+    "messages": [
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "checking",
+            "type": "text"
+          },
+          {
+            "id": "call_1",
+            "input": {
+              "q": "x"
+            },
+            "name": "lookup",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": [
+              {
+                "text": "found",
+                "type": "text"
+              }
+            ],
+            "tool_use_id": "call_1",
+            "type": "tool_result"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-opus-4-8",
+    "system": [
+      {
+        "text": "be brief",
+        "type": "text"
+      }
+    ],
+    "temperature": 0.2,
+    "tool_choice": {
+      "name": "lookup",
+      "type": "tool"
+    },
+    "tools": [
+      {
+        "description": "search",
+        "input_schema": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          }
+        },
+        "name": "lookup"
+      }
+    ],
+    "top_p": 0.9
+  },
+  "response": {
+    "id": "resp_1",
+    "output": [
+      {
+        "content": [
+          {
+            "text": "hello",
+            "type": "output_text"
+          }
+        ],
+        "type": "message"
+      },
+      {
+        "arguments": "{\"q\":\"y\"}",
+        "call_id": "call_2",
+        "name": "lookup",
+        "type": "function_call"
+      }
+    ],
+    "status": "completed",
+    "usage": {
+      "input_tokens": 4,
+      "output_tokens": 5
+    }
+  }
+}

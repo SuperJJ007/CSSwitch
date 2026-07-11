@@ -6,6 +6,8 @@ import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from _loopback_ports import bind_http_server
+
 
 def start_mock(mode="json"):
     hits = []
@@ -79,7 +81,14 @@ def start_mock(mode="json"):
             self.send_response(404)
             self.end_headers()
 
-    srv = ThreadingHTTPServer(("127.0.0.1", 0), M)
+    srv = bind_http_server(ThreadingHTTPServer, M)
     port = srv.server_address[1]
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{port}/up", hits, srv.shutdown
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+
+    def stop():
+        srv.shutdown()
+        srv.server_close()
+        thread.join(timeout=5)
+
+    return f"http://127.0.0.1:{port}/up", hits, stop

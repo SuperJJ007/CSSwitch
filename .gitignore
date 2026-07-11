@@ -29,10 +29,6 @@ build/
 # 本地开发工作流文档（brainstorm→spec→plan），不上传公开仓库
 docs/superpowers/
 
-# 每日巡检运行产物：全是本机运行态（报告/版本基线/日志/锁），只保留空目录占位
-findings/auto-maint/*
-!findings/auto-maint/.gitkeep
-
 # Local version comparison binaries; never commit.
 .science-binaries/
 
@@ -44,3 +40,21 @@ scratchpad/
 
 # Local seed files.
 .seed
+
+# Private project knowledge and reverse-engineering records. Keep these local.
+CLAUDE.md
+desktop/README.md
+findings/
+scripts/daily-maintenance.prompt.md
+scripts/com.csswitch.maintenance.plist
+scripts/daily-maintenance.sh
+scripts/install-maintenance.sh
+scripts/launch-science-sandbox.sh
+scripts/make-virtual-oauth.mjs
+test/A3_INSTALLED_APP_MANUAL_TEST.md
+test/decrypt-oauth.mjs
+test/test_make_virtual_oauth.mjs
+docs/*
+!docs/assets/
+!docs/assets/**
+!docs/upgrade-and-rollback.md

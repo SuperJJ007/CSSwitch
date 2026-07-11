@@ -1,0 +1,198 @@
+{
+  "anthropic_response": {
+    "content": [
+      {
+        "text": "answer",
+        "type": "text"
+      },
+      {
+        "id": "call_2",
+        "input": {
+          "score": 1
+        },
+        "name": "grade",
+        "type": "tool_use"
+      }
+    ],
+    "id": "chatcmpl_1",
+    "model": "claude-haiku-4-5",
+    "role": "assistant",
+    "stop_reason": "tool_use",
+    "stop_sequence": null,
+    "type": "message",
+    "usage": {
+      "input_tokens": 7,
+      "output_tokens": 8
+    }
+  },
+  "openai_request": {
+    "max_tokens": 8192,
+    "messages": [
+      {
+        "content": "be brief\nuse tools",
+        "role": "system"
+      },
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": "checking",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"q\": \"x\"}",
+              "name": "lookup"
+            },
+            "id": "toolu_1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "found",
+        "role": "tool",
+        "tool_call_id": "toolu_1"
+      },
+      {
+        "content": "thanks",
+        "role": "user"
+      }
+    ],
+    "model": "qwen-turbo",
+    "stop": [
+      "STOP"
+    ],
+    "stream": false,
+    "temperature": 0.2,
+    "tool_choice": {
+      "function": {
+        "name": "lookup"
+      },
+      "type": "function"
+    },
+    "tools": [
+      {
+        "function": {
+          "description": "search",
+          "name": "lookup",
+          "parameters": {
+            "properties": {
+              "q": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ],
+    "top_p": 0.9
+  },
+  "openai_response": {
+    "choices": [
+      {
+        "finish_reason": "tool_calls",
+        "message": {
+          "content": "answer",
+          "tool_calls": [
+            {
+              "function": {
+                "arguments": "{\"score\":1}",
+                "name": "grade"
+              },
+              "id": "call_2",
+              "type": "function"
+            }
+          ]
+        }
+      }
+    ],
+    "id": "chatcmpl_1",
+    "usage": {
+      "completion_tokens": 8,
+      "prompt_tokens": 7
+    }
+  },
+  "request": {
+    "max_tokens": 100000,
+    "messages": [
+      {
+        "content": "hi",
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "checking",
+            "type": "text"
+          },
+          {
+            "id": "toolu_1",
+            "input": {
+              "q": "x"
+            },
+            "name": "lookup",
+            "type": "tool_use"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "content": [
+              {
+                "text": "found",
+                "type": "text"
+              }
+            ],
+            "tool_use_id": "toolu_1",
+            "type": "tool_result"
+          },
+          {
+            "text": "thanks",
+            "type": "text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5",
+    "stop_sequences": [
+      "STOP"
+    ],
+    "system": [
+      {
+        "text": "be brief",
+        "type": "text"
+      },
+      {
+        "text": "use tools",
+        "type": "text"
+      }
+    ],
+    "temperature": 0.2,
+    "tool_choice": {
+      "name": "lookup",
+      "type": "tool"
+    },
+    "tools": [
+      {
+        "description": "search",
+        "input_schema": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "name": "lookup"
+      }
+    ],
+    "top_p": 0.9
+  }
+}

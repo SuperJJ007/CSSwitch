@@ -2,11 +2,11 @@
 //!
 //! 职责：管理「翻译代理」与「沙箱 Science」两个子进程的生命周期；读写
 //! `~/.csswitch/config.json`（多 profile 形态）；把第三方 key 以【环境变量】注入代理子进程
-//! （绝不进 argv）；探活；把沙箱 URL 交系统浏览器打开。已验证的越权/翻译逻辑仍留在
-//! Python/Node/shell 里被当作子进程调用，以保住铁律护栏与已验证行为。
+//! （绝不进 argv）；探活；把沙箱 URL 交系统浏览器打开。推理与协议转换由随包交付的
+//! Rust `csswitch-gateway` 完成；沙箱脚本仍作为受管子进程保留铁律护栏。
 //!
 //! 运行行为由生效 profile 的 `template_id` 经 [`templates`] 注册表派生出 adapter
-//! （deepseek | qwen | relay | openai-custom | openai-responses），再传给 python 代理 `--provider`。
+//! （deepseek | qwen | relay | openai-custom | openai-responses），再传给 Rust gateway。
 //!
 //! 铁律相关：key 只在内存与 0600 的 config.json；回显前端只给掩码；沙箱端口/目录护栏
 //! 由被调脚本负责（对 8765 与真实目录失败关闭）；退 app 默认停代理、保留沙箱。
@@ -76,10 +76,12 @@ pub(crate) struct AppState {
     pub(crate) secret: String,
     /// 当前代理进程所用 adapter 名（deepseek | qwen | relay | openai-custom | openai-responses）；用于健康复用判定。
     pub(crate) provider: String,
-    /// 当前代理进程的 gateway 实现身份（python | rust）。
+    /// 当前代理进程的 gateway 实现身份（生产值固定为 rust）。
     pub(crate) gateway_kind: String,
     /// 当前代理进程的 DeepSeek tool-use shim 模式（off | detect | rewrite）。
     pub(crate) shim_mode: String,
+    /// Tauri 每次启动 managed Rust gateway 时生成的唯一实例身份。
+    pub(crate) launch_id: String,
     /// 当前代理进程所用 key 的非加密指纹（仅内存、绝不落盘/打印）。
     /// 换 key/换上游后指纹变化 → 触发重启，避免复用带旧配置的代理。
     pub(crate) key_fp: u64,
@@ -96,12 +98,22 @@ impl AppState {
         self.provider.clear();
         self.gateway_kind.clear();
         self.shim_mode.clear();
+        self.launch_id.clear();
         self.key_fp = 0;
     }
 
     pub(crate) fn stop_proxy(&mut self) {
         kill_child(&mut self.proxy);
         self.clear_proxy_identity();
+    }
+}
+
+impl Drop for AppState {
+    fn drop(&mut self) {
+        // `std::process::Child` does not kill on drop. Keep a final owned-child
+        // safety net in addition to the Tauri exit events so a graceful app
+        // teardown cannot orphan the managed gateway.
+        self.stop_proxy();
     }
 }
 
@@ -142,7 +154,23 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
         .separator()
         .quit()
         .build()?;
-    let menu = MenuBuilder::new(app).item(&app_menu).build()?;
+    let menu_builder = MenuBuilder::new(app).item(&app_menu);
+    #[cfg(target_os = "macos")]
+    let menu_builder = {
+        // Native predefined edit items are what wires the standard macOS
+        // Command-X/C/V/A/Z shortcuts into the focused WebView field.
+        let edit_menu = SubmenuBuilder::new(app, "编辑")
+            .undo_with_text("撤销")
+            .redo_with_text("重做")
+            .separator()
+            .cut_with_text("剪切")
+            .copy_with_text("复制")
+            .paste_with_text("粘贴")
+            .select_all_with_text("全选")
+            .build()?;
+        menu_builder.item(&edit_menu)
+    };
+    let menu = menu_builder.build()?;
     app.set_menu(menu)?;
     app.on_menu_event(|app, event| {
         if event.id().as_ref() == "preferences" {
@@ -243,7 +271,6 @@ pub fn run() {
             commands::profiles::delete_profile,
             commands::profiles::set_active_profile,
             commands::runtime::start_proxy,
-            commands::runtime::verify_key,
             commands::runtime::fetch_models,
             commands::runtime::stop_all,
             commands::runtime::one_click_login,
@@ -282,33 +309,56 @@ pub fn run() {
 
     app.run(|app, event| match event {
         tauri::RunEvent::Reopen { .. } => show_main_window(app),
-        tauri::RunEvent::ExitRequested { .. } => cleanup_for_exit(app),
+        tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => cleanup_for_exit(app),
         _ => {}
     });
 }
 
 #[cfg(test)]
 mod tests {
+    use std::process::Command;
+
     use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
     use crate::{decide_launch_with_auto_boot, should_begin_boot, AppState, BootState, LaunchPath};
 
     #[test]
     fn app_state_clear_proxy_identity_removes_runtime_credentials() {
-        let mut st = AppState {
-            secret: "secret".into(),
-            provider: "deepseek".into(),
-            gateway_kind: "rust".into(),
-            shim_mode: "off".into(),
-            key_fp: 42,
-            ..AppState::default()
-        };
+        let mut st = AppState::default();
+        st.secret = "secret".into();
+        st.provider = "deepseek".into();
+        st.gateway_kind = "rust".into();
+        st.shim_mode = "off".into();
+        st.launch_id = "launch-old".into();
+        st.key_fp = 42;
         st.clear_proxy_identity();
         assert!(st.secret.is_empty());
         assert!(st.provider.is_empty());
         assert!(st.gateway_kind.is_empty());
         assert!(st.shim_mode.is_empty());
+        assert!(st.launch_id.is_empty());
         assert_eq!(st.key_fp, 0);
+    }
+
+    #[test]
+    fn app_state_drop_reaps_owned_proxy_child() {
+        let child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn owned test child");
+        let pid = child.id();
+        {
+            let mut st = AppState::default();
+            st.proxy = Some(child);
+        }
+        let status = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "pid="])
+            .output()
+            .expect("inspect owned test child");
+        assert!(
+            String::from_utf8_lossy(&status.stdout).trim().is_empty(),
+            "AppState drop left owned proxy child {pid} alive"
+        );
     }
 
     #[test]

@@ -12,13 +12,16 @@
       "action": "normalize",
       "reason": "DeepSeek uses the native Anthropic path; CSSwitch maps Science shell model ids, clamps known token caps, and normalizes thinking/tool_choice quirks.",
       "evidence": [
-        "proxy/csswitch_proxy.py:51",
-        "proxy/provider_policy.py:69",
-        "docs/verified-facts.md:34"
+        "desktop/gateway/src/server.rs",
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/server.rs"
       ],
       "tests": [
-        "test.test_provider_policy.ResolveModelDeepseek",
-        "test.test_provider_policy.ThinkingNormalization.test_deepseek_forced_tool_choice_disables_thinking"
+        "desktop/gateway/src/policy.rs::tests::resolves_deepseek_shell_models",
+        "desktop/gateway/src/policy.rs::tests::forced_tool_choice_disables_thinking",
+        "desktop/gateway/src/policy.rs::tests::transform_maps_model_and_normalizes_thinking",
+        "test.test_gateway_rust.RustGatewayLoopback.test_nonstream_maps_request_and_preserves_content_length"
       ]
     },
     {
@@ -32,13 +35,16 @@
       "action": "normalize",
       "reason": "Formal relay/custom proxies return one Science-visible claude-opus shell model with the real model name in display_name; outbound requests are force-overridden to the selected real model.",
       "evidence": [
-        "proxy/csswitch_proxy.py:344",
-        "proxy/model_discovery.py:32",
-        "docs/known-issues.md:132"
+        "desktop/gateway/src/server.rs",
+        "desktop/gateway/src/models.rs",
+        "desktop/gateway/src/anthropic_compat.rs",
+        "desktop/gateway/src/models.rs"
       ],
       "tests": [
-        "test.test_proxy_units.BuildModelsResponse.test_force_returns_single_shell",
-        "test.test_proxy_auth.ProxyOpenAIForcedModels.test_formal_proxy_returns_claude_shell_for_science_selector"
+        "desktop/gateway/src/models.rs::tests::force_shell_response_matches_python_contract",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_force_model_overrides_shell",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_force_model_overrides_shell",
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_forced_model_shell_and_nonstream_passthrough"
       ]
     },
     {
@@ -53,29 +59,41 @@
       "action": "degrade",
       "reason": "Kimi relay models require enabled thinking, but forced Anthropic tool_choice is removed so the model can choose tools itself.",
       "evidence": [
-        "desktop/src-tauri/src/templates.rs:120",
-        "proxy/provider_policy.py:103"
+        "desktop/src-tauri/src/templates.rs",
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/anthropic_compat.rs",
+        "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "test.test_provider_policy.ThinkingNormalization.test_relay_enabled_policy_drops_forced_tool_choice"
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_removed_tool_choice_degrades_to_auto_without_enabled_thinking",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
       ]
     },
     {
       "id": "provider.dashscope.responses-tools-cap",
       "scope": "provider",
       "match": {
+        "provider": "openai-responses",
         "api_format": "openai_responses",
-        "base_url_contains": "dashscope.aliyuncs.com",
+        "endpoint_hosts": [
+          "dashscope.aliyuncs.com"
+        ],
         "has_tools": true
       },
       "status": "limited",
       "action": "degrade",
-      "reason": "DashScope Responses tool requests use a conservative max_output_tokens cap to avoid provider-side rejection.",
+      "reason": "CSSwitch uses a conservative max_output_tokens cap for exact DashScope Responses request shapes for provider compatibility; this worktree validates source, fixture, and loopback behavior only and does not revalidate the live provider.",
       "evidence": [
-        "proxy/responses_compat.py:29"
+        "desktop/gateway/src/openai_responses.rs",
+        "desktop/gateway/src/openai_responses.rs",
+        "test/golden/openai_responses.json"
       ],
       "tests": [
-        "test.test_proxy_units.ResponsesMapping.test_dashscope_responses_tool_requests_use_conservative_cap"
+        "desktop/gateway/src/openai_responses.rs::tests::dashscope_responses_host_contract_matches_python_fixture",
+        "desktop/gateway/src/openai_responses.rs::tests::responses_dashscope_rules_match_python_fixture",
+        "desktop/gateway/src/openai_responses.rs::tests::dashscope_responses_host_contract_matches_python_fixture",
+        "test.test_gateway_rust.RustGatewayLoopback.test_dashscope_responses_uppercase_host_rules_and_safe_metadata_logs"
       ]
     }
   ],
@@ -92,12 +110,15 @@
       "action": "drop",
       "reason": "Kimi treats web_search as a provider server tool and may stream server_tool_use/web_search_tool_result blocks; CSSwitch keeps local known_tools but does not advertise web_search upstream and filters server-tool blocks.",
       "evidence": [
-        "proxy/anthropic_compat.py:84",
-        "proxy/anthropic_compat.py:178"
+        "desktop/gateway/src/anthropic_compat.rs",
+        "desktop/gateway/src/anthropic_compat.rs",
+        "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "test.test_anthropic_compat.TransformRequest.test_kimi_relay_does_not_advertise_web_search_server_tool",
-        "test.test_anthropic_compat.MakeStreamRewriter.test_kimi_filter_drops_server_tool_blocks_and_compacts_indexes"
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
+        "desktop/gateway/src/anthropic_compat.rs::tests::kimi_stream_filter_drops_server_tool_blocks_and_compacts_indexes",
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_kimi_stream_filters_server_tool_blocks"
       ]
     },
     {
@@ -111,12 +132,41 @@
       "action": "normalize",
       "reason": "Anthropic-compatible relay providers can reject empty or loose input_schema values, so CSSwitch normalizes relay tools to object schemas without mutating the caller request.",
       "evidence": [
-        "proxy/anthropic_compat.py:26",
-        "proxy/anthropic_compat.py:56"
+        "desktop/gateway/src/anthropic_compat.rs",
+        "desktop/gateway/src/anthropic_compat.rs",
+        "test/golden/relay_anthropic.json"
       ],
       "tests": [
-        "test.test_anthropic_compat.TransformRequest.test_relay_normalizes_loose_tool_schemas",
-        "test.test_proxy_auth.ProxyRelayTools.test_relay_outbound_tools_are_normalized_before_provider"
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
+        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
+        "desktop/gateway/src/anthropic_compat.rs::tests::relay_kimi_thinking_and_tool_quirks_match_python_fixture",
+        "test.test_gateway_rust.RustGatewayLoopback.test_relay_forced_model_shell_and_nonstream_passthrough"
+      ]
+    },
+    {
+      "id": "tool.siliconflow.forced-named-to-any",
+      "scope": "tool",
+      "match": {
+        "provider": "relay",
+        "endpoint_hosts": [
+          "api.siliconflow.cn",
+          "api.siliconflow.com"
+        ],
+        "tool_choice_type": "tool",
+        "tools_nonempty": true
+      },
+      "status": "limited",
+      "action": "degrade",
+      "reason": "CSSwitch is based on historical SiliconFlow compatibility evidence: for exact Anthropic endpoint hosts it degrades only forced named tool_choice to any while preserving tools. Live provider behavior was not revalidated in this worktree; current evidence is source, fixture, and loopback only.",
+      "evidence": [
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/anthropic_compat.rs",
+        "desktop/gateway/src/anthropic_compat.rs"
+      ],
+      "tests": [
+        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
+        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_tool_choice_fixture_matrix_matches_python",
+        "desktop/gateway/src/anthropic_compat.rs::tests::siliconflow_endpoint_matching_is_exact_and_url_parsed"
       ]
     },
     {
@@ -133,29 +183,38 @@
       "action": "normalize",
       "reason": "DeepSeek rejects forced tool use combined with thinking, so CSSwitch disables thinking for forced Anthropic tool_choice on DeepSeek.",
       "evidence": [
-        "proxy/provider_policy.py:103",
-        "docs/verified-facts.md:38"
+        "desktop/gateway/src/policy.rs",
+        "desktop/gateway/src/policy.rs"
       ],
       "tests": [
-        "test.test_provider_policy.ThinkingNormalization.test_deepseek_forced_tool_choice_disables_thinking"
+        "desktop/gateway/src/policy.rs::tests::forced_tool_choice_disables_thinking",
+        "desktop/gateway/src/policy.rs::tests::forced_tool_choice_disables_thinking"
       ]
     },
     {
       "id": "tool.dashscope.responses.web_search-drop",
       "scope": "tool",
       "match": {
+        "provider": "openai-responses",
         "api_format": "openai_responses",
-        "base_url_contains": "dashscope.aliyuncs.com",
+        "endpoint_hosts": [
+          "dashscope.aliyuncs.com"
+        ],
         "tool_name": "web_search"
       },
       "status": "limited",
       "action": "drop",
-      "reason": "DashScope Responses-compatible endpoints reject web_search in this path, so CSSwitch drops that tool while preserving other function tools.",
+      "reason": "CSSwitch drops web_search for exact DashScope Responses request shapes while preserving other function tools, for provider compatibility. Behavior is covered by source, fixture, loopback, and release validation.",
       "evidence": [
-        "proxy/responses_compat.py:58"
+        "desktop/gateway/src/openai_responses.rs",
+        "desktop/gateway/src/openai_responses.rs",
+        "test/golden/openai_responses.json"
       ],
       "tests": [
-        "test.test_proxy_units.ResponsesMapping.test_dashscope_responses_drops_incompatible_web_search_tool"
+        "desktop/gateway/src/openai_responses.rs::tests::responses_dashscope_rules_match_python_fixture",
+        "desktop/gateway/src/openai_responses.rs::tests::dashscope_responses_host_contract_matches_python_fixture",
+        "desktop/gateway/src/openai_responses.rs::tests::responses_dashscope_rules_match_python_fixture",
+        "test.test_gateway_rust.RustGatewayLoopback.test_dashscope_responses_uppercase_host_rules_and_safe_metadata_logs"
       ]
     },
     {
@@ -170,199 +229,22 @@
       "action": "normalize",
       "reason": "When explicitly enabled, the DSML shim can turn known leaked DSML tool calls back into Anthropic tool_use blocks; default runtime behavior remains off.",
       "evidence": [
-        "proxy/dsml_shim.py",
-        "docs/known-issues.md:164"
+        "desktop/gateway/src/dsml_shim.rs",
+        "desktop/gateway/src/dsml_shim.rs",
+        "desktop/gateway/src/server.rs"
       ],
       "tests": [
-        "test.test_dsml_shim",
-        "test.test_proxy_dsml_e2e"
+        "desktop/gateway/src/dsml_shim.rs::tests::stream_dsml_becomes_tool_use_across_chunk_sizes",
+        "desktop/gateway/src/dsml_shim.rs::tests::rewrite_nonstream_injects_stable_tool_use_and_stop_reason",
+        "desktop/gateway/src/dsml_shim.rs::tests::rewrite_nonstream_injects_stable_tool_use_and_stop_reason",
+        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_dsml_rewrite_nonstream_opt_in",
+        "test.test_gateway_rust.RustGatewayLoopback.test_deepseek_dsml_rewrite_stream_opt_in"
       ]
     }
   ],
-  "mcp_servers": [
-    {
-      "id": "mcp.hosted-anthropic.hcls-boundary",
-      "scope": "mcp",
-      "match": {
-        "transport": "hosted",
-        "servers": [
-          "pubmed",
-          "clinical-trials",
-          "chembl",
-          "biorxiv"
-        ],
-        "auth": "anthropic-hosted"
-      },
-      "status": "unsupported",
-      "action": "diagnose",
-      "reason": "Anthropic-hosted MCP servers require real claude.ai authorization and user:mcp_servers scope; CSSwitch virtual OAuth cannot make official hosted services available.",
-      "evidence": [
-        "docs/verified-facts.md:13",
-        "docs/known-issues.md:167"
-      ],
-      "tests": []
-    },
-    {
-      "id": "mcp.streamable-http.external-bio",
-      "scope": "mcp",
-      "match": {
-        "transport": "streamable_http",
-        "servers": [
-          "pubmed",
-          "clinical-trials",
-          "chembl",
-          "biorxiv"
-        ]
-      },
-      "status": "limited",
-      "action": "diagnose",
-      "reason": "External Streamable HTTP MCP servers depend on outbound network routing; current CONNECT tunneling is direct unless a future upstream proxy path is added.",
-      "evidence": [
-        "https://github.com/SuperJJ007/CSSwitch/issues/11",
-        "proxy/csswitch_proxy.py:532",
-        "scripts/launch-virtual-sandbox.sh:112"
-      ],
-      "tests": [
-        "test.test_proxy_connect.ProxyConnect.test_connect_passthrough_tunnels_bytes"
-      ]
-    },
-    {
-      "id": "mcp.local-stdio.bio-connectors",
-      "scope": "mcp",
-      "match": {
-        "transport": "stdio",
-        "domain": "bio"
-      },
-      "status": "unknown",
-      "action": "document",
-      "reason": "Local stdio bio connectors are the preferred fallback for hosted MCP boundaries, but installation, discovery, and restart persistence need explicit verification before support can be claimed.",
-      "evidence": [
-        "https://github.com/SuperJJ007/CSSwitch/pull/10"
-      ],
-      "tests": []
-    },
-    {
-      "id": "mcp.directory-connectors.virtual-login",
-      "scope": "mcp",
-      "match": {
-        "capability": "Directory connectors",
-        "auth": "virtual_oauth"
-      },
-      "status": "unsupported",
-      "action": "diagnose",
-      "reason": "Directory connectors are hosted claude.ai capabilities and can report unavailable or session expired under virtual login.",
-      "evidence": [
-        "docs/known-issues.md:170"
-      ],
-      "tests": []
-    }
-  ],
-  "skills": [
-    {
-      "id": "skill.local-or-github.discoverability",
-      "scope": "skill",
-      "match": {
-        "source": [
-          "local",
-          "github"
-        ]
-      },
-      "status": "unknown",
-      "action": "diagnose",
-      "reason": "Local and GitHub skills need post-install discoverability checks; storing or installing a skill is not enough to prove Science can use it.",
-      "evidence": [
-        "docs/known-issues.md:167"
-      ],
-      "tests": []
-    },
-    {
-      "id": "skill.remote-official.virtual-login-boundary",
-      "scope": "skill",
-      "match": {
-        "source": "remote_official",
-        "auth": "virtual_oauth"
-      },
-      "status": "unsupported",
-      "action": "diagnose",
-      "reason": "Official remote skills may depend on claude.ai hosted services and real account state; CSSwitch can document local alternatives but cannot promise hosted remote skill availability.",
-      "evidence": [
-        "docs/known-issues.md:167",
-        "docs/verified-facts.md:13"
-      ],
-      "tests": []
-    }
-  ],
-  "science_versions": [
-    {
-      "id": "science.version.0_1_0_dev_20260630",
-      "scope": "science_version",
-      "match": {
-        "version": "0.1.0-dev.20260630.t212931.sha2bc1ac8"
-      },
-      "status": "supported",
-      "action": "document",
-      "reason": "The installed /Applications Claude Science baseline has verified Info.plist and --version evidence; do not infer newer native routes from this seed.",
-      "evidence": [
-        "docs/verified-facts.md:19",
-        "docs/known-issues.md:34"
-      ],
-      "tests": []
-    },
-    {
-      "id": "science.version.0_1_15_dev.route-diff",
-      "scope": "science_version",
-      "match": {
-        "version": "0.1.15-dev.20260701.t220242.shaaa553de"
-      },
-      "status": "limited",
-      "action": "document",
-      "reason": "Local binary evidence records new auth nonce, auth, conda/pypi remote, token-series, preferences, and skills resync routes; these require isolated retest before runtime claims.",
-      "evidence": [
-        "docs/verified-facts.md:21",
-        "docs/verified-facts.md:22",
-        "docs/known-issues.md:30"
-      ],
-      "tests": []
-    },
-    {
-      "id": "science.auth.refresh-hardcoded-0_1_15",
-      "scope": "science_version",
-      "match": {
-        "version": "0.1.15-dev.20260701.t220242.shaaa553de",
-        "auth_refresh": "api.anthropic.com/oauth/token"
-      },
-      "status": "limited",
-      "action": "diagnose",
-      "reason": "Issue #15 reports that this Science build may refresh OAuth via hardcoded api.anthropic.com/oauth/token outside ANTHROPIC_BASE_URL; virtual OAuth can then be treated as logged-out. CSSwitch surfaces this as a version/auth boundary, not as real-account success.",
-      "evidence": [
-        "https://github.com/SuperJJ007/CSSwitch/issues/15",
-        "docs/known-issues.md:37",
-        "findings/switching-organization-hang.md:16"
-      ],
-      "tests": [
-        "test.test_capability_catalog.CapabilityCatalogSchema.test_rule_ids_are_unique_and_key_rules_exist"
-      ]
-    },
-    {
-      "id": "science.auth.virtual-oauth-scope-boundary",
-      "scope": "science_version",
-      "match": {
-        "auth": "virtual_oauth",
-        "scopes_contains": [
-          "user:mcp_servers",
-          "user:plugins"
-        ]
-      },
-      "status": "limited",
-      "action": "document",
-      "reason": "Virtual OAuth can satisfy local Science inference/auth status paths, but listing scopes in local token material does not grant hosted claude.ai capabilities.",
-      "evidence": [
-        "docs/verified-facts.md:13",
-        "desktop/src-tauri/src/oauth_forge.rs:338"
-      ],
-      "tests": []
-    }
-  ],
+  "mcp_servers": [],
+  "skills": [],
+  "science_versions": [],
   "transport_rules": [
     {
       "id": "transport.connect.anthropic-fastfail-401",
@@ -379,12 +261,14 @@
       "action": "diagnose",
       "reason": "Anthropic/Claude hosts are fast-failed with 401 so Science treats virtual login as logged out instead of retrying organization switching.",
       "evidence": [
-        "proxy/csswitch_proxy.py:206",
-        "proxy/csswitch_proxy.py:532"
+        "desktop/gateway/src/server.rs",
+        "desktop/gateway/src/connect.rs"
       ],
       "tests": [
-        "test.test_proxy_connect.ProxyConnect.test_connect_anthropic_domains_fastfail_401",
-        "test.test_proxy_connect.ProxyConnect.test_connect_subdomain_of_blocked_is_blocked"
+        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel",
+        "desktop/gateway/src/connect.rs::tests::blocks_anthropic_claude_hosts_only",
+        "desktop/gateway/src/connect.rs::tests::blocked_and_bad_targets_never_reach_the_dialer",
+        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel"
       ]
     },
     {
@@ -396,13 +280,17 @@
       },
       "status": "limited",
       "action": "document",
-      "reason": "Non-Anthropic CONNECT currently opens a direct TCP tunnel; external MCP access can fail on networks where direct egress is blocked.",
+      "reason": "Non-Anthropic CONNECT opens a direct TCP tunnel. One 10-second dial budget starts before synchronous DNS and is shared across resolved addresses; std DNS itself cannot be interrupted by that budget. External MCP access can still fail where direct egress is blocked.",
       "evidence": [
-        "proxy/csswitch_proxy.py:554",
+        "desktop/gateway/src/server.rs",
+        "desktop/gateway/src/connect.rs",
         "https://github.com/SuperJJ007/CSSwitch/issues/11"
       ],
       "tests": [
-        "test.test_proxy_connect.ProxyConnect.test_connect_passthrough_tunnels_bytes"
+        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel",
+        "desktop/gateway/src/connect.rs::tests::all_addresses_share_one_connect_budget",
+        "desktop/gateway/src/connect.rs::tests::elapsed_deadline_never_attempts_a_dial",
+        "test.test_gateway_rust.RustGatewayLoopback.test_connect_status_contract_and_local_tunnel"
       ]
     },
     {
@@ -416,7 +304,7 @@
       "action": "document",
       "reason": "The virtual sandbox intentionally does not set http_proxy because the CSSwitch proxy does not implement ordinary absolute-form HTTP forwarding.",
       "evidence": [
-        "scripts/launch-virtual-sandbox.sh:115"
+        "scripts/launch-virtual-sandbox.sh"
       ],
       "tests": []
     },
@@ -432,7 +320,7 @@
       "reason": "An upstream proxy path is the recommended future fix for external MCP egress, but it is not implemented in the current main branch.",
       "evidence": [
         "https://github.com/SuperJJ007/CSSwitch/pull/14",
-        "proxy/http_transport.py"
+        "desktop/gateway/src/messages.rs"
       ],
       "tests": []
     }

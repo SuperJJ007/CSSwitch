@@ -13,5 +13,7 @@ name = "csswitch_gateway"
 path = "src/lib.rs"
 
 [dependencies]
+getrandom = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+regex = "1"
 serde_json = { version = "1", features = ["preserve_order"] }

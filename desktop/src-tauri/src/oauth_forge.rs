@@ -1,21 +1,6 @@
-//! 虚拟 OAuth 伪造器（Rust 原生，替代 `scripts/make-virtual-oauth.mjs`，去 node 依赖）。
-//!
-//! 在【沙箱】auth_dir 里写一套本地自造、绝不联网的登录凭证，让 Claude Science 认为已登录
-//! （virtual@localhost.invalid），推理经 `ANTHROPIC_BASE_URL` 导去本项目代理。全程零 Anthropic
-//! 接触、零真实凭证。逆向依据与 `.mjs` 一致（见该文件头注与 `docs/verified-facts.md`）：
-//!   - 令牌文件 `<auth_dir>/.oauth-tokens/<sanitized account_uuid>.enc`（目录里恰好一个 .enc）
-//!   - 内容 v2 格式：`"v2:" + base64( IV(12) ‖ AES-256-GCM(密文) ‖ authTag(16) )`
-//!     derivedKey = HKDF-SHA256(ikm=base64_decode(OAUTH_ENCRYPTION_KEY), salt=空, info="operon:aes-256-gcm:oauth", 32)
-//!     AAD = "v2:oauth"；明文 = JSON(tokenBlob)
-//!   - `encryption.key`：换行分隔 KEY=base64(≥16B)；过期设远期 → 绝不触发联网刷新
-//!   - `active-org.json`：`{ "org_uuid": <uuid> }`（Science 只校验 org_uuid 是合法 UUID）
-//!
-//! 铁律护栏：**载重护栏 = 绝不写真实凭证目录**（载荷是假凭证，唯一致命的就是误写真实
-//! `~/.claude-science`）；另加假账号（email 必须 localhost.invalid）、写前拒符号链接、
-//! O_EXCL 临时文件 + rename + 0600。`.mjs` 里那条「必须在 `.sandbox/` 下」是给人手敲
-//! `--auth-dir` 的 CLI 兜底；本函数由 app 用自己构造的沙箱路径调用，不需要该启发式。
-//!
-//! 与 `.mjs` 的 v2 GCM 格式**字节兼容**，由本文件 `tests` 的 node↔rust 双向对拍单测钉死。
+//! Creates isolated local credentials used only inside a CSSwitch-managed sandbox.
+//! Guardrails reject the real account directory, non-local identities, and symlink escapes.
+//! Writes use restrictive permissions and atomic replacement.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -39,7 +24,7 @@ const KEY_NAMES: [&str; 4] = [
 const HKDF_INFO: &[u8] = b"operon:aes-256-gcm:oauth";
 const AAD: &[u8] = b"v2:oauth";
 
-/// 伪造成功后的摘要（供上层日志/回显，不含任何密钥材料）。
+/// Isolated credential setup summary; contains no secret material.
 #[derive(Debug)]
 pub struct ForgeResult {
     pub auth_dir: PathBuf,
@@ -74,7 +59,7 @@ fn hex(bytes: &[u8]) -> String {
     s
 }
 
-/// base64(32 随机字节)：encryption.key 各项的值（与 `.mjs` 的 randomBytes(32).toString("base64") 一致）。
+/// Generates a base64-encoded random key value.
 fn b64_32() -> std::io::Result<String> {
     Ok(B64.encode(rand_bytes(32)?))
 }
@@ -387,7 +372,7 @@ fn write_login(
         return Err("自校验失败：解密回读的 email 不符".into());
     }
 
-    // —— active-org.json（Science 只要求 org_uuid 是 UUID）——
+    // Persist the sandbox organization identifier.
     let org_json = serde_json::to_string_pretty(&json!({ "org_uuid": org_uuid })).unwrap() + "\n";
     safe_write(
         &resolved.join("active-org.json"),
@@ -845,77 +830,6 @@ mod tests {
         let r = forge_guarded(&dir, "attacker@example.com", &dir, &fake_real);
         assert!(r.is_err());
         assert!(r.unwrap_err().contains("localhost.invalid"));
-    }
-
-    // ---- node ↔ rust 双向对拍：证明与 .mjs 的 v2 GCM 格式字节兼容（无 node 则跳过）----
-    fn repo_root() -> PathBuf {
-        // CARGO_MANIFEST_DIR = <repo>/desktop/src-tauri
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..")
-    }
-    fn have_node() -> bool {
-        std::process::Command::new("node")
-            .arg("-v")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
-    }
-
-    #[test]
-    fn crosscompat_rust_reads_node_and_node_reads_rust() {
-        if !have_node() {
-            eprintln!("跳过：环境无 node");
-            return;
-        }
-        let root = repo_root();
-        let mjs = root.join("scripts/make-virtual-oauth.mjs");
-        let decrypt_mjs = root.join("test/decrypt-oauth.mjs");
-        let email = "virtual@localhost.invalid";
-
-        // 方向 1：node 伪造 → rust 解密读回。
-        let dir_n = tmpdir("node2rust");
-        let st = std::process::Command::new("node")
-            .arg(&mjs)
-            .args(["--auth-dir"])
-            .arg(&dir_n)
-            .args(["--email", email, "--force"])
-            .stdout(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        assert!(st.success(), "node 伪造应成功");
-        let key = read_oauth_key(&dir_n);
-        let body = std::fs::read_to_string(the_enc_file(&dir_n)).unwrap();
-        let blob: serde_json::Value =
-            serde_json::from_slice(&decrypt_token_v2(&body, &key).unwrap()).unwrap();
-        assert_eq!(blob["email"], email, "rust 应能解开 node 的 .enc");
-        assert_eq!(blob["provider"], "claude_ai");
-
-        // 方向 2：rust 伪造 → node 解密读回。
-        let dir_r = tmpdir("rust2node");
-        let fake_real = tmpdir("realcred4");
-        forge_guarded(&dir_r, email, &dir_r, &fake_real).unwrap();
-        let out = std::process::Command::new("node")
-            .arg(&decrypt_mjs)
-            .args(["--auth-dir"])
-            .arg(&dir_r)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "node 解密应成功：{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let printed = String::from_utf8_lossy(&out.stdout);
-        assert!(
-            printed.contains(email),
-            "node 应能解开 rust 的 .enc，输出：{printed}"
-        );
-        assert!(printed.contains("claude_ai"));
-
-        for d in [dir_n, dir_r, fake_real] {
-            let _ = std::fs::remove_dir_all(&d);
-        }
     }
 
     // ---------- 幂等 ensure_virtual_login ----------

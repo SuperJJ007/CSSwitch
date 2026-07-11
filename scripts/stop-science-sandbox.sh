@@ -7,6 +7,16 @@ DATA_DIR="$SANDBOX_HOME/.claude-science"
 REAL_DIR="$HOME/.claude-science"
 BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
 
+reject_explicit_science_symlink() {
+  local probe="$1"
+  [[ "$probe" == /* ]] || { echo "拒绝：显式 SCIENCE_BIN 必须是绝对路径: $probe"; return 1; }
+  while [[ "$probe" != "/" ]]; do
+    [[ -L "$probe" ]] && { echo "拒绝：显式 SCIENCE_BIN 路径含符号链接: $probe"; return 1; }
+    probe="${probe:h}"
+  done
+}
+if [[ -n "${SCIENCE_BIN:-}" ]]; then reject_explicit_science_symlink "$BIN" || exit 1; fi
+
 _dd="${DATA_DIR:A}"; _rd="${REAL_DIR:A}"
 if [[ "$_dd" == "$_rd" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 

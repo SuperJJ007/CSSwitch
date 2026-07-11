@@ -287,14 +287,14 @@ mod tests {
     }
 
     fn state_with_proxy_identity() -> SharedAppState {
-        Arc::new(Mutex::new(AppState {
-            secret: "runtime-secret".into(),
-            provider: "deepseek".into(),
-            gateway_kind: "rust".into(),
-            shim_mode: "off".into(),
-            key_fp: 42,
-            ..AppState::default()
-        }))
+        let mut state = AppState::default();
+        state.secret = "runtime-secret".into();
+        state.provider = "deepseek".into();
+        state.gateway_kind = "rust".into();
+        state.shim_mode = "off".into();
+        state.launch_id = "launch-current".into();
+        state.key_fp = 42;
+        Arc::new(Mutex::new(state))
     }
 
     #[test]
@@ -320,6 +320,7 @@ mod tests {
         assert!(st.provider.is_empty());
         assert!(st.gateway_kind.is_empty());
         assert!(st.shim_mode.is_empty());
+        assert!(st.launch_id.is_empty());
         assert_eq!(st.key_fp, 0);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -347,6 +348,7 @@ mod tests {
         assert_eq!(st.provider, "deepseek");
         assert_eq!(st.gateway_kind, "rust");
         assert_eq!(st.shim_mode, "off");
+        assert_eq!(st.launch_id, "launch-current");
         assert_eq!(st.key_fp, 42);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -375,6 +377,7 @@ mod tests {
         assert!(st.provider.is_empty());
         assert!(st.gateway_kind.is_empty());
         assert!(st.shim_mode.is_empty());
+        assert!(st.launch_id.is_empty());
         assert_eq!(st.key_fp, 0);
         let _ = fs::remove_dir_all(&dir);
     }

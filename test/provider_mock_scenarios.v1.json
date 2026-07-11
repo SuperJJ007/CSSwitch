@@ -1,0 +1,618 @@
+{
+  "schema": "csswitch.provider-mock-scenarios",
+  "version": 1,
+  "actions": [
+    "anthropic_json",
+    "anthropic_sse",
+    "dsml",
+    "openai_chat_text_tool",
+    "openai_responses_text_tool",
+    "kimi_sse",
+    "models_json",
+    "status",
+    "malformed_json",
+    "drop_before_headers",
+    "drop_then_success",
+    "delay",
+    "stall",
+    "truncated"
+  ],
+  "scenarios": {
+    "installed_deepseek_matrix": {
+      "description": "Repeatable DeepSeek upstream queue. Discovery is deliberately empty because native models are static.",
+      "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
+      "steps": [
+        {
+          "id": "deepseek-scratch-off",
+          "phase": "scratch",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {
+              "content-type": {"contains": "application/json"},
+              "anthropic-version": {"equals": "2023-06-01"},
+              "x-api-key": {"equals_secret": "provider_key"},
+              "authorization": false
+            },
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/max_tokens"],
+              "types": {"/messages": "array"},
+              "equals": {
+                "/model": "deepseek-v4-pro",
+                "/max_tokens": 1
+              },
+              "shape": ["/stream", "/tools", "/tool_choice"]
+            }
+          },
+          "action": {"type": "anthropic_json", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-formal-off",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {
+              "anthropic-version": {"equals": "2023-06-01"},
+              "x-api-key": {"equals_secret": "provider_key"}
+            },
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/max_tokens", "/thinking/type"],
+              "equals": {
+                "/model": "deepseek-v4-pro",
+                "/max_tokens": 65536,
+                "/thinking/type": "adaptive"
+              }
+            }
+          },
+          "action": {"type": "anthropic_json", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-formal-detect",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/tools"],
+              "types": {"/tools": "array"},
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}
+            }
+          },
+          "action": {"type": "dsml", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-formal-rewrite",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/tools"],
+              "types": {"/tools": "array"},
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}
+            }
+          },
+          "action": {"type": "dsml", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-formal-rewrite-stream",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/tools", "/stream"],
+              "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536, "/stream": true}
+            }
+          },
+          "action": {"type": "dsml", "stream": true, "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-reuse-scratch",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 1}}
+          },
+          "action": {"type": "anthropic_json", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-reuse-formal",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}}
+          },
+          "action": {"type": "anthropic_json", "model": "deepseek-v4-pro"}
+        },
+        {
+          "id": "deepseek-restart-formal",
+          "phase": "restart",
+          "method": "POST",
+          "path": "/deepseek/v1/messages",
+          "checks": {
+            "headers": {"x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "equals": {"/model": "deepseek-v4-pro", "/max_tokens": 65536}}
+          },
+          "action": {"type": "anthropic_json", "model": "deepseek-v4-pro"}
+        }
+      ]
+    },
+    "installed_qwen_matrix": {
+      "description": "Repeatable Qwen Chat, tools, results, stream replay, reuse, and restart queue.",
+      "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
+      "steps": [
+        {
+          "id": "qwen-scratch",
+          "phase": "scratch",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {
+            "headers": {
+              "authorization": {"bearer_secret": "provider_key"},
+              "x-api-key": false,
+              "anthropic-version": false
+            },
+            "body": {
+              "json": true,
+              "required": ["/model", "/messages", "/max_tokens", "/stream"],
+              "equals": {"/model": "qwen3.7-max", "/max_tokens": 1, "/stream": false},
+              "types": {"/messages": "array"}
+            }
+          },
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-formal-chat",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}},
+            "body": {"json": true, "equals": {"/model": "qwen3.7-max", "/max_tokens": 8192, "/stream": false}}
+          },
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-formal-tools-results",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/tools", "/tool_choice", "/messages/1/tool_calls/0/function/name", "/messages/2/tool_call_id"],
+              "types": {"/tools": "array"},
+              "equals": {
+                "/model": "qwen3.7-max",
+                "/max_tokens": 8192,
+                "/stream": false,
+                "/messages/1/tool_calls/0/function/name": "lookup",
+                "/messages/2/role": "tool",
+                "/messages/2/tool_call_id": "toolu_1",
+                "/tool_choice": {"type": "function", "function": {"name": "lookup"}}
+              }
+            }
+          },
+          "action": {"type": "openai_chat_text_tool", "include_tool": true, "tool_name": "grade", "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-formal-stream",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}},
+            "body": {"json": true, "equals": {"/model": "qwen3.7-max", "/max_tokens": 8192, "/stream": false}}
+          },
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "text": "mock qwen stream", "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-reuse-scratch",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "qwen3.7-max", "/max_tokens": 1}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-reuse-formal",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "qwen3.7-max", "/max_tokens": 8192}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "qwen3.7-max"}
+        },
+        {
+          "id": "qwen-restart-formal",
+          "phase": "restart",
+          "method": "POST",
+          "path": "/qwen/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "qwen3.7-max", "/max_tokens": 8192}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "qwen3.7-max"}
+        }
+      ]
+    },
+    "installed_openai_chat_matrix": {
+      "description": "Custom OpenAI discovery and repeated forced-model Chat requests without the Responses cap.",
+      "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
+      "steps": [
+        {
+          "id": "openai-chat-discovery",
+          "phase": "discovery",
+          "method": "GET",
+          "path": "/openai/v1/models",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": false}},
+          "action": {"type": "models_json", "models": ["glm-4.5", "glm-tool"]}
+        },
+        {
+          "id": "openai-chat-scratch",
+          "phase": "scratch",
+          "method": "POST",
+          "path": "/openai/v1/chat/completions",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": false, "anthropic-version": false},
+            "body": {"json": true, "required": ["/messages"], "equals": {"/model": "glm-4.5", "/max_tokens": 1, "/stream": false}}
+          },
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "glm-4.5"}
+        },
+        {
+          "id": "openai-chat-formal",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/openai/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "glm-4.5", "/max_tokens": 1000000, "/stream": false}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": true, "model": "glm-4.5"}
+        },
+        {
+          "id": "openai-chat-reuse-scratch",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/openai/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "glm-4.5", "/max_tokens": 1}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "glm-4.5"}
+        },
+        {
+          "id": "openai-chat-reuse-formal",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/openai/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "glm-4.5", "/max_tokens": 1000000}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "glm-4.5"}
+        },
+        {
+          "id": "openai-chat-restart-formal",
+          "phase": "restart",
+          "method": "POST",
+          "path": "/openai/v1/chat/completions",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "glm-4.5", "/max_tokens": 1000000}}},
+          "action": {"type": "openai_chat_text_tool", "include_tool": false, "model": "glm-4.5"}
+        }
+      ]
+    },
+    "installed_openai_responses_matrix": {
+      "description": "Responses discovery, function call/result mapping, exact call IDs, cap, reuse, and restart.",
+      "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
+      "steps": [
+        {
+          "id": "responses-discovery",
+          "phase": "discovery",
+          "method": "GET",
+          "path": "/responses/v1/models",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": false}},
+          "action": {"type": "models_json", "models": ["gpt-5.2", "gpt-tool"]}
+        },
+        {
+          "id": "responses-scratch",
+          "phase": "scratch",
+          "method": "POST",
+          "path": "/responses/v1/responses",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": false, "anthropic-version": false},
+            "body": {"json": true, "required": ["/input"], "types": {"/input": "array"}, "equals": {"/model": "gpt-5.2", "/max_output_tokens": 1, "/stream": false}}
+          },
+          "action": {"type": "openai_responses_text_tool", "include_tool": false, "model": "gpt-5.2"}
+        },
+        {
+          "id": "responses-formal-tools-results",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/responses/v1/responses",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/input/1/type", "/input/1/call_id", "/input/2/type", "/input/2/call_id", "/tools/0/name"],
+              "types": {"/input": "array", "/tools": "array"},
+              "equals": {
+                "/model": "gpt-5.2",
+                "/max_output_tokens": 65536,
+                "/stream": false,
+                "/input/1/type": "function_call",
+                "/input/1/call_id": "toolu_1",
+                "/input/2/type": "function_call_output",
+                "/input/2/call_id": "toolu_1",
+                "/tools/0/name": "lookup",
+                "/tool_choice": "auto"
+              }
+            }
+          },
+          "action": {"type": "openai_responses_text_tool", "include_tool": true, "tool_name": "lookup", "model": "gpt-5.2"}
+        },
+        {
+          "id": "responses-reuse-scratch",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/responses/v1/responses",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "gpt-5.2", "/max_output_tokens": 1}}},
+          "action": {"type": "openai_responses_text_tool", "include_tool": false, "model": "gpt-5.2"}
+        },
+        {
+          "id": "responses-reuse-formal",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/responses/v1/responses",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "gpt-5.2", "/max_output_tokens": 65536}}},
+          "action": {"type": "openai_responses_text_tool", "include_tool": false, "model": "gpt-5.2"}
+        },
+        {
+          "id": "responses-restart-formal",
+          "phase": "restart",
+          "method": "POST",
+          "path": "/responses/v1/responses",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "gpt-5.2", "/max_output_tokens": 65536}}},
+          "action": {"type": "openai_responses_text_tool", "include_tool": false, "model": "gpt-5.2"}
+        }
+      ]
+    },
+    "installed_relay_matrix": {
+      "description": "Relay discovery, force, thinking, schema normalization, Kimi request filtering, reuse, and restart.",
+      "phases": ["discovery", "scratch", "formal", "reuse", "restart"],
+      "steps": [
+        {
+          "id": "relay-discovery",
+          "phase": "discovery",
+          "method": "GET",
+          "path": "/relay/v1/models",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}, "anthropic-version": {"equals": "2023-06-01"}}},
+          "action": {"type": "models_json", "models": ["MiniMax-M2", "kimi-k2.7-code"]}
+        },
+        {
+          "id": "relay-scratch-force",
+          "phase": "scratch",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}, "anthropic-version": {"equals": "2023-06-01"}},
+            "body": {"json": true, "required": ["/messages"], "equals": {"/model": "MiniMax-M2", "/max_tokens": 1}}
+          },
+          "action": {"type": "anthropic_json", "model": "MiniMax-M2"}
+        },
+        {
+          "id": "relay-formal-force-schema",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/tools/0/input_schema/type", "/tools/1/input_schema/properties"],
+              "equals": {"/model": "MiniMax-M2", "/thinking/type": "adaptive", "/tools/0/input_schema/type": "object", "/tools/1/input_schema": {"type": "object", "properties": {}}}
+            }
+          },
+          "action": {"type": "anthropic_json", "model": "MiniMax-M2"}
+        },
+        {
+          "id": "relay-formal-kimi-thinking-filter",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
+            "body": {
+              "json": true,
+              "required": ["/tools/0/name", "/tools/1/name"],
+              "absent": ["/tools/2", "/tool_choice"],
+              "equals": {"/model": "kimi-k2.7-code", "/thinking/type": "enabled", "/thinking/budget_tokens": 1024, "/tools/0/name": "lookup", "/tools/1/name": "empty", "/tools/0/input_schema/type": "object"}
+            }
+          },
+          "action": {"type": "anthropic_json", "model": "kimi-k2.7-code"}
+        },
+        {
+          "id": "relay-formal-kimi-stream",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {
+            "headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "absent": ["/tool_choice"], "equals": {"/model": "kimi-k2.7-code", "/stream": true, "/thinking/type": "enabled", "/thinking/budget_tokens": 1024}}
+          },
+          "action": {"type": "kimi_sse"}
+        },
+        {
+          "id": "relay-reuse-scratch",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "MiniMax-M2", "/max_tokens": 1}}},
+          "action": {"type": "anthropic_json", "model": "MiniMax-M2"}
+        },
+        {
+          "id": "relay-reuse-formal",
+          "phase": "reuse",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "MiniMax-M2"}}},
+          "action": {"type": "anthropic_json", "model": "MiniMax-M2"}
+        },
+        {
+          "id": "relay-restart-formal",
+          "phase": "restart",
+          "method": "POST",
+          "path": "/relay/v1/messages",
+          "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true, "equals": {"/model": "MiniMax-M2"}}},
+          "action": {"type": "anthropic_json", "model": "MiniMax-M2"}
+        }
+      ]
+    },
+    "relay_siliconflow_proxy_positive": {
+      "description": "HTTP proxy absolute-form fixture for the exact SiliconFlow host; no HTTPS or CONNECT.",
+      "phases": ["formal"],
+      "steps": [
+        {
+          "id": "siliconflow-exact-host",
+          "phase": "formal",
+          "method": "POST",
+          "path": "http://api.siliconflow.cn/v1/messages",
+          "checks": {
+            "headers": {"host": {"equals": "api.siliconflow.cn"}, "authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "required": ["/tools", "/tool_choice"], "equals": {"/tool_choice": {"type": "any"}}}
+          },
+          "action": {"type": "anthropic_json", "model": "siliconflow-mock"}
+        }
+      ]
+    },
+    "relay_siliconflow_proxy_evil_suffix": {
+      "description": "HTTP proxy negative fixture proving a SiliconFlow-like suffix does not trigger the downgrade.",
+      "phases": ["formal"],
+      "steps": [
+        {
+          "id": "siliconflow-evil-suffix",
+          "phase": "formal",
+          "method": "POST",
+          "path": "http://api.siliconflow.cn.evil/v1/messages",
+          "checks": {
+            "headers": {"host": {"equals": "api.siliconflow.cn.evil"}, "authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}},
+            "body": {"json": true, "required": ["/tools", "/tool_choice"], "equals": {"/tool_choice": {"type": "tool", "name": "lookup"}}}
+          },
+          "action": {"type": "anthropic_json", "model": "siliconflow-negative-mock"}
+        }
+      ]
+    },
+    "retry_message_drop3_then_success": {
+      "description": "Three retryable pre-header drops followed by a valid Anthropic response on the same step.",
+      "phases": ["formal"],
+      "steps": [
+        {
+          "id": "retry-message-four-attempts",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/retry/v1/messages",
+          "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true, "required": ["/messages"]}},
+          "action": {"type": "drop_then_success", "drops": 3, "then": {"type": "anthropic_json", "model": "retry-mock"}}
+        }
+      ]
+    },
+    "keepalive_stream_delay_1_2s_then_anthropic_sse": {
+      "description": "A first-byte delay longer than one second followed by a complete Anthropic SSE stream.",
+      "phases": ["formal"],
+      "steps": [
+        {
+          "id": "keepalive-delayed-stream",
+          "phase": "formal",
+          "method": "POST",
+          "path": "/keepalive/v1/messages",
+          "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true, "equals": {"/stream": true}}},
+          "action": {"type": "delay", "seconds": 1.2, "then": {"type": "anthropic_sse", "model": "keepalive-mock"}}
+        }
+      ]
+    },
+    "deepseek_status_matrix": {
+      "description": "DeepSeek actual appended endpoint status mapping.",
+      "phases": ["status-401", "status-403", "status-429", "status-503"],
+      "steps": [
+        {"id": "deepseek-401", "phase": "status-401", "method": "POST", "path": "/deepseek/v1/messages", "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 401}},
+        {"id": "deepseek-403", "phase": "status-403", "method": "POST", "path": "/deepseek/v1/messages", "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 403}},
+        {"id": "deepseek-429", "phase": "status-429", "method": "POST", "path": "/deepseek/v1/messages", "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 429}},
+        {"id": "deepseek-503", "phase": "status-503", "method": "POST", "path": "/deepseek/v1/messages", "checks": {"headers": {"x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "qwen_status_matrix": {
+      "description": "Qwen actual appended endpoint status mapping.",
+      "phases": ["status-401", "status-403", "status-429", "status-503"],
+      "steps": [
+        {"id": "qwen-401", "phase": "status-401", "method": "POST", "path": "/qwen/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 401}},
+        {"id": "qwen-403", "phase": "status-403", "method": "POST", "path": "/qwen/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 403}},
+        {"id": "qwen-429", "phase": "status-429", "method": "POST", "path": "/qwen/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 429}},
+        {"id": "qwen-503", "phase": "status-503", "method": "POST", "path": "/qwen/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "openai_chat_status_matrix": {
+      "description": "Custom Chat actual appended endpoint status mapping.",
+      "phases": ["status-401", "status-403", "status-429", "status-503"],
+      "steps": [
+        {"id": "openai-chat-401", "phase": "status-401", "method": "POST", "path": "/openai/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 401}},
+        {"id": "openai-chat-403", "phase": "status-403", "method": "POST", "path": "/openai/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 403}},
+        {"id": "openai-chat-429", "phase": "status-429", "method": "POST", "path": "/openai/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 429}},
+        {"id": "openai-chat-503", "phase": "status-503", "method": "POST", "path": "/openai/v1/chat/completions", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "openai_responses_status_matrix": {
+      "description": "Responses actual appended endpoint status mapping.",
+      "phases": ["status-401", "status-403", "status-429", "status-503"],
+      "steps": [
+        {"id": "responses-401", "phase": "status-401", "method": "POST", "path": "/responses/v1/responses", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 401}},
+        {"id": "responses-403", "phase": "status-403", "method": "POST", "path": "/responses/v1/responses", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 403}},
+        {"id": "responses-429", "phase": "status-429", "method": "POST", "path": "/responses/v1/responses", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 429}},
+        {"id": "responses-503", "phase": "status-503", "method": "POST", "path": "/responses/v1/responses", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "relay_status_matrix": {
+      "description": "Relay actual appended endpoint status mapping.",
+      "phases": ["status-401", "status-403", "status-429", "status-503"],
+      "steps": [
+        {"id": "relay-401", "phase": "status-401", "method": "POST", "path": "/relay/v1/messages", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 401}},
+        {"id": "relay-403", "phase": "status-403", "method": "POST", "path": "/relay/v1/messages", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 403}},
+        {"id": "relay-429", "phase": "status-429", "method": "POST", "path": "/relay/v1/messages", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 429}},
+        {"id": "relay-503", "phase": "status-503", "method": "POST", "path": "/relay/v1/messages", "checks": {"headers": {"authorization": {"bearer_secret": "provider_key"}, "x-api-key": {"equals_secret": "provider_key"}}, "body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "engine_fault_matrix": {
+      "description": "Explicit protocol fault actions. Every phase must be armed separately.",
+      "phases": ["malformed", "truncated", "delay", "drop"],
+      "steps": [
+        {"id": "fault-malformed", "phase": "malformed", "method": "POST", "path": "/failure/v1/messages", "checks": {"body": {"json": true}}, "action": {"type": "malformed_json"}},
+        {"id": "fault-truncated", "phase": "truncated", "method": "POST", "path": "/failure/v1/messages", "checks": {"body": {"json": true}}, "action": {"type": "truncated", "missing_bytes": 32}},
+        {"id": "fault-delay", "phase": "delay", "method": "POST", "path": "/failure/v1/messages", "checks": {"body": {"json": true}}, "action": {"type": "delay", "seconds": 0.2, "then": {"type": "anthropic_json"}}},
+        {"id": "fault-drop", "phase": "drop", "method": "POST", "path": "/failure/v1/messages", "checks": {"body": {"json": true}}, "action": {"type": "drop_before_headers"}}
+      ]
+    },
+    "stalled_message": {
+      "description": "Long stall interrupted by owned stop.",
+      "phases": ["formal"],
+      "steps": [
+        {"id": "stalled-message", "phase": "formal", "method": "POST", "path": "/failure/v1/messages", "checks": {"body": {"json": true}}, "action": {"type": "stall", "seconds": 30, "then": {"type": "anthropic_json"}}}
+      ]
+    },
+    "status_get_post": {
+      "description": "Engine-level status actions for both GET and POST.",
+      "phases": ["status"],
+      "steps": [
+        {"id": "status-get", "phase": "status", "method": "GET", "path": "/status/200", "action": {"type": "status", "status": 200}},
+        {"id": "status-post", "phase": "status", "method": "POST", "path": "/status/503", "checks": {"body": {"json": true}}, "action": {"type": "status", "status": 503}}
+      ]
+    },
+    "connect_observer_only": {
+      "description": "Mock-side CONNECT observer only. Gateway CONNECT round trips use start_owned_tcp_echo and driver-owned direct assertions.",
+      "phases": ["connect"],
+      "steps": [
+        {"id": "connect-observed", "phase": "connect", "method": "CONNECT", "path": "provider.invalid:443", "action": {"type": "status", "status": 405}}
+      ]
+    }
+  }
+}

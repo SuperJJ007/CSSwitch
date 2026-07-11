@@ -2,6 +2,8 @@
 被 sub-runner（bash 调 CLI 形态）与 unittest（import 形态）共用。"""
 import socket
 
+from _loopback_ports import bind_loopback_listener
+
 
 def loopback_available():
     """能否在 127.0.0.1 上 bind 并 connect。禁 loopback 的沙箱返 False（不抛）。"""
@@ -10,9 +12,7 @@ def loopback_available():
         return False
     srv = cli = None
     try:
-        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        srv.bind(("127.0.0.1", 0))
-        srv.listen(1)
+        srv = bind_loopback_listener(backlog=1)
         port = srv.getsockname()[1]
         cli = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         cli.settimeout(1.0)

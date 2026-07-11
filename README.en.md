@@ -23,11 +23,14 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
+> **0.4.0 upgrade note:** The inference data plane now uses the bundled Rust gateway. Production packages no longer ship a Python proxy or fallback. An in-place install preserves v2 configuration; back up your config first and reinstall the previous stable app if you need to roll back. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+
 ## Contents
 
 - [Why CSSwitch exists](#why-csswitch-exists)
 - [What it can do](#what-it-can-do)
 - [Quick start](#quick-start)
+- [Upgrading from an older version](#upgrading-from-an-older-version)
 - [Supported model sources](#supported-model-sources)
 - [Status diagnostics and capability catalog](#status-diagnostics-and-capability-catalog)
 - [How it protects your real account](#how-it-protects-your-real-account)
@@ -43,12 +46,12 @@ Claude Science is Anthropic's AI agent app for research and analysis workflows, 
 CSSwitch acts as a local runtime control plane:
 
 - It starts Claude Science in an isolated sandbox.
-- It prepares a locally generated launch ticket for Science without copying your real Claude login.
+- It runs third-party model mode in a separate local workspace without taking over your real Claude account.
 - It forwards Science model requests to the provider you choose.
 - It translates between Anthropic Messages API and OpenAI-compatible APIs when needed.
 - It keeps an "Official Claude" mode so subscribers can switch back to the real Science app.
 
-In short: CSSwitch is to Claude Science what CC Switch is to Claude Code, but Science also needs a launch-ticket and sandbox layer.
+In short: CSSwitch is to Claude Science what CC Switch is to Claude Code, with additional desktop-app, isolated-workspace, and local-gateway management.
 
 ```text
 Claude Science sandbox
@@ -82,7 +85,7 @@ Before starting, make sure you have:
 - [Claude Science](https://claude.com)
 - A macOS Apple Silicon device
 - A working third-party model API key
-- `python3` (the current proxy still needs it; moving this into Rust is planned)
+- No separate Python runtime is required; CSSwitch bundles its Rust inference gateway
 
 1. Download the latest `CSSwitch_*.dmg` from [GitHub Releases](../../releases/latest).
 2. Drag CSSwitch into Applications.
@@ -94,6 +97,12 @@ Before starting, make sure you have:
 8. CSSwitch starts the isolated Science instance and opens it in your browser.
 
 If you have a Claude subscription and want the normal official Science experience, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
+
+## Upgrading from an older version
+
+CSSwitch 0.4.0 keeps the existing v2 configuration format. Quit the older CSSwitch app, drag 0.4.0 into Applications, and replace the existing copy. The first launch may still require right-clicking the app and choosing “Open.” Back up `~/.csswitch/config.json` before upgrading. If 0.4.0 blocks your workflow, quit CSSwitch and reinstall the previous stable app; there is no runtime switch back to the Python data plane.
+
+For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 
 ## Supported model sources
 
@@ -115,9 +124,9 @@ If you have a Claude subscription and want the normal official Science experienc
 
 ## Status diagnostics and capability catalog
 
-CSSwitch includes a read-only capability catalog that makes known compatibility boundaries explicit across providers, tool use, MCP/skills, Science versions, and transport behavior. Runtime `status` diagnostics return the catalog rules matched by the current profile plus fixed boundary rules, which helps explain why a configuration is handled a certain way and which capabilities are diagnostic-only or degraded.
+CSSwitch includes a read-only capability catalog for known provider, tool-use, and transport compatibility boundaries. Runtime diagnostics return rules matched by the current profile to explain how that configuration is handled.
 
-This catalog is for diagnostics and observability. It is not proof that a live provider, real Claude account state, Science GUI E2E flow, DMG signing/notarization, or official hosted capability has been verified. A catalog rule id means CSSwitch records that rule or boundary; it does not mean external providers, Anthropic-hosted MCP, Directory connectors, or remote skills are fully verified or fixed.
+This catalog is for diagnostics and observability. It does not mean every external provider, official hosted capability, signing state, or notarization state has been verified.
 
 Status lights are local observations only. For example, the sandbox light is local HTTP health, not proof that the port has been identity-verified as the CSSwitch sandbox Science instance. `Doctor` skips the real `~/.claude-science` path by default; checking whether the real HOME path exists requires explicitly setting `CSSWITCH_DOCTOR_CHECK_REAL_HOME=1`.
 
@@ -126,25 +135,22 @@ Status lights are local observations only. For example, the sandbox light is loc
 CSSwitch's core boundary is simple: third-party model mode keeps credentials, data directories, and proxy routing inside the sandbox. It does not take over your real Claude account.
 
 - It does not copy, read, or modify real Claude login credentials, OAuth tokens, account state, or user data.
-- On first sandbox initialization, it may read-only clone Science runtime assets from the real `~/.claude-science` path, such as `bin`, `conda`, `runtime`, and `seed-assets`; these are not account credentials or conversation data.
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
-- Keys are passed to the local proxy through environment variables, not command-line arguments or logs.
-- The proxy only listens on `127.0.0.1` and validates requests with a path secret.
-- Incoming Science `Authorization` / `x-api-key` headers are stripped before CSSwitch injects your configured third-party key.
+- Keys are not displayed in application logs, and the local gateway listens only on loopback.
 - Official Claude mode tears down the third-party proxy path before handing you back to the real Science app.
 
 ## Current limitations
 
-CSSwitch is not an official Claude service, and its locally generated launch ticket does not grant Anthropic account privileges. These are current architectural limits:
+CSSwitch is not an official Claude service, and third-party model mode does not grant Anthropic account privileges. These are current architectural limits:
 
 - Anthropic-hosted remote MCP services are unavailable, including `pubmed`, `clinical-trials`, `chembl`, `biorxiv`, and other `*.mcp.claude.com` services.
 - Directory connectors, remote plugins, and cloud features that require real Claude account authorization may show session expired, unavailable, or skipped.
 - Third-party models differ in tool use, long context, thinking, image, and streaming compatibility. Native Anthropic endpoints are usually more reliable than OpenAI translation paths.
 - The macOS package is not notarized yet, so the first launch requires manual approval.
-- The current runtime still needs `python3` for the proxy. Moving to a Rust single-binary proxy is on the roadmap.
+- The inference gateway is a bundled Rust sidecar; no runtime Python fallback is shipped.
 
-Known issues and roadmap notes live in [docs/known-issues.md](./docs/known-issues.md).
+Please report problems through [GitHub Issues](https://github.com/SuperJJ007/CSSwitch/issues).
 
 ## Languages
 
@@ -189,26 +195,18 @@ Common checks:
 bash test/run_all.sh
 bash test/run_all.sh --require-release-ready
 
-python3 -m unittest test.test_proxy_units test.test_provider_policy test.test_proxy_packaging -v
+(cd desktop/gateway && cargo test)
 (cd desktop/src-tauri && cargo test)
+python3 -m unittest discover -s test -p 'test_*.py' -v
 node --check desktop/src/main.js
 ```
-
-More development notes:
-
-- [desktop/README.md](./desktop/README.md)
-- [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)
-- [docs/provider-support.md](./docs/provider-support.md)
-- [docs/verified-facts.md](./docs/verified-facts.md)
 
 ## Risk and disclaimer
 
 - This project is for personal learning and research. Use it at your own risk.
 - CSSwitch is not affiliated with, endorsed by, or partnered with Anthropic.
 - Inference requests are sent to the third-party model service you configure and pay for.
-- The locally generated Science launch ticket does not contain real Anthropic credentials and does not grant official Anthropic account permissions.
-- Science may still try to access built-in profile, account, or service-discovery endpoints during startup. In third-party model mode, CSSwitch isolates or fast-fails those requests where possible, so this README intentionally avoids absolute claims such as "never contacts Anthropic".
-- Analysis of Science's login-token encryption format and the local launch-ticket implementation may involve terms-of-service or legal questions. Applicability should be assessed by a qualified professional.
+- Third-party model mode does not grant official Anthropic account permissions; some official hosted capabilities may remain unavailable.
 - The software is provided "as is", without warranty of any kind.
 
 ## Acknowledgements

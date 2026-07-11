@@ -10,10 +10,11 @@ use crate::runtime::diagnostics::{
     build_status_response, proxy_status_last_error, science_diagnostics, status_lights,
     ScienceDiagnosticsInput, StatusProbeInput,
 };
-use crate::runtime::operation::{self, OperationKind, OperationStage, OperationTrace};
+use crate::runtime::operation::{self, OperationKind, OperationTrace};
 use crate::runtime::profile::profile_capabilities;
 use crate::runtime::provider::{
-    adapter_for_profile, current_shim_mode_for_adapter, gateway_kind_for_adapter, upstream_endpoint,
+    adapter_for_profile, current_shim_mode_for_adapter, gateway_kind_for_adapter,
+    status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
 use crate::runtime::science::{settings_change_needs_teardown, stop_sandbox};
@@ -227,62 +228,6 @@ fn start_proxy_inner_cmd<R: tauri::Runtime>(
     })
 }
 
-/// 「存 key 即验证」：确保代理在跑，再经代理向上游发一个最小请求，据状态码判断 key 是否可用。
-#[tauri::command]
-pub(crate) async fn verify_key(
-    app: tauri::AppHandle,
-    state: State<'_, SharedAppState>,
-    lifecycle: State<'_, SharedLifecycle>,
-) -> Result<serde_json::Value, String> {
-    let state = state.inner().clone();
-    let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || verify_key_inner_cmd(app, state, lifecycle)).await
-}
-
-fn verify_key_inner_cmd(
-    app: tauri::AppHandle,
-    state: SharedAppState,
-    lifecycle: SharedLifecycle,
-) -> Result<serde_json::Value, String> {
-    // 经串行器（修 P1-a）：ensure_proxy 与其它生命周期操作不并发交叠。
-    lifecycle.with_serialized(|| {
-        let trace = OperationTrace::start(OperationKind::VerifyKey, "command=verify_key");
-        let (port, secret, _action) =
-            ensure_proxy(&app, &state, lifecycle.as_ref(), Some(&trace))?;
-        let body = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
-        trace.stage(OperationStage::UpstreamProbe, "POST /v1/messages via active proxy");
-        match proc::http_post_status(
-            port,
-            Some(&secret),
-            "/v1/messages",
-            body,
-            operation::VERIFY_KEY_TIMEOUT_MS,
-        ) {
-            Some(200) => {
-                trace.finish("ok status=200");
-                Ok(json!({ "ok": true, "hint": "key 有效，上游已接受。" }))
-            }
-            Some(code @ (401 | 403)) => {
-                trace.finish(format!("rejected status={code}"));
-                Ok(
-                    json!({ "ok": false, "hint": format!("上游拒绝（{code}），key 可能无效或无权限。") }),
-                )
-            }
-            Some(code) => {
-                trace.finish(format!("upstream_status={code}"));
-                Ok(json!({
-                    "ok": false,
-                    "hint": format!("上游返回 {code}，可能是 key 无效、额度不足或上游异常。")
-                }))
-            }
-            None => {
-                trace.finish("error=no_response");
-                Err("验证请求无响应（多为网络或上游不通）。".to_string())
-            }
-        }
-    })
-}
-
 #[derive(Deserialize)]
 pub(crate) struct FetchModelsReq {
     /// 模板 id（决定 builtin / base_url 可编辑性 / 默认 base_url）。
@@ -382,10 +327,13 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         base_url,
         active_profile,
         catalog_profile,
+        tracked_proxy_child_alive,
+        launched_provider,
         launched_gateway_kind,
         launched_shim_mode,
+        launched_launch_id,
     ) = {
-        let st = lock(state.inner());
+        let mut st = lock(state.inner());
         let cfg = match config::load_from(&config::default_dir()) {
             Ok(cfg) => cfg,
             Err(e) => return status_response_for_config_error(&e),
@@ -400,6 +348,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         } else {
             cfg.sandbox_port
         };
+        let tracked_proxy_child_alive = proc::tracked_child_is_running(&mut st.proxy);
         // 上游灯读生效 profile 的 adapter/base_url；无生效配置 → 空（灯显黄，不误探）。
         let (adapter, base_url, active_profile, catalog_profile) = match cfg.active_profile() {
             Some(p) => {
@@ -428,18 +377,27 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             base_url,
             active_profile,
             catalog_profile,
+            tracked_proxy_child_alive,
+            st.provider.clone(),
             st.gateway_kind.clone(),
             st.shim_mode.clone(),
+            st.launch_id.clone(),
         )
     };
-    let upstream = upstream_endpoint(&adapter, &base_url);
-    let proxy_ok = !secret.is_empty()
+    let diagnostic_override = std::env::var_os("CSSWITCH_UPSTREAM_URL");
+    let upstream = status_upstream_endpoint(&adapter, &base_url, diagnostic_override.as_deref());
+    let proxy_ok = tracked_proxy_child_alive
+        && !secret.is_empty()
         && !launched_gateway_kind.is_empty()
+        && !launched_provider.is_empty()
         && proc::http_health_gateway(
             pport,
             Some(&secret),
             operation::STATUS_HEALTH_TIMEOUT_MS,
             &launched_gateway_kind,
+            Some(&launched_provider),
+            Some(launched_shim_mode.as_str()),
+            Some(launched_launch_id.as_str()),
         );
     let last_error = proxy_status_last_error(!secret.is_empty(), proxy_ok, pport);
     let sandbox_ok = proc::http_health(sport, None, operation::STATUS_HEALTH_TIMEOUT_MS);
@@ -539,7 +497,7 @@ mod tests {
     fn status_runtime_identity_prefers_launched_identity_and_fail_closes_partial_launch() {
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "", String::new(), String::new());
-        assert_eq!(gateway, "python");
+        assert_eq!(gateway, "rust");
         assert_eq!(shim, "off");
         assert_eq!(catalog_shim, "off");
 
@@ -847,8 +805,7 @@ esac
         assert_eq!(status["upstream"], "green");
         assert_eq!(status["active_profile"]["id"], "mock-relay");
         assert_eq!(status["science"]["sandbox"]["port"], sandbox_port);
-        assert_eq!(status["science"]["auth"]["real_account_verified"], false);
-        assert_eq!(status["science"]["auth"]["real_home_verified"], false);
+        assert_eq!(status["science"]["schema_version"], 1);
         assert!(status["last_error"].is_null());
 
         let doctor = std::process::Command::new(root.join("scripts/doctor.sh"))

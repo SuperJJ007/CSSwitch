@@ -29,7 +29,7 @@ pub(crate) fn should_write_back(
 
 /// 探活超时的原因措辞（纯函数，修真机 P2）：本地 `/health` 不验上游 key，故探活超时与 key 有效性
 /// 无关。日志出现绑定失败（Address already in use / EADDRINUSE）→ 明确报端口占用；否则报「探活超时」
-/// （多为 python 依赖缺失 / 脚本异常），绝不再含糊说「或 key 无效」。
+/// （多为 sidecar 缺失 / 启动异常），绝不再含糊说「或 key 无效」。
 pub(crate) fn health_timeout_reason(port: u16, tail: &str) -> String {
     let occupied = tail.contains("Address already in use")
         || tail.contains("EADDRINUSE")
@@ -39,26 +39,14 @@ pub(crate) fn health_timeout_reason(port: u16, tail: &str) -> String {
         format!("端口 {port} 已被占用，换个端口或先停掉占用进程后重试。")
     } else {
         format!(
-            "代理起后探活超时（端口 {port}）：多为 python 依赖缺失或代理脚本异常，请查看代理日志。"
+            "代理起后探活超时（端口 {port}）：多为 Rust sidecar 缺失或启动异常，请查看代理日志。"
         )
     }
 }
 
-/// Escape ERE metacharacters so a path can be matched literally by `pkill -f`.
-pub(crate) fn ere_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    for c in s.chars() {
-        if "\\.^$*+?()[]{}|".contains(c) {
-            out.push('\\');
-        }
-        out.push(c);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{ere_escape, health_timeout_reason, should_write_back};
+    use super::{health_timeout_reason, should_write_back};
 
     #[test]
     fn should_write_back_requires_both_gen_and_secret() {
@@ -80,18 +68,10 @@ mod tests {
         assert!(occ.contains("占用"), "应明确报端口占用：{occ}");
         assert!(!occ.contains("key"), "端口占用不该扯上 key：{occ}");
         // 其它探活失败（依赖缺失等）：本地探活与 key 有效性无关，不得说「key 无效」。
-        let generic = health_timeout_reason(18991, "ModuleNotFoundError: No module named 'x'");
+        let generic = health_timeout_reason(18991, "failed to execute sidecar");
         assert!(
             !generic.contains("key 无效"),
             "本地探活超时与 key 有效性无关：{generic}"
-        );
-    }
-
-    #[test]
-    fn ere_escape_makes_path_literal_for_extended_regex() {
-        assert_eq!(
-            ere_escape("/tmp/a+b(proxy).py"),
-            "/tmp/a\\+b\\(proxy\\)\\.py"
         );
     }
 }

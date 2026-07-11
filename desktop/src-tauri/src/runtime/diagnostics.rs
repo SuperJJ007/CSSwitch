@@ -42,23 +42,6 @@ pub(crate) fn science_diagnostics(input: ScienceDiagnosticsInput) -> serde_json:
             "port": input.sandbox_port,
             "health": light(input.sandbox_ok),
         },
-        "auth": {
-            "mode": "virtual_oauth",
-            "real_account_verified": false,
-            "real_home_verified": false,
-            "known_boundary_rule_ids": [
-                "science.auth.virtual-oauth-scope-boundary",
-                "science.auth.refresh-hardcoded-0_1_15",
-            ],
-        },
-        "version": {
-            "status_probe": "not_run_in_status_poll",
-            "known_rule_ids": [
-                "science.version.0_1_15_dev.route-diff",
-                "science.auth.refresh-hardcoded-0_1_15",
-            ],
-            "note": "status() does not run claude-science binary/version probes; use isolated HOME and non-8765 ports before making Science-version or real-account claims.",
-        },
     })
 }
 
@@ -160,7 +143,7 @@ mod tests {
                 "api_format": "anthropic",
                 "model": "glm-5.2",
             }),
-            "python",
+            "rust",
             "off",
             json!({
                 "schema_version": 1,
@@ -178,17 +161,13 @@ mod tests {
         assert_eq!(v["sandbox"], "amber");
         assert_eq!(v["upstream"], "green");
         assert_eq!(v["active_profile"]["template_id"], "glm");
-        assert_eq!(v["runtime"]["gateway_kind"], "python");
+        assert_eq!(v["runtime"]["gateway_kind"], "rust");
         assert_eq!(v["runtime"]["shim_mode"], "off");
         assert_eq!(v["catalog"]["schema_version"], 1);
         assert_eq!(v["science"]["schema_version"], 1);
         assert_eq!(v["science"]["sandbox"]["port"], 8990);
         assert_eq!(v["science"]["sandbox"]["health"], "amber");
-        assert_eq!(v["science"]["auth"]["real_account_verified"], false);
-        assert_eq!(
-            v["science"]["version"]["known_rule_ids"][1],
-            "science.auth.refresh-hardcoded-0_1_15"
-        );
+        assert_object_keys(&v["science"], &["sandbox", "schema_version"]);
         assert!(v["last_error"].is_null());
     }
 
@@ -215,7 +194,7 @@ mod tests {
                     "supports_tools_hint": "native",
                 },
             }),
-            "python",
+            "rust",
             "detect",
             json!({
                 "schema_version": 1,
@@ -260,7 +239,7 @@ mod tests {
             v["active_profile"]["capabilities"]["thinking_policy"],
             "adaptive"
         );
-        assert_eq!(v["runtime"]["gateway_kind"], "python");
+        assert_eq!(v["runtime"]["gateway_kind"], "rust");
         assert_eq!(v["runtime"]["shim_mode"], "detect");
         assert!(v["last_error"].is_null());
     }
@@ -313,7 +292,7 @@ mod tests {
                 upstream_ok: false,
             }),
             serde_json::Value::Null,
-            "python",
+            "rust",
             "off",
             json!({"schema_version": 1}),
             science_diagnostics(ScienceDiagnosticsInput {
@@ -352,7 +331,7 @@ mod tests {
                 upstream_ok: true,
             }),
             serde_json::Value::Null,
-            "python",
+            "rust",
             "off",
             json!({"schema_version": 1}),
             science_diagnostics(ScienceDiagnosticsInput {
@@ -377,7 +356,7 @@ mod tests {
                 upstream_ok: true,
             }),
             Value::Null,
-            "python",
+            "rust",
             "off",
             json!({"schema_version": 1}),
             science_diagnostics(ScienceDiagnosticsInput {
@@ -389,7 +368,7 @@ mod tests {
 
         assert!(v["active_profile"].is_null());
         assert_object_keys(&v["runtime"], &["gateway_kind", "shim_mode"]);
-        assert_eq!(v["runtime"]["gateway_kind"], "python");
+        assert_eq!(v["runtime"]["gateway_kind"], "rust");
         assert_eq!(v["runtime"]["shim_mode"], "off");
         assert_object_keys(&v["last_error"], &["message", "port", "type"]);
         assert_eq!(v["last_error"]["type"], "proxy_unhealthy");

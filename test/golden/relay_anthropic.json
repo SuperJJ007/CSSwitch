@@ -1,0 +1,231 @@
+{
+  "force_mapped": {
+    "max_tokens": 1000000,
+    "messages": [],
+    "model": "MiniMax-M2"
+  },
+  "force_request": {
+    "max_tokens": 1000000,
+    "messages": [],
+    "model": "claude-opus-4-8"
+  },
+  "force_rule_ids": [
+    "provider.relay.force-model-shell"
+  ],
+  "force_target_model": "MiniMax-M2",
+  "kimi_mapped": {
+    "max_tokens": 2048,
+    "messages": [],
+    "model": "kimi-k2.7-code",
+    "thinking": {
+      "budget_tokens": 1024,
+      "type": "enabled"
+    },
+    "tools": [
+      {
+        "description": "lookup",
+        "input_schema": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "type": "object"
+        },
+        "name": "lookup"
+      },
+      {
+        "input_schema": {
+          "properties": {},
+          "type": "object"
+        },
+        "name": "empty"
+      }
+    ]
+  },
+  "kimi_request": {
+    "max_tokens": 2048,
+    "messages": [],
+    "model": "claude-opus-4-8",
+    "tool_choice": {
+      "name": "web_search",
+      "type": "tool"
+    },
+    "tools": [
+      {
+        "input_schema": {
+          "type": "object"
+        },
+        "name": "web_search"
+      },
+      {
+        "description": "lookup",
+        "input_schema": {
+          "properties": {
+            "q": {
+              "type": "string"
+            }
+          },
+          "required": "bad"
+        },
+        "name": "lookup"
+      },
+      {
+        "input_schema": [],
+        "name": "empty"
+      }
+    ]
+  },
+  "kimi_rule_ids": [
+    "provider.relay.force-model-shell",
+    "provider.kimi.relay-thinking-enabled",
+    "tool.relay.input-schema-normalize",
+    "tool.kimi.web_search.server-tool-filter"
+  ],
+  "kimi_target_model": "kimi-k2.7-code",
+  "plain_mapped": {
+    "max_tokens": 1000000,
+    "messages": [
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5-20251001",
+    "thinking": {
+      "type": "adaptive"
+    }
+  },
+  "plain_request": {
+    "max_tokens": 1000000,
+    "messages": [
+      {
+        "content": "hi",
+        "role": "user"
+      }
+    ],
+    "model": "claude-haiku-4-5",
+    "thinking": {
+      "type": "auto"
+    }
+  },
+  "plain_rule_ids": [],
+  "plain_target_model": "claude-haiku-4-5-20251001",
+  "siliconflow_tool_choice_cases": [
+    {
+      "name": "cn_forced_named_nonstream",
+      "endpoint": "https://API.SILICONFLOW.CN/v1/messages",
+      "request": {
+        "model": "claude-opus-4-8",
+        "stream": false,
+        "messages": [],
+        "tools": [{"name": "lookup", "description": "lookup", "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}],
+        "tool_choice": {"type": "tool", "name": "lookup"}
+      },
+      "mapped": {
+        "model": "claude-opus-4-8",
+        "stream": false,
+        "messages": [],
+        "tools": [{"name": "lookup", "description": "lookup", "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}],
+        "tool_choice": {"type": "any"}
+      },
+      "rule_ids": ["tool.relay.input-schema-normalize", "tool.siliconflow.forced-named-to-any"]
+    },
+    {
+      "name": "com_fqdn_forced_named_stream",
+      "endpoint": "http://api.siliconflow.com./anthropic/v1/messages",
+      "request": {
+        "model": "claude-opus-4-8",
+        "stream": true,
+        "messages": [],
+        "tools": [{"name": "lookup", "description": "lookup", "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}],
+        "tool_choice": {"type": "tool", "name": "lookup"}
+      },
+      "mapped": {
+        "model": "claude-opus-4-8",
+        "stream": true,
+        "messages": [],
+        "tools": [{"name": "lookup", "description": "lookup", "input_schema": {"type": "object", "properties": {"q": {"type": "string"}}}}],
+        "tool_choice": {"type": "any"}
+      },
+      "rule_ids": ["tool.relay.input-schema-normalize", "tool.siliconflow.forced-named-to-any"]
+    },
+    {
+      "name": "siliconflow_auto_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "auto"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "auto"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "siliconflow_any_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "any"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "any"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "siliconflow_none_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "none"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "none"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "siliconflow_string_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": "tool"},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": "tool"},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "siliconflow_required_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "required"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "required"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "non_siliconflow_forced_named_unchanged",
+      "endpoint": "https://relay.example/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "evil_suffix_forced_named_unchanged",
+      "endpoint": "https://api.siliconflow.cn.evil/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "userinfo_forced_named_unchanged",
+      "endpoint": "https://evil@api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "empty_userinfo_forced_named_unchanged",
+      "endpoint": "https://@api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "double_trailing_dot_forced_named_unchanged",
+      "endpoint": "https://api.siliconflow.cn../v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tools": [{"name": "lookup", "input_schema": {"type": "object", "properties": {}}}], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": ["tool.relay.input-schema-normalize"]
+    },
+    {
+      "name": "siliconflow_without_tools_unchanged",
+      "endpoint": "https://api.siliconflow.cn/v1/messages",
+      "request": {"model": "claude-opus-4-8", "messages": [], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "mapped": {"model": "claude-opus-4-8", "messages": [], "tool_choice": {"type": "tool", "name": "lookup"}},
+      "rule_ids": []
+    }
+  ]
+}

@@ -1,0 +1,49 @@
+{
+  "web_search_schema": {
+    "web_search": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "numeric_schema": {
+    "calc": {
+      "type": "object",
+      "properties": {
+        "n": {
+          "type": "integer"
+        },
+        "f": {
+          "type": "number"
+        },
+        "b": {
+          "type": "boolean"
+        },
+        "o": {
+          "type": "object"
+        },
+        "arr": {
+          "type": "array"
+        }
+      }
+    }
+  },
+  "wrapped_text": "A<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name=\"web_search\"><｜｜DSML｜｜parameter name=\"query\" string=\"true\">q</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>B",
+  "unknown_tool_text": "<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name=\"evil\"><｜｜DSML｜｜parameter name=\"c\" string=\"true\">x</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>",
+  "typed_call": "<｜｜DSML｜｜tool_calls> <｜｜DSML｜｜invoke name=\"calc\"><｜｜DSML｜｜parameter name=\"n\" string=\"false\">42</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"f\" string=\"false\">3.5</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"b\" string=\"false\">true</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"o\" string=\"false\">{\"k\":1}</｜｜DSML｜｜parameter><｜｜DSML｜｜parameter name=\"arr\" string=\"false\">[1,2]</｜｜DSML｜｜parameter> </｜｜DSML｜｜invoke> </｜｜DSML｜｜tool_calls>",
+  "expected_typed_input": {
+    "n": 42,
+    "f": 3.5,
+    "b": true,
+    "o": {
+      "k": 1
+    },
+    "arr": [
+      1,
+      2
+    ]
+  }
+}

@@ -15,7 +15,6 @@ useDefault = true
 description = "运行期资产（gitignore 之外的双保险）+ 测试假 token / 占位常量"
 paths = [
   '''\.sandbox/''',            # 隔离沙箱运行时（大文件、克隆资产），已 gitignore
-  '''findings/auto-maint/''',  # 每日巡检运行态产物，已 gitignore
   '''node_modules/''',         # 前端依赖（含各包自带的测试假 token），已 gitignore
   '''target/''',               # Rust 构建产物，已 gitignore
 ]
@@ -28,5 +27,5 @@ regexes = [
   '''sk-abcdef1234''',          # config.rs save_then_load_roundtrips 测试 fixture
   '''sk-secret-tail9999''',     # config.rs mask 测试 fixture
   '''sk-1234567890ab''',        # config.rs mask 测试 fixture
-  '''sk-definitely-invalid''',  # test/RM_RETEST_STEPS.md 故意无效 key（RM-06 坏 key 拦截步骤）
+  '''sk-definitely-invalid''',  # intentionally invalid test fixture
 ]
