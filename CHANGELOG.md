@@ -2,6 +2,20 @@
 
 CSSwitch follows semantic versioning. Older release notes remain available on the [GitHub Releases page](https://github.com/SuperJJ007/CSSwitch/releases).
 
+## [0.4.1] — 2026-07-11
+
+### Fixed
+
+- Fixed upgrades from Python-based releases leaving an orphaned CSSwitch proxy on the configured port and blocking “Start.”
+- CSSwitch now stops a legacy listener only when the listening PID, current user, Python process name, exact previous bundle script path, provider argument, and configured port all match.
+- Unknown listeners, unrelated Python processes, and unverified stale gateways remain untouched and continue to fail closed.
+
+### Upgrade notes
+
+- Replace the existing app with `CSSwitch_0.4.1_aarch64.dmg`; v2 profiles remain compatible.
+- The first start may take a moment while an exact legacy CSSwitch Python proxy exits and the Rust gateway takes ownership of the port.
+- If CSSwitch cannot prove that a listener belongs to the legacy bundle, it will still ask you to choose a free port or stop that process manually.
+
 ## [0.4.0] — 2026-07-11
 
 ### Added

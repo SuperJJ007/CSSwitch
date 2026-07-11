@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.0"><img src="https://img.shields.io/badge/release-v0.4.0-2ea44f.svg" alt="CSSwitch v0.4.0"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.1"><img src="https://img.shields.io/badge/release-v0.4.1-2ea44f.svg" alt="CSSwitch v0.4.1"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 [Download latest release](../../releases/latest) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.0 upgrade note:** The inference data plane now uses the bundled Rust gateway. Production packages no longer ship a Python proxy or fallback. An in-place install preserves v2 configuration; back up your config first and reinstall the previous stable app if you need to roll back. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
+> **0.4.1 upgrade note:** The inference data plane uses the bundled Rust gateway. Version 0.4.1 safely stops a legacy CSSwitch Python proxy only when its identity matches exactly; unknown listeners still fail closed. An in-place install preserves v2 configuration. See [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 
 ## Contents
 
@@ -101,7 +101,7 @@ If you have a Claude subscription and want the normal official Science experienc
 
 ## Upgrading from an older version
 
-CSSwitch 0.4.0 keeps the existing v2 configuration format. Quit the older CSSwitch app, drag 0.4.0 into Applications, and replace the existing copy. The first launch may still require right-clicking the app and choosing “Open.” Back up `~/.csswitch/config.json` before upgrading. If 0.4.0 blocks your workflow, quit CSSwitch and reinstall the previous stable app; there is no runtime switch back to the Python data plane.
+CSSwitch 0.4.1 keeps the existing v2 configuration format. Quit the older CSSwitch app, drag 0.4.1 into Applications, and replace the existing copy. The first launch may still require right-clicking the app and choosing “Open.” Back up `~/.csswitch/config.json` before upgrading. If 0.4.1 blocks your workflow, quit CSSwitch and reinstall the previous stable app; there is no runtime switch back to the Python data plane.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/upgrade-and-rollback.md).
 

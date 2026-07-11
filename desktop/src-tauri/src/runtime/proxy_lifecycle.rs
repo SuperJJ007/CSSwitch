@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use tauri::{Manager, Runtime};
 
+use crate::runtime::legacy_proxy::{stop_legacy_csswitch_python_on_port, LegacyProxyCleanup};
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
     assert_format_supported, current_shim_mode_for_adapter, is_native_adapter, is_openai_adapter,
     normalize_shim_mode, proxy_args_for, proxy_fingerprint_with_runtime, ProxyLaunch,
 };
 use crate::runtime::proxy::{health_timeout_reason, should_write_back, ProxyAction};
-use crate::runtime::system::{log_path, open_log, redact, repo_root, tail_file};
+use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
 fn formal_proxy_env(launch: &ProxyLaunch) -> Vec<(&'static str, String)> {
@@ -254,9 +255,36 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 
         st.stop_proxy();
         if proc::loopback_port_in_use(port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
-            return Err(format!(
-                "端口 {port} 已被未知或旧 listener 占用；为避免发送鉴权信息或接管/结束非本轮进程，已拒绝启动。请手工确认后改用空闲端口。"
-            ));
+            let legacy_script = asset_root(app).map(|root| root.join("proxy/csswitch_proxy.py"));
+            let cleanup = legacy_script
+                .as_deref()
+                .map(|script| stop_legacy_csswitch_python_on_port(port, script))
+                .unwrap_or(LegacyProxyCleanup::NotLegacy);
+            match cleanup {
+                LegacyProxyCleanup::Stopped(pid) => {
+                    if let Some(t) = trace {
+                        t.stage(
+                            OperationStage::ProxySpawn,
+                            format!("stopped legacy CSSwitch Python proxy pid={pid} port={port}"),
+                        );
+                    }
+                }
+                LegacyProxyCleanup::StopFailed(pid) => {
+                    return Err(format!(
+                        "已确认端口 {port} 由旧版 CSSwitch Python proxy（PID {pid}）占用，但安全停止失败。请退出旧版或重启电脑后重试；未发送鉴权信息，也未强制结束进程。"
+                    ));
+                }
+                LegacyProxyCleanup::NotLegacy => {
+                    return Err(format!(
+                        "端口 {port} 已被未知或旧 listener 占用；为避免发送鉴权信息或接管/结束非本轮进程，已拒绝启动。请手工确认后改用空闲端口。"
+                    ));
+                }
+            }
+            if proc::loopback_port_in_use(port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
+                return Err(format!(
+                    "旧版 CSSwitch proxy 已停止，但端口 {port} 随即被其它 listener 占用；未发送鉴权信息，也未结束新占用者。请改用空闲端口。"
+                ));
+            }
         }
         st.secret = secret.clone();
 

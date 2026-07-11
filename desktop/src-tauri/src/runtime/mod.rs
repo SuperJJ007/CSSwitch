@@ -1,5 +1,6 @@
 pub(crate) mod capability_catalog;
 pub(crate) mod diagnostics;
+pub(crate) mod legacy_proxy;
 pub(crate) mod model_discovery;
 pub(crate) mod operation;
 pub(crate) mod profile;

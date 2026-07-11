@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.0"><img src="https://img.shields.io/badge/release-v0.4.0-2ea44f.svg" alt="CSSwitch v0.4.0"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.4.1"><img src="https://img.shields.io/badge/release-v0.4.1-2ea44f.svg" alt="CSSwitch v0.4.1"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -24,7 +24,7 @@ CSSwitch 是一个给 Claude Science 使用的本地模型切换器。它把 Sci
 
 [下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.4.0 升级提示：** 推理数据面已改为随应用打包的 Rust gateway，正式包不再携带 Python proxy 或 fallback。覆盖安装会保留 v2 配置；升级前建议备份配置，需要回退时重新安装上一稳定版。见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+> **0.4.1 升级提示：** 推理数据面使用随应用打包的 Rust gateway。0.4.1 会在身份完全匹配时安全清理旧版遗留的 CSSwitch Python proxy；未知 listener 仍保持拒绝处理。覆盖安装会保留 v2 配置，见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 
 ## 目录
 
@@ -101,7 +101,7 @@ Claude Science sandbox
 
 ## 从旧版升级
 
-0.4.0 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.0 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份 `~/.csswitch/config.json`。如果 0.4.0 阻断你的工作流，请先退出 CSSwitch，再重新安装上一稳定版；0.4.0 没有可切回 Python 数据面的运行时开关。
+0.4.1 保留现有 v2 配置格式。退出旧版 CSSwitch 后，将 0.4.1 拖入「应用程序」并覆盖即可；首次启动仍可能需要右键选择「打开」。升级前建议备份 `~/.csswitch/config.json`。如果 0.4.1 阻断你的工作流，请先退出 CSSwitch，再重新安装上一稳定版；0.4.1 没有可切回 Python 数据面的运行时开关。
 
 完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
 
