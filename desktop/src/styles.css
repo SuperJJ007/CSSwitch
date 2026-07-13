@@ -117,6 +117,11 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 /* 表单视图（向导/连接/改名）隐藏运行控制区与页脚；反馈消息区 .feedback 始终可见（P1-3）。 */
 .panel.view-form .list-only{display:none}
 .feedback{border-top:1px solid var(--line)}
+.runtime-choice{background:color-mix(in srgb,var(--amber) 7%,var(--panel))}
+.runtime-choice-title{font-size:12.5px;font-weight:650;color:var(--ink)}
+.runtime-choice-text{margin-top:5px;font-size:11px;line-height:1.5;color:var(--sub)}
+.runtime-choice .subbtns{flex-wrap:wrap}
+.runtime-choice .btn{flex:1 1 auto}
 /* 模板选择 chip 网格（对齐 CC Switch；替代下拉）。 */
 .chips{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin-top:2px}
 .chip{display:flex;align-items:center;gap:7px;padding:9px 10px;border:1px solid var(--line);

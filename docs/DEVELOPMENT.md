@@ -20,6 +20,19 @@ If Science already owns the capability, CSSwitch may expose a link or diagnostic
 - State source tests, built-artifact tests, installed-copy tests, installed-runtime tests, live-provider tests, signing/notarization, and public release as separate evidence layers.
 - A test that copied files does not prove Science discovery; discovery does not prove triggering or functional execution.
 
+## Science upgrade compatibility
+
+After every installed Science update, verify all of the following as separate evidence:
+
+1. the exact App executable path and `--version` output selected by CSSwitch;
+2. reuse of the intended persistent CSSwitch data-dir without copying real-HOME runtime assets;
+3. the live process executable, Science version-runtime directory, data-dir, and listening port belong to the same run;
+4. one-click start, reopen, status, URL, and stop keep the same in-memory runtime identity;
+5. natural-language external-Skill routing plus install/attach/load/restart/uninstall/detach E2E;
+6. Skill bridge incompatibility remains warning-only and ordinary Science Agent behavior still works.
+
+Do not convert a successful check on one upstream build into a global minimum-version rule. Prefer runtime interface probes and exact evidence. If a newer Science changes an observed interface, CSSwitch must disable only the affected bridge and report the incompatibility; it must not replace or downgrade the user's App.
+
 ## Dirty worktrees
 
 Treat uncommitted work as user data. Do not reset, clean, overwrite, or remove a dirty worktree. Use a focused worktree from the intended base for isolated changes. Remove old worktrees only after verifying they are clean and no branch or artifact is still needed; do not delete remote branches automatically.

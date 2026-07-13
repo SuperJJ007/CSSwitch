@@ -26,6 +26,8 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 > **0.4.4：** CSSwitch 一键启动不再扫描外部 Skill、读取旧 store/inventory 或执行 reconcile。升级继续复用 `~/.csswitch/sandbox/home/.claude-science`，不迁移、删除或覆盖现有 Science 数据。现行边界见 [架构说明](./docs/ARCHITECTURE.md)。
 
+> **0.4.5 本机测试版：** CSSwitch 把一个固定的外部 Skill 路由挂到 Science 默认 Agent，引导安装/卸载请求使用两个专用 connector。安装避开 catalog 控制的 `host.skills.edit/publish`，复制完成后使用 Science 原生 `host.agents.attach_skill` 绑定并验证；卸载把 CSSwitch 导入目录移入本地隔离回收区，再使用原生 `detach_skill`，不调用 `host.skills.delete` 或手动删目录。首次操作会出现 MCP 工具确认和一个专用桥目录的读写授权。只说 Skill 名称时，Agent 可以搜索候选来源，但不能安装一个含糊猜测；桥本身始终要求准确 URL。详见 [外部 Skill 安装桥](./docs/EXTERNAL_SKILL_INSTALL.md)。
+
 ## 目录
 
 - [为什么需要 CSSwitch](#为什么需要-csswitch)
@@ -70,7 +72,9 @@ Claude Science sandbox
 - 点击「一键开始」会自动启动代理、准备隔离环境、打开 Science。
 - Science 顶部模型选择器会显示你选择的真实模型名，而不是笼统的 `claude` 或 `opus`。
 - 可以一键切回「官方 Claude」模式，不干扰你的真实 Claude 登录。
-- 复用 Science 的持久化 data-dir；Skill 状态不再阻塞 CSSwitch 启动。第三方模式下，依赖 Anthropic 账号 catalog 的 Science 原生 Skill 导入/发布入口可能不可用。
+- 复用 Science 的持久化 data-dir；Skill 状态不再阻塞 CSSwitch 启动。0.4.5 本机测试版可通过对话安装公开 GitHub Skill 目录；原生导入/发布入口仍可能受 Anthropic catalog 限制。
+- CSSwitch 默认继承 `/Applications/Claude Science.app` 中用户当前安装的 Science，不比较、固定、升级或降级版本；更新 App 后，下次启动继续复用原 data-dir 并使用更新后的 App executable。
+- 如果 Science App 缺失，CSSwitch 不会静默启动 data-dir 中的旧缓存。只有缓存可执行且版本可确认时，UI 才允许“仅本次使用缓存版本”；该选择不保存。否则只能打开 [Claude 官方下载页](https://claude.com/download) 安装 / 更新或取消。
 
 **给进阶用户**
 
@@ -84,7 +88,7 @@ Claude Science sandbox
 
 开始之前，请确认你已经安装：
 
-- [Claude Science](https://claude.com)
+- [Claude Science（Claude 官方下载页）](https://claude.com/download)
 - macOS Apple Silicon 设备
 - 一个可用的第三方模型 API Key
 - CSSwitch 已内置 Rust inference gateway，无需另外安装 Python 运行时
@@ -97,6 +101,8 @@ Claude Science sandbox
 6. 点击「创建」，再在配置列表中点击「设为当前」。
 7. 验证通过后点击「一键开始」。
 8. CSSwitch 会启动隔离 Science，并在浏览器中打开入口。
+
+CSSwitch 不替你选择 Science 版本。正常启动使用当前安装的 Claude Science App；如果 App 缺失，面板会据实显示可确认的历史缓存版本并要求你明确选择“仅本次使用”，或打开官方下载页安装 / 更新。缓存选择不会写入配置；以后检测到 App 时会自动恢复使用 App。
 
 如果你想使用 Science 的官方服务配置，切到「官方 Claude」模式即可。CSSwitch 会停止第三方代理链路，再打开真实 Science。
 
@@ -148,7 +154,7 @@ CSSwitch 不是 Claude 官方服务，第三方模型模式也不会获得 Anthr
 
 - Anthropic 托管的远程 MCP 服务不可用，例如 `pubmed`、`clinical-trials`、`chembl`、`biorxiv` 等 `*.mcp.claude.com` 服务。
 - 依赖真实 Claude 账号授权的目录连接器、远程插件、云端能力可能会显示 session expired、unavailable 或 skipped。
-- Science 当前的外部 Skill GitHub 导入和新 Skill 发布会查询 Anthropic 账号 catalog；第三方模型模式没有真实 Anthropic 登录时可能失败。CSSwitch 0.4.4 不伪造 OAuth 或 catalog，也尚未提供自然语言本地安装桥。
+- Science 当前的原生外部 Skill GitHub 导入、新 Skill 发布和草稿删除会查询 Anthropic 账号 catalog；第三方模型模式没有真实 Anthropic 登录时可能失败。CSSwitch 不伪造 OAuth 或 catalog。0.4.5 本机测试版仅增加公开 GitHub 目录的本地安装与隔离回收；不提供搜索、更新、覆盖、永久删除/恢复界面、私有仓库或发布。
 - 第三方模型对工具调用、长上下文、thinking、图片和流式输出的兼容程度不同；原生 Anthropic 端点通常比 OpenAI 翻译路径更稳。
 - 当前 macOS 包尚未 Apple 公证，首次启动需要手动放行。
 - inference gateway 已是随应用打包的 Rust sidecar；不再提供运行时 Python fallback。

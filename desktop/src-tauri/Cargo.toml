@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.4.4"
+version = "0.4.5"
 description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
 authors = ["CSSwitch"]
 edition = "2021"
@@ -30,6 +30,7 @@ aes-gcm = "0.10"
 hkdf = "0.12"
 sha2 = "0.10"
 base64 = "0.22"
+libc = "0.2"
 
 [dev-dependencies]
 tauri = { version = "2", features = ["test"] }

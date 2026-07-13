@@ -104,6 +104,10 @@ function mockInvoke(cmd, args) {
       return Promise.resolve(null);
     case "one_click_login":
       return Promise.resolve({ url: "http://127.0.0.1:8990", msg: "（预览模式：假装已就绪）", action: "started" });
+    case "science_runtime_preflight":
+      return Promise.resolve({ status: "installed_ready", selected_source: "installed_app", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
+    case "open_science_download_page":
+      return Promise.resolve(null);
     case "status":
       return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
     case "boot_error":
@@ -383,6 +387,7 @@ function setBusy(on, op) {
   if (!on) clearBusyMsgTimers();
   [
     els.oneClickBtn, els.stopBtn, els.newBtn,
+    els.runtimeUseCacheBtn, els.runtimeDownloadBtn, els.runtimeChoiceCancelBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
@@ -1010,16 +1015,27 @@ async function activate(id, skipVerify) {
   }
 }
 
-// ── 一键开始：读 active profile。无生效则引导先建/选一条（不再对旧 provider 槽落未提交输入）。──
-async function oneClick() {
-  if (!configState.active_id) {
-    setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
-    return;
-  }
+function hideRuntimeChoice() {
+  els.runtimeChoiceSec.hidden = true;
+  els.runtimeChoiceText.textContent = "";
+}
+
+function showRuntimeChoice(preflight) {
+  const cachedVersion = preflight && preflight.cached_version;
+  const canUseCache = preflight && preflight.status === "cached_choice_required" && !!cachedVersion;
+  els.runtimeUseCacheBtn.hidden = !canUseCache;
+  els.runtimeChoiceText.textContent = canUseCache
+    ? "未找到已安装的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
+    : "未找到可用的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
+  els.runtimeChoiceSec.hidden = false;
+}
+
+async function runOneClick(runtimeChoice) {
+  hideRuntimeChoice();
   setBusy(true, { kind: "oneClick" });
   startOneClickFeedback();
   try {
-    const r = await call("one_click_login");
+    const r = await call("one_click_login", { runtimeChoice: runtimeChoice || null });
     // 透传后端据实回传的 msg（已重开 / 已用新配置重启 / 沿用原对话 / 已启动 / 打开失败请手动打开）。
     setMsg((r.msg || "已就绪，正在打开面板…") + "\n" + (r.url || ""), "ok");
     await refreshStatus();
@@ -1028,6 +1044,46 @@ async function oneClick() {
   } finally {
     setBusy(false);
   }
+}
+
+// ── 一键开始：先确认本次实际 Science runtime，再进入原启动链路。──
+async function oneClick() {
+  if (!configState.active_id) {
+    setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
+    return;
+  }
+  setBusy(true, { kind: "oneClick" });
+  setMsg("正在确认本次使用的 Claude Science…");
+  try {
+    const preflight = await call("science_runtime_preflight");
+    if (preflight && preflight.status === "installed_ready") {
+      setBusy(false);
+      await runOneClick(null);
+      return;
+    }
+    showRuntimeChoice(preflight || { status: "missing" });
+    setMsg(preflight && preflight.status === "cached_choice_required"
+      ? "Claude Science App 未安装。请选择是否仅本次使用已确认版本的缓存。"
+      : "Claude Science App 未安装，且没有可安全启动的缓存版本。", "err");
+  } catch (e) {
+    setMsg("Science 运行环境检查失败：" + e, "err");
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function openScienceDownload() {
+  try {
+    await call("open_science_download_page");
+    setMsg("已打开 Claude 官方下载页。安装完成后请再次点击「一键开始」。");
+  } catch (e) {
+    setMsg("打开 Claude 官方下载页失败：" + e, "err");
+  }
+}
+
+function cancelRuntimeChoice() {
+  hideRuntimeChoice();
+  setMsg("已取消，本次没有启动 Claude Science。");
 }
 
 async function stopAll() {
@@ -1127,6 +1183,7 @@ async function refreshStatus() {
 function wire() {
   [
     "oneClickBtn", "stopBtn", "ltProxy", "ltSandbox", "ltUpstream",
+    "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "advSec",
     "listSec", "profileList", "newBtn", "skipActivateBtn",
@@ -1186,6 +1243,9 @@ function wire() {
   els.metaCancelBtn.addEventListener("click", cancelForm);
 
   els.oneClickBtn.addEventListener("click", heroClick);
+  els.runtimeUseCacheBtn.addEventListener("click", () => runOneClick("cached_once"));
+  els.runtimeDownloadBtn.addEventListener("click", openScienceDownload);
+  els.runtimeChoiceCancelBtn.addEventListener("click", cancelRuntimeChoice);
   els.stopBtn.addEventListener("click", stopAll);
   els.openBrowserBtn.addEventListener("click", openBrowser);
   els.doctorBtn.addEventListener("click", runDoctor);

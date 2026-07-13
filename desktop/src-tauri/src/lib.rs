@@ -88,6 +88,8 @@ pub(crate) struct AppState {
     pub(crate) sandbox: Option<Child>,
     pub(crate) sandbox_port: u16,
     pub(crate) sandbox_url: Option<String>,
+    /// 当前 CSSwitch Science daemon 的实际 binary 身份，仅存内存；绝不形成版本偏好。
+    pub(crate) science_runtime: Option<runtime::science::ScienceRuntimeIdentity>,
     boot: BootState,
     pub(crate) boot_error: Option<String>,
 }
@@ -235,7 +237,12 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
             LaunchPath::BootScience => {
                 let state_inner = state.inner().clone();
                 let lifecycle = app.state::<SharedLifecycle>().inner().clone();
-                match commands::runtime::one_click_login_cmd(app.clone(), state_inner, lifecycle) {
+                match commands::runtime::one_click_login_cmd(
+                    app.clone(),
+                    state_inner,
+                    lifecycle,
+                    None,
+                ) {
                     Ok(_) => {
                         let mut st = lock(state.inner());
                         st.boot = BootState::Ready;
@@ -274,6 +281,8 @@ pub fn run() {
             commands::runtime::fetch_models,
             commands::runtime::stop_all,
             commands::runtime::one_click_login,
+            commands::runtime::science_runtime_preflight,
+            commands::runtime::open_science_download_page,
             commands::runtime::status,
             commands::runtime::boot_error,
             commands::runtime::open_url,

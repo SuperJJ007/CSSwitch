@@ -1,7 +1,10 @@
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use tauri::{Manager, Runtime};
 
 use crate::runtime::legacy_proxy::{stop_legacy_csswitch_python_on_port, LegacyProxyCleanup};
@@ -64,6 +67,147 @@ pub(crate) fn configure_managed_proxy_command(
     }
 }
 
+pub(crate) fn skill_install_bridge_dir(secret: &str) -> Result<PathBuf, String> {
+    if secret.len() < 24 || !secret.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err("CSSwitch secret 格式非法，无法创建 Skill 安装桥".into());
+    }
+    let csswitch_dir = config::default_dir();
+    let home = csswitch_dir.parent().ok_or("无法确定用户主目录")?;
+    Ok(home.join(format!("CSSwitch-Skill-Bridge-{}", &secret[..24])))
+}
+
+pub(crate) fn configure_skill_install_host(
+    cmd: &mut Command,
+    data_dir: &Path,
+    secret: &str,
+    launch_id: &str,
+) -> Result<(), String> {
+    let bridge_dir = skill_install_bridge_dir(secret)?;
+    let bridge_token = skill_install_bridge_token(secret, launch_id)?;
+    write_skill_install_bridge_key(&bridge_token)?;
+    cmd.env("CSSWITCH_SKILL_DATA_DIR", data_dir)
+        .env("CSSWITCH_SKILL_BRIDGE_DIR", bridge_dir)
+        .env("CSSWITCH_SKILL_BRIDGE_TOKEN", bridge_token);
+    Ok(())
+}
+
+fn skill_install_bridge_token(secret: &str, launch_id: &str) -> Result<String, String> {
+    if secret.len() < 24
+        || !secret
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+        || launch_id.len() < 24
+        || !launch_id
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return Err("CSSwitch secret 格式非法，无法保护 Skill 安装桥".into());
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"csswitch-skill-install-bridge-v1\0");
+    hash.update(secret.as_bytes());
+    hash.update(b"\0");
+    hash.update(launch_id.as_bytes());
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+fn skill_install_bridge_key_path() -> PathBuf {
+    config::default_dir()
+        .join("runtime")
+        .join("skill-install-bridge.key")
+}
+
+pub(crate) fn current_skill_install_bridge_key() -> Result<PathBuf, String> {
+    let key_file = skill_install_bridge_key_path();
+    reject_skill_bridge_symlinks(&key_file)?;
+    let metadata =
+        fs::metadata(&key_file).map_err(|_| "CSSwitch 私有 Skill bridge key file 不可用")?;
+    if !metadata.is_file() || metadata.len() > 128 {
+        return Err("CSSwitch 私有 Skill bridge key file 类型非法".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err("CSSwitch 私有 Skill bridge key file 权限非法".into());
+        }
+    }
+    Ok(key_file)
+}
+
+fn write_skill_install_bridge_key(token: &str) -> Result<PathBuf, String> {
+    let runtime_dir = config::default_dir().join("runtime");
+    reject_skill_bridge_symlinks(&runtime_dir)?;
+    fs::create_dir_all(&runtime_dir).map_err(|_| "无法创建 CSSwitch 私有 Skill bridge key 目录")?;
+    reject_skill_bridge_symlinks(&runtime_dir)?;
+    #[cfg(unix)]
+    fs::set_permissions(
+        &runtime_dir,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .map_err(|_| "无法收紧 CSSwitch 私有 Skill bridge key 目录权限")?;
+    let key_file = skill_install_bridge_key_path();
+    reject_skill_bridge_symlinks(&key_file)?;
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = runtime_dir.join(format!(
+        ".skill-install-bridge.key.{}-{suffix}",
+        std::process::id()
+    ));
+    let result = (|| -> Result<(), String> {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options
+            .open(&temporary)
+            .map_err(|_| "无法创建 CSSwitch 私有 Skill bridge key")?;
+        file.write_all(token.as_bytes())
+            .and_then(|_| file.write_all(b"\n"))
+            .and_then(|_| file.sync_all())
+            .map_err(|_| "无法写入 CSSwitch 私有 Skill bridge key")?;
+        fs::rename(&temporary, &key_file).map_err(|_| "无法提交 CSSwitch 私有 Skill bridge key")?;
+        #[cfg(unix)]
+        fs::set_permissions(
+            &key_file,
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .map_err(|_| "无法收紧 CSSwitch 私有 Skill bridge key 权限")?;
+        File::open(&runtime_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|_| "无法同步 CSSwitch 私有 Skill bridge key 目录")?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result?;
+    Ok(key_file)
+}
+
+fn reject_skill_bridge_symlinks(path: &Path) -> Result<(), String> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("CSSwitch 私有 Skill bridge key 路径包含符号链接".into())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("无法检查 CSSwitch 私有 Skill bridge key 路径".into()),
+        }
+    }
+    Ok(())
+}
+
 fn find_gateway_in(dir: &Path) -> Option<PathBuf> {
     let exact = dir.join(if cfg!(windows) {
         "csswitch-gateway.exe"
@@ -98,7 +242,7 @@ pub(crate) fn gateway_bin_path<R: Runtime>(app: &tauri::AppHandle<R>) -> Option<
     )
 }
 
-fn gateway_bin_path_from(
+pub(crate) fn gateway_bin_path_from(
     env_bin: Option<PathBuf>,
     current_exe: Option<PathBuf>,
     resource_dir: Option<PathBuf>,
@@ -312,6 +456,16 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             &secret,
             &launch_id,
         );
+        // The external-Skill bridge is optional. Unsafe or unwritable bridge
+        // state disables only that bridge; it must never prevent the proxy (and
+        // therefore Science) from starting.
+        let _skill_install_bridge_ready = configure_skill_install_host(
+            &mut cmd,
+            &crate::runtime::science::sandbox_home().join(".claude-science"),
+            &secret,
+            &launch_id,
+        )
+        .is_ok();
         for (k, v) in formal_proxy_env(&launch) {
             cmd.env(k, v);
         }
@@ -416,6 +570,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 mod tests {
     use super::{
         configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
+        skill_install_bridge_token,
     };
     use crate::runtime::provider::ProxyLaunch;
     use std::fs;
@@ -552,6 +707,17 @@ mod tests {
     fn formal_proxy_env_preserves_relay_thinking_policy() {
         let env = formal_proxy_env(&launch_with_thinking("relay", "glm-5.2", "enabled"));
         assert!(env.contains(&("CSSWITCH_RELAY_THINKING", "enabled".to_string())));
+    }
+
+    #[test]
+    fn skill_bridge_token_rotates_with_gateway_launch_identity() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let first = skill_install_bridge_token(secret, "11111111111111111111111111111111").unwrap();
+        let second =
+            skill_install_bridge_token(secret, "22222222222222222222222222222222").unwrap();
+        assert_eq!(first.len(), 64);
+        assert_ne!(first, second);
+        assert!(!first.contains(secret));
     }
 
     #[test]

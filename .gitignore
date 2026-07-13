@@ -55,6 +55,7 @@ test/A3_INSTALLED_APP_MANUAL_TEST.md
 test/decrypt-oauth.mjs
 test/test_make_virtual_oauth.mjs
 docs/*
+!docs/EXTERNAL_SKILL_INSTALL.md
 !docs/assets/
 !docs/assets/**
 !docs/ARCHITECTURE.md

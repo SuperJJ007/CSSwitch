@@ -8,4 +8,6 @@ pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod policy;
+pub mod science_control;
 pub mod server;
+pub mod skill_install;

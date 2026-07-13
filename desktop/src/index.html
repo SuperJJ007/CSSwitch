@@ -112,6 +112,17 @@
         <div class="msg" id="msg" role="status" aria-live="polite"></div>
       </div>
 
+      <!-- App 缺失时的 runtime 选择。缓存授权只作用于下一次启动命令，不写配置。 -->
+      <div class="sec runtime-choice list-only" id="runtimeChoiceSec" hidden>
+        <div class="runtime-choice-title">需要选择 Claude Science</div>
+        <div class="runtime-choice-text" id="runtimeChoiceText"></div>
+        <div class="subbtns">
+          <button class="btn" id="runtimeUseCacheBtn">仅本次使用缓存版本</button>
+          <button class="btn" id="runtimeDownloadBtn">安装 / 更新 Science</button>
+          <button class="btn" id="runtimeChoiceCancelBtn">取消</button>
+        </div>
+      </div>
+
       <!-- 运行控制区 + 状态灯：仅列表视图显示（表单视图由 .view-form 隐藏）。 -->
       <div class="sec list-only">
         <button class="hero" id="oneClickBtn">⚡ 一键开始</button>

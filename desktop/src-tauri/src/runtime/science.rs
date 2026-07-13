@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::Duration;
 
+use serde_json::{json, Value};
 use tauri::Runtime;
 
 use crate::{config, proc};
@@ -11,6 +12,32 @@ use super::system::{asset_root, kill_child};
 
 pub(crate) const SCIENCE_BIN: &str =
     "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
+pub(crate) const SCIENCE_DOWNLOAD_URL: &str = "https://claude.com/download";
+pub(crate) const CACHED_ONCE_CHOICE: &str = "cached_once";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScienceRuntimeSource {
+    Explicit,
+    InstalledApp,
+    CachedOnce,
+}
+
+impl ScienceRuntimeSource {
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Explicit => "explicit",
+            Self::InstalledApp => "installed_app",
+            Self::CachedOnce => "cached_once",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScienceRuntimeIdentity {
+    pub(crate) path: PathBuf,
+    pub(crate) source: ScienceRuntimeSource,
+    pub(crate) version: Option<String>,
+}
 
 /// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
 pub(crate) fn sandbox_home() -> PathBuf {
@@ -69,28 +96,186 @@ fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
-fn science_bin_for_paths(
-    data_dir: &Path,
-    explicit_bin: Option<&Path>,
-    app_bin: &Path,
-) -> Option<PathBuf> {
-    if let Some(bin) = explicit_bin {
-        return is_explicit_executable_file(bin).then(|| bin.to_path_buf());
+fn cached_science_bin(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin").join("claude-science")
+}
+
+fn safe_science_version(path: &Path) -> Option<String> {
+    let output = Command::new(path).arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
     }
-    let sandbox_bin = data_dir.join("bin").join("claude-science");
-    if is_executable_file(&sandbox_bin) {
-        return Some(sandbox_bin);
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.lines().next()?.trim();
+    if value.is_empty()
+        || value.len() > 160
+        || !value
+            .bytes()
+            .all(|byte| byte == b' ' || (0x21..=0x7e).contains(&byte))
+    {
+        return None;
     }
-    if is_executable_file(app_bin) {
-        Some(app_bin.to_path_buf())
-    } else {
-        None
+    Some(value.to_string())
+}
+
+fn runtime_identity(path: PathBuf, source: ScienceRuntimeSource) -> ScienceRuntimeIdentity {
+    let version = safe_science_version(&path);
+    ScienceRuntimeIdentity {
+        path,
+        source,
+        version,
     }
 }
 
-fn science_bin_for(data_dir: &Path) -> Option<PathBuf> {
-    let explicit_bin = std::env::var_os("SCIENCE_BIN").map(PathBuf::from);
-    science_bin_for_paths(data_dir, explicit_bin.as_deref(), Path::new(SCIENCE_BIN))
+fn explicit_science_bin() -> Result<Option<PathBuf>, String> {
+    let Some(path) = std::env::var_os("SCIENCE_BIN").map(PathBuf::from) else {
+        return Ok(None);
+    };
+    if !is_explicit_executable_file(&path) {
+        return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
+    }
+    Ok(Some(path))
+}
+
+fn science_runtime_preflight_for_paths(
+    data_dir: &Path,
+    explicit_bin: Option<&Path>,
+    app_bin: &Path,
+) -> Result<Value, String> {
+    if let Some(bin) = explicit_bin {
+        if !is_explicit_executable_file(bin) {
+            return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
+        }
+        let identity = runtime_identity(bin.to_path_buf(), ScienceRuntimeSource::Explicit);
+        return Ok(json!({
+            "status": "installed_ready",
+            "selected_source": identity.source.code(),
+            "selected_version": identity.version,
+            "cached_version": Value::Null,
+            "download_url": SCIENCE_DOWNLOAD_URL,
+        }));
+    }
+    if is_executable_file(app_bin) {
+        let identity = runtime_identity(app_bin.to_path_buf(), ScienceRuntimeSource::InstalledApp);
+        return Ok(json!({
+            "status": "installed_ready",
+            "selected_source": identity.source.code(),
+            "selected_version": identity.version,
+            "cached_version": Value::Null,
+            "download_url": SCIENCE_DOWNLOAD_URL,
+        }));
+    }
+    let cached = cached_science_bin(data_dir);
+    let cached_version = is_executable_file(&cached)
+        .then(|| safe_science_version(&cached))
+        .flatten();
+    if let Some(version) = cached_version {
+        return Ok(json!({
+            "status": "cached_choice_required",
+            "selected_source": Value::Null,
+            "selected_version": Value::Null,
+            "cached_version": version,
+            "download_url": SCIENCE_DOWNLOAD_URL,
+        }));
+    }
+    Ok(json!({
+        "status": "missing",
+        "selected_source": Value::Null,
+        "selected_version": Value::Null,
+        "cached_version": Value::Null,
+        "download_url": SCIENCE_DOWNLOAD_URL,
+    }))
+}
+
+pub(crate) fn science_runtime_preflight() -> Result<Value, String> {
+    if let Ok(cfg) = config::load_from(&config::default_dir()) {
+        let (state, runtime) = probe_sandbox_runtime(cfg.sandbox_port)?;
+        if state == SandboxScienceState::RunningHealthy {
+            let runtime = runtime.ok_or("Science 状态为运行中，但无法确认其 binary 身份")?;
+            return Ok(json!({
+                "status": "installed_ready",
+                "selected_source": runtime.source.code(),
+                "selected_version": runtime.version,
+                "cached_version": Value::Null,
+                "download_url": SCIENCE_DOWNLOAD_URL,
+            }));
+        }
+    }
+    let data_dir = sandbox_data_dir();
+    let explicit = explicit_science_bin()?;
+    science_runtime_preflight_for_paths(&data_dir, explicit.as_deref(), Path::new(SCIENCE_BIN))
+}
+
+fn select_science_runtime_for_paths(
+    data_dir: &Path,
+    explicit_bin: Option<&Path>,
+    app_bin: &Path,
+    choice: Option<&str>,
+) -> Result<ScienceRuntimeIdentity, String> {
+    if let Some(bin) = explicit_bin {
+        if !is_explicit_executable_file(bin) {
+            return Err("显式 SCIENCE_BIN 不是安全的绝对可执行文件；已拒绝回退".into());
+        }
+        return Ok(runtime_identity(
+            bin.to_path_buf(),
+            ScienceRuntimeSource::Explicit,
+        ));
+    }
+    if is_executable_file(app_bin) {
+        return Ok(runtime_identity(
+            app_bin.to_path_buf(),
+            ScienceRuntimeSource::InstalledApp,
+        ));
+    }
+    let cached = cached_science_bin(data_dir);
+    let cached_version = is_executable_file(&cached)
+        .then(|| safe_science_version(&cached))
+        .flatten();
+    if choice == Some(CACHED_ONCE_CHOICE) {
+        let version = cached_version
+            .ok_or("缓存 Science 版本无法确认；请安装或更新 Claude Science 后再试")?;
+        return Ok(ScienceRuntimeIdentity {
+            path: cached,
+            source: ScienceRuntimeSource::CachedOnce,
+            version: Some(version),
+        });
+    }
+    if cached_version.is_some() {
+        return Err("SCIENCE_RUNTIME_CHOICE_REQUIRED：请明确选择仅本次使用缓存版本，或安装/更新 Claude Science".into());
+    }
+    Err("找不到可用的 Claude Science App；请先安装或更新 Claude Science".into())
+}
+
+pub(crate) fn select_science_runtime(
+    choice: Option<&str>,
+) -> Result<ScienceRuntimeIdentity, String> {
+    let data_dir = sandbox_data_dir();
+    let explicit = explicit_science_bin()?;
+    select_science_runtime_for_paths(
+        &data_dir,
+        explicit.as_deref(),
+        Path::new(SCIENCE_BIN),
+        choice,
+    )
+}
+
+fn runtime_probe_candidates() -> Result<Vec<ScienceRuntimeIdentity>, String> {
+    if let Some(explicit) = explicit_science_bin()? {
+        return Ok(vec![runtime_identity(
+            explicit,
+            ScienceRuntimeSource::Explicit,
+        )]);
+    }
+    let mut candidates = Vec::new();
+    let app = PathBuf::from(SCIENCE_BIN);
+    if is_executable_file(&app) {
+        candidates.push(runtime_identity(app, ScienceRuntimeSource::InstalledApp));
+    }
+    let cached = cached_science_bin(&sandbox_data_dir());
+    if is_executable_file(&cached) && safe_science_version(&cached).is_some() {
+        candidates.push(runtime_identity(cached, ScienceRuntimeSource::CachedOnce));
+    }
+    Ok(candidates)
 }
 
 #[cfg(test)]
@@ -115,11 +300,20 @@ fn science_status_value(out: &Output) -> Option<bool> {
     None
 }
 
+#[cfg(test)]
 fn trusted_science_status(out: &Output) -> Option<bool> {
     if out.status.success() {
         science_status_value(out)
     } else {
         None
+    }
+}
+
+fn runtime_status_value(out: &Output) -> Option<bool> {
+    match science_status_value(out) {
+        Some(false) => Some(false),
+        Some(true) if out.status.success() => Some(true),
+        _ => None,
     }
 }
 
@@ -130,6 +324,7 @@ pub(crate) enum SandboxScienceState {
     Unknown,
 }
 
+#[cfg(test)]
 fn classify_sandbox_state(
     status: Option<bool>,
     health_ready: bool,
@@ -142,57 +337,158 @@ fn classify_sandbox_state(
     }
 }
 
+fn classify_known_runtime_state(
+    status: Option<bool>,
+    health_ready: bool,
+    port_accepts_tcp: bool,
+    listener_matches_runtime: bool,
+) -> SandboxScienceState {
+    match status {
+        Some(true) if health_ready && listener_matches_runtime => {
+            SandboxScienceState::RunningHealthy
+        }
+        Some(false) if !port_accepts_tcp => SandboxScienceState::Stopped,
+        _ => SandboxScienceState::Unknown,
+    }
+}
+
 fn loopback_port_accepts_tcp(port: u16) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
 }
 
+fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
+    let listener = Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output();
+    let Ok(listener) = listener else {
+        return false;
+    };
+    if !listener.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(listener.stdout) else {
+        return false;
+    };
+    let mut pids = stdout.lines().map(str::trim).filter(|pid| !pid.is_empty());
+    let Some(pid) = pids.next() else {
+        return false;
+    };
+    if pids.any(|other| other != pid) {
+        return false;
+    }
+    let Ok(expected) = runtime.path.canonicalize() else {
+        return false;
+    };
+    let text_files = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", pid, "-d", "txt", "-Fn"])
+        .output();
+    let Ok(text_files) = text_files else {
+        return false;
+    };
+    if !text_files.status.success() {
+        return false;
+    }
+    let expected = format!("n{}", expected.display());
+    String::from_utf8(text_files.stdout)
+        .ok()
+        .is_some_and(|stdout| stdout.lines().any(|line| line == expected))
+}
+
 /// Return the sandbox UI URL, falling back to the plain localhost port.
-pub(crate) fn sandbox_url(port: u16) -> String {
+pub(crate) fn sandbox_url(port: u16, runtime: &ScienceRuntimeIdentity) -> String {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
-    if let Some(bin) = science_bin_for(&data_dir) {
-        if let Ok(out) = Command::new(bin)
-            .arg("url")
-            .arg("--data-dir")
-            .arg(&data_dir)
-            .env("HOME", &home)
-            .output()
-        {
-            let s = String::from_utf8_lossy(&out.stdout);
-            if let Some(url) = first_http_url(&s) {
-                return url;
-            }
+    if let Ok(out) = Command::new(&runtime.path)
+        .arg("url")
+        .arg("--data-dir")
+        .arg(&data_dir)
+        .env("HOME", &home)
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout);
+        if let Some(url) = first_http_url(&s) {
+            return url;
         }
     }
     format!("http://127.0.0.1:{port}")
 }
 
-/// Check that the sandbox Science associated with our data-dir is running.
-/// A naked `/health` response is not sufficient identity proof.
-pub(crate) fn sandbox_running_ours(port: u16) -> bool {
-    sandbox_science_state(port) == SandboxScienceState::RunningHealthy
-}
-
-pub(crate) fn sandbox_science_state(port: u16) -> SandboxScienceState {
-    let home = sandbox_home();
-    let data_dir = sandbox_data_dir();
-    let Some(bin) = science_bin_for(&data_dir) else {
-        return SandboxScienceState::Unknown;
-    };
-    let Ok(out) = Command::new(bin)
+fn runtime_status(runtime: &ScienceRuntimeIdentity) -> Option<bool> {
+    let out = Command::new(&runtime.path)
         .arg("status")
         .arg("--data-dir")
-        .arg(&data_dir)
-        .env("HOME", &home)
+        .arg(sandbox_data_dir())
+        .env("HOME", sandbox_home())
         .output()
-    else {
-        return SandboxScienceState::Unknown;
-    };
-    let status = trusted_science_status(&out);
+        .ok()?;
+    // Some Science builds use a non-zero exit to mean "not running" while
+    // still returning a valid {"running":false} payload. Accept only that
+    // negative result; a non-zero positive or malformed response stays unknown.
+    runtime_status_value(&out)
+}
+
+pub(crate) fn probe_known_runtime(
+    port: u16,
+    runtime: &ScienceRuntimeIdentity,
+) -> SandboxScienceState {
+    let status = runtime_status(runtime);
     let health_ready = proc::http_health(port, None, 400);
     let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
-    classify_sandbox_state(status, health_ready, port_accepts_tcp)
+    let listener_matches_runtime =
+        status == Some(true) && health_ready && listener_uses_runtime(port, runtime);
+    classify_known_runtime_state(
+        status,
+        health_ready,
+        port_accepts_tcp,
+        listener_matches_runtime,
+    )
+}
+
+pub(crate) fn probe_sandbox_runtime(
+    port: u16,
+) -> Result<(SandboxScienceState, Option<ScienceRuntimeIdentity>), String> {
+    let health_ready = proc::http_health(port, None, 400);
+    let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
+    let candidates = runtime_probe_candidates()?;
+    let no_candidates = candidates.is_empty();
+    let mut saw_stopped = false;
+    let mut saw_running_unconfirmed = false;
+    for runtime in candidates {
+        match runtime_status(&runtime) {
+            Some(true) if health_ready && listener_uses_runtime(port, &runtime) => {
+                return Ok((SandboxScienceState::RunningHealthy, Some(runtime)))
+            }
+            Some(true) => saw_running_unconfirmed = true,
+            Some(false) => saw_stopped = true,
+            None => {}
+        }
+    }
+    if saw_running_unconfirmed {
+        return Ok((SandboxScienceState::Unknown, None));
+    }
+    if !port_accepts_tcp && (saw_stopped || !sandbox_data_dir().exists()) {
+        return Ok((SandboxScienceState::Stopped, None));
+    }
+    if !port_accepts_tcp && no_candidates {
+        return Ok((SandboxScienceState::Stopped, None));
+    }
+    Ok((SandboxScienceState::Unknown, None))
+}
+
+fn recover_running_runtime(port: u16) -> Result<Option<ScienceRuntimeIdentity>, String> {
+    for runtime in runtime_probe_candidates()? {
+        if runtime_status(&runtime) == Some(true) && listener_uses_runtime(port, &runtime) {
+            return Ok(Some(runtime));
+        }
+    }
+    Ok(None)
+}
+
+/// Check that the sandbox Science associated with our data-dir is running.
+/// A naked `/health` response is not sufficient identity proof.
+pub(crate) fn sandbox_running_ours(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
+    probe_known_runtime(port, runtime) == SandboxScienceState::RunningHealthy
 }
 
 /// Stop the sandbox Science process and clear the in-memory sandbox URL.
@@ -203,7 +499,25 @@ pub(crate) fn stop_sandbox<R: Runtime>(
     app: &tauri::AppHandle<R>,
     sandbox: &mut Option<Child>,
     sandbox_url: &mut Option<String>,
+    runtime: Option<&ScienceRuntimeIdentity>,
 ) -> Result<(), String> {
+    if !sandbox_data_dir().exists() {
+        kill_child(sandbox);
+        *sandbox_url = None;
+        return Ok(());
+    }
+    let recovered;
+    let runtime = match runtime {
+        Some(runtime) => runtime,
+        None => {
+            let port = config::load_from(&config::default_dir())
+                .map_err(|e| format!("读取 Science 端口配置失败：{e}"))?
+                .sandbox_port;
+            recovered = recover_running_runtime(port)?
+                .ok_or("无法确认当前 Science daemon 使用的 binary；已拒绝按端口停止")?;
+            &recovered
+        }
+    };
     let mut err = None;
     match asset_root(app) {
         Some(root) => {
@@ -212,6 +526,7 @@ pub(crate) fn stop_sandbox<R: Runtime>(
                 match Command::new("zsh")
                     .arg(&stop)
                     .env("SANDBOX_HOME", sandbox_home())
+                    .env("SCIENCE_BIN", &runtime.path)
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())
                     .status()
@@ -251,9 +566,11 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_sandbox_state, first_http_url, sandbox_home, sandbox_running_ours, sandbox_url,
-        science_bin_for_paths, science_status_running, settings_change_needs_teardown,
-        trusted_science_status, SandboxScienceState,
+        classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
+        sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
+        science_status_running, select_science_runtime_for_paths, settings_change_needs_teardown,
+        trusted_science_status, SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource,
+        CACHED_ONCE_CHOICE,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -362,68 +679,154 @@ mod tests {
             trusted_science_status(&status_output(1, r#"{"running":false}"#)),
             None
         );
+        assert_eq!(
+            runtime_status_value(&status_output(1, r#"{"running":false}"#)),
+            Some(false),
+            "a selected runtime may report stopped with a non-zero CLI exit"
+        );
+        assert_eq!(
+            runtime_status_value(&status_output(1, r#"{"running":true}"#)),
+            None,
+            "a non-zero positive status is never trusted"
+        );
     }
 
     #[test]
-    fn science_bin_selection_matches_launch_script_priority(
+    fn known_runtime_classifier_requires_listener_binary_identity() {
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, true),
+            SandboxScienceState::RunningHealthy
+        );
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, false),
+            SandboxScienceState::Unknown
+        );
+    }
+
+    #[test]
+    fn runtime_selection_requires_explicit_one_shot_cache_choice(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let root = unique_temp_dir("science-bin-selection")?;
         let data_dir = root.join("home").join(".claude-science");
         let explicit_bin = root.join("explicit-claude-science");
-        let sandbox_bin = data_dir.join("bin").join("claude-science");
+        let cached_bin = data_dir.join("bin").join("claude-science");
         let app_bin = root.join("app-claude-science");
 
-        write_fake_bin(&explicit_bin, 0o755)?;
-        write_fake_bin(&sandbox_bin, 0o755)?;
-        write_fake_bin(&app_bin, 0o755)?;
+        write_fake_version_bin(&explicit_bin, 0o755, "fake-explicit-1")?;
+        write_fake_version_bin(&cached_bin, 0o755, "fake-cache-1")?;
+        write_fake_version_bin(&app_bin, 0o755, "fake-app-1")?;
+        let preflight =
+            science_runtime_preflight_for_paths(&data_dir, Some(&explicit_bin), &app_bin)?;
+        assert_eq!(preflight["status"], "installed_ready");
+        assert_eq!(preflight["selected_source"], "explicit");
+        assert_eq!(preflight["selected_version"], "fake-explicit-1");
         assert_eq!(
-            science_bin_for_paths(&data_dir, Some(&explicit_bin), &app_bin).as_deref(),
-            Some(explicit_bin.as_path())
+            select_science_runtime_for_paths(
+                &data_dir,
+                Some(&explicit_bin),
+                &app_bin,
+                Some(CACHED_ONCE_CHOICE),
+            )?
+            .path,
+            explicit_bin,
+            "a valid explicit development override wins even if cache was authorized"
         );
 
         fs::set_permissions(&explicit_bin, fs::Permissions::from_mode(0o644))?;
-        assert_eq!(
-            science_bin_for_paths(&data_dir, Some(&explicit_bin), &app_bin).as_deref(),
-            None,
+        assert!(
+            select_science_runtime_for_paths(&data_dir, Some(&explicit_bin), &app_bin, None)
+                .is_err(),
             "an invalid explicit override must not fall through to sandbox or system Science"
         );
 
+        let app =
+            select_science_runtime_for_paths(&data_dir, None, &app_bin, Some(CACHED_ONCE_CHOICE))?;
         assert_eq!(
-            science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
-            Some(sandbox_bin.as_path())
+            app.path, app_bin,
+            "the installed Science app always wins over an old cache"
         );
+        assert_eq!(app.source, ScienceRuntimeSource::InstalledApp);
+        assert_eq!(app.version.as_deref(), Some("fake-app-1"));
 
         let explicit_link = root.join("explicit-link");
         symlink(&app_bin, &explicit_link)?;
-        assert_eq!(
-            science_bin_for_paths(&data_dir, Some(&explicit_link), &app_bin),
-            None,
+        assert!(
+            select_science_runtime_for_paths(&data_dir, Some(&explicit_link), &app_bin, None)
+                .is_err(),
             "an explicit symlink must fail closed"
         );
 
         let real_parent = root.join("real-parent");
         let linked_parent = root.join("linked-parent");
         let parent_bin = real_parent.join("claude-science");
-        write_fake_bin(&parent_bin, 0o755)?;
+        write_fake_version_bin(&parent_bin, 0o755, "fake-parent-1")?;
         symlink(&real_parent, &linked_parent)?;
-        assert_eq!(
-            science_bin_for_paths(
+        assert!(
+            select_science_runtime_for_paths(
                 &data_dir,
                 Some(&linked_parent.join("claude-science")),
                 &app_bin,
-            ),
-            None,
+                None,
+            )
+            .is_err(),
             "an explicit path with a symlinked parent must fail closed"
         );
 
-        fs::set_permissions(&sandbox_bin, fs::Permissions::from_mode(0o644))?;
-        assert_eq!(
-            science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
-            Some(app_bin.as_path())
-        );
-
         fs::set_permissions(&app_bin, fs::Permissions::from_mode(0o644))?;
-        assert_eq!(science_bin_for_paths(&data_dir, None, &app_bin), None);
+        let preflight = science_runtime_preflight_for_paths(&data_dir, None, &app_bin)?;
+        assert_eq!(preflight["status"], "cached_choice_required");
+        assert_eq!(preflight["cached_version"], "fake-cache-1");
+        let no_choice = select_science_runtime_for_paths(&data_dir, None, &app_bin, None)
+            .expect_err("cache must not launch without one-shot authorization");
+        assert!(no_choice.contains("SCIENCE_RUNTIME_CHOICE_REQUIRED"));
+        let cached =
+            select_science_runtime_for_paths(&data_dir, None, &app_bin, Some(CACHED_ONCE_CHOICE))?;
+        assert_eq!(cached.path, cached_bin);
+        assert_eq!(cached.source, ScienceRuntimeSource::CachedOnce);
+        assert_eq!(cached.version.as_deref(), Some("fake-cache-1"));
+
+        write_fake_bin(&cached_bin, 0o755)?;
+        let preflight = science_runtime_preflight_for_paths(&data_dir, None, &app_bin)?;
+        assert_eq!(preflight["status"], "missing");
+        assert!(select_science_runtime_for_paths(
+            &data_dir,
+            None,
+            &app_bin,
+            Some(CACHED_ONCE_CHOICE),
+        )
+        .is_err());
+
+        fs::set_permissions(&cached_bin, fs::Permissions::from_mode(0o644))?;
+        assert_eq!(
+            science_runtime_preflight_for_paths(&data_dir, None, &app_bin)?["status"],
+            "missing"
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn replacing_installed_app_uses_new_version_without_mutating_cache_or_data_dir(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("science-app-upgrade")?;
+        let data_dir = root.join("home").join(".claude-science");
+        let cached_bin = data_dir.join("bin").join("claude-science");
+        let app_bin = root.join("app-claude-science");
+        let state_marker = data_dir.join("persistent-state.txt");
+        write_fake_version_bin(&cached_bin, 0o755, "fake-cache-old")?;
+        fs::write(&state_marker, "keep-me")?;
+        let cached_before = fs::read(&cached_bin)?;
+
+        write_fake_version_bin(&app_bin, 0o755, "fake-app-v1")?;
+        let first = select_science_runtime_for_paths(&data_dir, None, &app_bin, None)?;
+        assert_eq!(first.version.as_deref(), Some("fake-app-v1"));
+
+        write_fake_version_bin(&app_bin, 0o755, "fake-app-v2")?;
+        let second = select_science_runtime_for_paths(&data_dir, None, &app_bin, None)?;
+        assert_eq!(second.version.as_deref(), Some("fake-app-v2"));
+        assert_eq!(second.path, app_bin);
+        assert_eq!(fs::read_to_string(&state_marker)?, "keep-me");
+        assert_eq!(fs::read(&cached_bin)?, cached_before);
         fs::remove_dir_all(root)?;
         Ok(())
     }
@@ -440,18 +843,30 @@ mod tests {
 
     #[test]
     fn sandbox_url_falls_back_to_localhost_when_cli_absent() {
-        // In CI/dev environments without Claude Science installed, this keeps
-        // the command behavior deterministic and matches the previous fallback.
-        if !std::path::Path::new(super::SCIENCE_BIN).is_file() {
-            assert_eq!(sandbox_url(8990), "http://127.0.0.1:8990");
-        }
+        let root = unique_temp_dir("science-url-fallback").unwrap();
+        let bin = root.join("claude-science");
+        write_fake_bin(&bin, 0o755).unwrap();
+        let runtime = ScienceRuntimeIdentity {
+            path: bin,
+            source: ScienceRuntimeSource::InstalledApp,
+            version: None,
+        };
+        assert_eq!(sandbox_url(8990, &runtime), "http://127.0.0.1:8990");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn sandbox_identity_does_not_trust_health_when_cli_absent() {
-        if !std::path::Path::new(super::SCIENCE_BIN).is_file() {
-            assert!(!sandbox_running_ours(9));
-        }
+        let root = unique_temp_dir("science-identity-fallback").unwrap();
+        let bin = root.join("claude-science");
+        write_fake_bin(&bin, 0o755).unwrap();
+        let runtime = ScienceRuntimeIdentity {
+            path: bin,
+            source: ScienceRuntimeSource::InstalledApp,
+            version: None,
+        };
+        assert!(!sandbox_running_ours(9, &runtime));
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn status_output(code: i32, stdout: &str) -> Output {
@@ -481,6 +896,24 @@ mod tests {
             fs::create_dir_all(parent)?;
         }
         fs::write(path, "#!/bin/sh\nexit 0\n")?;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+    }
+
+    fn write_fake_version_bin(
+        path: &std::path::Path,
+        mode: u32,
+        version: &str,
+    ) -> std::io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\nif [ \"${{1:-}}\" = \"--version\" ]; then printf '%s\\n' '{}'; exit 0; fi\nexit 0\n",
+                version
+            ),
+        )?;
         fs::set_permissions(path, fs::Permissions::from_mode(mode))
     }
 }

@@ -473,6 +473,9 @@ mod tests {
             relay_thinking: None,
             shim_mode: "off".to_string(),
             launch_id: "timeout-test".to_string(),
+            skill_data_dir: None,
+            skill_bridge_dir: None,
+            skill_bridge_token: None,
         }
     }
 

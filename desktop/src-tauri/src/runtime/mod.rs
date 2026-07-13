@@ -1,5 +1,6 @@
 pub(crate) mod capability_catalog;
 pub(crate) mod diagnostics;
+pub(crate) mod external_skill_route;
 pub(crate) mod legacy_proxy;
 pub(crate) mod model_discovery;
 pub(crate) mod operation;
@@ -11,5 +12,6 @@ pub(crate) mod proxy_lifecycle;
 pub(crate) mod sandbox_session;
 pub(crate) mod science;
 pub(crate) mod settings;
+pub(crate) mod skill_install_bridge;
 pub(crate) mod system;
 pub(crate) mod transaction;

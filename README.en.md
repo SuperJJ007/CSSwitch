@@ -26,6 +26,8 @@ It is built for more than developers. You need Claude Science, a third-party API
 
 > **0.4.4:** One-click startup no longer scans external Skills, reads legacy store/inventory, or reconciles deployments. Upgrades keep using `~/.csswitch/sandbox/home/.claude-science` without migrating, deleting, or overwriting existing Science data. See the [architecture contract](./docs/ARCHITECTURE.md).
 
+> **0.4.5 local test build:** CSSwitch attaches one fixed external-Skill route to Science's default Agent, directing install and uninstall requests to two scoped connectors. Install avoids catalog-controlled `host.skills.edit/publish`, then uses Science's native `host.agents.attach_skill` and verifies the Skill; uninstall quarantines only a CSSwitch import, then uses native `detach_skill`, without calling `host.skills.delete` or manually deleting files. The first operation shows an MCP confirmation and a read-write grant for a dedicated bridge directory. With only a Skill name, the Agent may search for candidates but must not install an ambiguous guess; the bridge itself always requires an exact URL. See [External Skill install bridge](./docs/EXTERNAL_SKILL_INSTALL.md).
+
 ## Contents
 
 - [Why CSSwitch exists](#why-csswitch-exists)
@@ -70,7 +72,9 @@ Claude Science sandbox
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
 - Switch back to "Official Claude" without interfering with your real Claude login.
-- Reuse Science's persistent data-dir; Skill state is no longer a CSSwitch startup gate. In third-party mode, native Science Skill import/publish paths that depend on the Anthropic account catalog may be unavailable.
+- Reuse Science's persistent data-dir; Skill state is no longer a CSSwitch startup gate. The 0.4.5 local test build can install a public GitHub Skill directory from conversation; native import/publish may still depend on the Anthropic catalog.
+- CSSwitch inherits the Science version currently installed in `/Applications/Claude Science.app`; it does not compare, pin, upgrade, or downgrade that version. After the App updates, the next launch uses the updated App executable with the same persistent data-dir.
+- If the Science App is missing, CSSwitch never starts a data-dir cache silently. Only an executable cache with a readable version can be authorized for this launch once; the choice is not saved. Otherwise the UI offers the [official Claude download page](https://claude.com/download) or cancel.
 
 **For advanced users**
 
@@ -84,7 +88,7 @@ Claude Science sandbox
 
 Before starting, make sure you have:
 
-- [Claude Science](https://claude.com)
+- [Claude Science (official Claude download page)](https://claude.com/download)
 - A macOS Apple Silicon device
 - A working third-party model API key
 - No separate Python runtime is required; CSSwitch bundles its Rust inference gateway
@@ -97,6 +101,8 @@ Before starting, make sure you have:
 6. Click "创建" (Create), then choose "设为当前" (Set active) on the profile.
 7. After verification succeeds, click "一键开始" (Start).
 8. CSSwitch starts the isolated Science instance and opens it in your browser.
+
+CSSwitch does not choose a Science version for you. Normal startup uses the currently installed Claude Science App. If the App is missing, the panel shows an exact readable cache version and asks whether to use it for this launch only, or to open the official download page. That choice is not persisted, and a later detected App automatically becomes the default again.
 
 To use Science with its official service configuration, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
 

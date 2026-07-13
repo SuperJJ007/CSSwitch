@@ -2,7 +2,7 @@
 # 启动 CSSwitch 管理的隔离运行环境。
 # Safety boundaries:
 #   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
-#   - 只复制运行所需资产，不复制账号凭证或用户数据
+#   - data-dir 只承载持久化状态；不从真实 HOME 复制任何 runtime 或用户数据
 #   - 只使用应用在隔离目录中生成的本地状态，与真实账号无关
 #   - 使用独立的本地钥匙串
 #
@@ -50,26 +50,11 @@ _dd_real="${DATA_DIR:A}"; _real_real="${REAL_DIR:A}"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 if [[ "$DRY_RUN" == "1" ]]; then echo "DRY-RUN OK：护栏通过，未启动沙箱。"; exit 0; fi
 
-# Prepare the isolated runtime assets on first launch.
-if [[ ! -d "$DATA_DIR/bin" ]]; then
-  echo "首次初始化沙箱运行时（APFS 克隆，只拷运行时、不拷真实登录）…"
-  mkdir -p "$DATA_DIR"
-  for asset in bin conda runtime seed-assets; do
-    if [[ -d "$REAL_DIR/$asset" ]]; then
-      cp -Rc "$REAL_DIR/$asset" "$DATA_DIR/$asset"
-    fi
-  done
-  echo "运行时就绪。"
-fi
-
-# 优先级：显式 SCIENCE_BIN > 沙箱内已克隆 runtime > App 内置 binary。
-# 沙箱内 runtime 优先，App 内置 binary 仅作缺省 fallback。
+# 优先级：后端显式选中的 SCIENCE_BIN > 当前已安装 Science App。
+# 旧 data-dir 中可能存在历史缓存，但本脚本绝不自动选择它；缓存只能由 UI 本次授权后
+# 通过 SCIENCE_BIN 传入。Science binary 自己负责初始化/复用同一个持久化 data-dir。
 if [[ -z "$BIN" ]]; then
-  if [[ -x "$DATA_DIR/bin/claude-science" ]]; then
-    BIN="$DATA_DIR/bin/claude-science"
-  else
-    BIN="$APP_BIN"
-  fi
+  BIN="$APP_BIN"
 fi
 if [[ -n "${SCIENCE_BIN:-}" ]]; then reject_explicit_science_symlink "$BIN" || exit 1; fi
 if [[ ! -x "$BIN" ]]; then echo "找不到 Science 二进制: $BIN"; exit 1; fi

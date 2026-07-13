@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -800,6 +800,173 @@ fn handle_post(
     handle_messages(stream, cfg, body, request_nonces, relay_models);
 }
 
+#[cfg(unix)]
+fn start_skill_install_bridge(cfg: &GatewayConfig) -> Result<(), String> {
+    use std::fs::OpenOptions;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let (Some(bridge), Some(data_dir), Some(bridge_token)) = (
+        &cfg.skill_bridge_dir,
+        &cfg.skill_data_dir,
+        &cfg.skill_bridge_token,
+    ) else {
+        return Ok(());
+    };
+    let name = bridge
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    if !bridge.is_absolute() || !name.starts_with("CSSwitch-Skill-Bridge-") {
+        return Err("refusing unsafe Skill install bridge path".into());
+    }
+    reject_bridge_symlinks(bridge)?;
+    match std::fs::symlink_metadata(bridge) {
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("refusing non-directory Skill install bridge path".into())
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder.create(bridge).map_err(|error| error.to_string())?;
+        }
+        Err(error) => return Err(error.to_string()),
+    }
+    std::fs::set_permissions(bridge, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| error.to_string())?;
+    let metadata = std::fs::metadata(bridge).map_err(|error| error.to_string())?;
+    if metadata.uid() != unsafe { libc::geteuid() } {
+        return Err("refusing Skill install bridge owned by another user".into());
+    }
+    let bridge = bridge.clone();
+    let data_dir = data_dir.clone();
+    let bridge_token = bridge_token.clone();
+    thread::spawn(move || {
+        let mut used_request_ids = HashSet::new();
+        loop {
+            let entries = match std::fs::read_dir(&bridge) {
+                Ok(entries) => entries,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let Some(id) = name.strip_suffix(".request.json") else {
+                    continue;
+                };
+                if id.len() != 32
+                    || !id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+                {
+                    continue;
+                }
+                let processing = bridge.join(format!("{id}.processing"));
+                if std::fs::rename(entry.path(), &processing).is_err() {
+                    continue;
+                }
+                let response = read_regular_bridge_request(&processing)
+                    .ok()
+                    .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                    .map_or_else(bridge_request_failed, |request| {
+                        if crate::skill_install::validate_bridge_request(
+                            &bridge_token,
+                            id,
+                            &request,
+                        )
+                        .is_err()
+                            || !used_request_ids.insert(id.to_string())
+                        {
+                            bridge_request_failed()
+                        } else {
+                            crate::skill_install::handle_bridge_request(&data_dir, &request)
+                        }
+                    });
+                let temp = bridge.join(format!(".{id}.response.tmp"));
+                let target = bridge.join(format!("{id}.response.json"));
+                let written = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&temp)
+                    .and_then(|mut file| {
+                        serde_json::to_writer(&mut file, &response)
+                            .map_err(std::io::Error::other)?;
+                        file.sync_all()
+                    })
+                    .and_then(|_| std::fs::rename(&temp, &target));
+                if written.is_err() {
+                    let _ = std::fs::remove_file(&temp);
+                }
+                let _ = std::fs::remove_file(&processing);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+    Ok(())
+}
+
+#[cfg(unix)]
+fn reject_bridge_symlinks(path: &std::path::Path) -> Result<(), String> {
+    let mut current = std::path::PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("refusing symlink in Skill install bridge path".into())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn read_regular_bridge_request(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| "invalid Skill bridge request")?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| "invalid Skill bridge request")?;
+    if !metadata.is_file()
+        || metadata.len() > 1024 * 1024
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err("invalid Skill bridge request".into());
+    }
+    let mut body = Vec::with_capacity(metadata.len() as usize);
+    file.take(1024 * 1024 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| "invalid Skill bridge request")?;
+    if body.len() > 1024 * 1024 {
+        return Err("invalid Skill bridge request".into());
+    }
+    Ok(body)
+}
+
+#[cfg(unix)]
+fn bridge_request_failed() -> Value {
+    json!({
+        "status":"REQUEST_FAILED",
+        "message":"本地 Skill 请求非法或已处理",
+        "directory_commit":false,
+        "restart_required":false
+    })
+}
+
+#[cfg(not(unix))]
+fn start_skill_install_bridge(_cfg: &GatewayConfig) -> Result<(), String> {
+    Ok(())
+}
+
 fn handle_one(
     cfg: GatewayConfig,
     mut stream: TcpStream,
@@ -832,6 +999,9 @@ fn handle_one(
 }
 
 pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
+    if let Err(error) = start_skill_install_bridge(&cfg) {
+        eprintln!("Skill install host unavailable (gateway continues): {error}");
+    }
     let request_nonces = if cfg.provider == "deepseek" && cfg.shim_mode == "rewrite" {
         Some(Arc::new(RequestNonceGenerator::new()?))
     } else {
@@ -862,6 +1032,8 @@ mod tests {
 
     use serde_json::{json, Map, Value};
 
+    #[cfg(unix)]
+    use super::read_regular_bridge_request;
     use super::{
         forward_stream_body, stream_error_event, KimiServerToolFilter, RequestNonceGenerator,
         StreamFilter, StreamTermination,
@@ -878,6 +1050,41 @@ mod tests {
 
     struct CountingEofReader {
         reads: usize,
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bridge_reader_rejects_symlink_and_fifo_without_blocking() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+            "csswitch-bridge-reader-{}-{suffix}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let regular = root.join("regular");
+        std::fs::write(&regular, b"{}").unwrap();
+        std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_regular_bridge_request(&regular).unwrap(), b"{}");
+
+        let link = root.join("link");
+        symlink(&regular, &link).unwrap();
+        assert!(read_regular_bridge_request(&link).is_err());
+
+        let fifo = root.join("fifo");
+        let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+        let started = Instant::now();
+        assert!(read_regular_bridge_request(&fifo).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

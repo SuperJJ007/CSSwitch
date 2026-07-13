@@ -12,6 +12,14 @@ pub struct GatewayConfig {
     /// Opaque per-spawn identity supplied by the Tauri process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
+    /// CSSwitch-managed Science data-dir used only by the authenticated local
+    /// external-Skill install endpoint. Standalone gateways leave it unset.
+    pub skill_data_dir: Option<std::path::PathBuf>,
+    pub skill_bridge_dir: Option<std::path::PathBuf>,
+    /// Per-proxy HMAC key for the user-confirmed Skill filesystem bridge.
+    /// It is supplied only through the child environment and is never returned
+    /// from Gateway health or inference responses.
+    pub skill_bridge_token: Option<String>,
 }
 
 pub const UPSTREAM_UA: &str = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)";
@@ -222,6 +230,19 @@ impl GatewayConfig {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let skill_data_dir = std::env::var_os("CSSWITCH_SKILL_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let skill_bridge_dir = std::env::var_os("CSSWITCH_SKILL_BRIDGE_DIR")
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute());
+        let skill_bridge_token =
+            std::env::var("CSSWITCH_SKILL_BRIDGE_TOKEN")
+                .ok()
+                .filter(|value| {
+                    value.len() == 64
+                        && value.chars().all(|character| character.is_ascii_hexdigit())
+                });
         Ok(Self {
             provider,
             port: port.ok_or("--port 必填")?,
@@ -233,6 +254,9 @@ impl GatewayConfig {
             relay_thinking,
             shim_mode: shim.to_string(),
             launch_id,
+            skill_data_dir,
+            skill_bridge_dir,
+            skill_bridge_token,
         })
     }
 }

@@ -2,7 +2,7 @@ use std::path::Path;
 use std::process::Command;
 
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use tauri::State;
 
 use crate::runtime::capability_catalog::diagnostics_for_profile;
@@ -17,7 +17,10 @@ use crate::runtime::provider::{
     status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
-use crate::runtime::science::{settings_change_needs_teardown, stop_sandbox};
+use crate::runtime::science::{
+    science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
+    SCIENCE_DOWNLOAD_URL,
+};
 use crate::runtime::settings::validate_runtime_ports;
 use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
@@ -73,7 +76,12 @@ fn status_runtime_identity(
 }
 
 fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
-    stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
+    let runtime = st.science_runtime.clone();
+    let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
+    if result.is_ok() {
+        st.science_runtime = None;
+    }
+    result
 }
 
 /// 切换运行模式（"proxy" 第三方 / "official" 官方）。切官方要先拆第三方链路成功再落盘。
@@ -298,20 +306,37 @@ pub(crate) async fn one_click_login(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
+    runtime_choice: Option<String>,
 ) -> Result<serde_json::Value, String> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || one_click_login_cmd(app, state, lifecycle)).await
+    run_blocking(move || one_click_login_cmd(app, state, lifecycle, runtime_choice)).await
 }
 
 pub(crate) fn one_click_login_cmd(
     app: tauri::AppHandle,
     state: SharedAppState,
     lifecycle: SharedLifecycle,
+    runtime_choice: Option<String>,
 ) -> Result<serde_json::Value, String> {
     lifecycle.with_serialized(|| {
-        crate::runtime::sandbox_session::one_click_login(app, state, lifecycle.as_ref())
+        crate::runtime::sandbox_session::one_click_login(
+            app,
+            state,
+            lifecycle.as_ref(),
+            runtime_choice.as_deref(),
+        )
     })
+}
+
+#[tauri::command]
+pub(crate) async fn science_runtime_preflight() -> Result<Value, String> {
+    run_blocking(runtime_preflight).await
+}
+
+#[tauri::command]
+pub(crate) fn open_science_download_page() -> Result<(), String> {
+    open_in_browser(SCIENCE_DOWNLOAD_URL)
 }
 
 #[tauri::command]
@@ -332,6 +357,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         launched_gateway_kind,
         launched_shim_mode,
         launched_launch_id,
+        science_runtime,
     ) = {
         let mut st = lock(state.inner());
         let cfg = match config::load_from(&config::default_dir()) {
@@ -382,6 +408,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
             st.gateway_kind.clone(),
             st.shim_mode.clone(),
             st.launch_id.clone(),
+            st.science_runtime.clone(),
         )
     };
     let diagnostic_override = std::env::var_os("CSSWITCH_UPSTREAM_URL");
@@ -412,16 +439,27 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
     });
     let (gateway_kind, shim_mode, catalog_shim_mode) =
         status_runtime_identity(&adapter, &secret, launched_gateway_kind, launched_shim_mode);
+    let mut science = science_diagnostics(ScienceDiagnosticsInput {
+        sandbox_port: sport,
+        sandbox_ok,
+    });
+    if let (Some(object), Some(runtime)) = (science.as_object_mut(), science_runtime) {
+        object.insert(
+            "runtime".into(),
+            json!({
+                "path": runtime.path,
+                "source": runtime.source.code(),
+                "version": runtime.version,
+            }),
+        );
+    }
     build_status_response(
         lights,
         active_profile,
         &gateway_kind,
         &shim_mode,
         diagnostics_for_profile(catalog_profile.as_ref(), catalog_shim_mode),
-        science_diagnostics(ScienceDiagnosticsInput {
-            sandbox_port: sport,
-            sandbox_ok,
-        }),
+        science,
         last_error,
     )
 }
@@ -545,7 +583,9 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        env::temp_dir().join(format!("csswitch-{label}-{}-{now}", std::process::id()))
+        let path = env::temp_dir().join(format!("csswitch-{label}-{}-{now}", std::process::id()));
+        fs::create_dir_all(&path).unwrap();
+        path.canonicalize().unwrap()
     }
 
     fn free_port() -> u16 {
@@ -715,7 +755,7 @@ esac
         let home = tmp.join("home");
         let bin_dir = tmp.join("bin");
         fs::create_dir_all(&home).unwrap();
-        let fake_science = write_test_bins(&bin_dir);
+        let fake_science = write_test_bins(&bin_dir).canonicalize().unwrap();
         let open_log = tmp.join("open.log");
         let mock_upstream_port = start_mock_upstream();
         let proxy_port = free_port();
@@ -767,9 +807,13 @@ esac
             .unwrap();
         let handle = app.handle().clone();
 
-        let first =
-            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
-                .expect("first one-click should start proxy and sandbox");
+        let first = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
         assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
         wait_http_health(sandbox_port);
@@ -785,9 +829,13 @@ esac
             "1"
         );
 
-        let second =
-            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
-                .expect("second one-click should reuse running sandbox");
+        let second = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("second one-click should reuse running sandbox");
         assert_eq!(second["action"], "reopened");
         assert_eq!(second["url"], format!("http://127.0.0.1:{sandbox_port}"));
         assert_eq!(
@@ -848,9 +896,11 @@ esac
             let AppState {
                 sandbox,
                 sandbox_url,
+                science_runtime,
                 ..
             } = &mut *st;
-            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url);
+            let runtime = science_runtime.clone();
+            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url, runtime.as_ref());
             st.stop_proxy();
         }
         let _ = fs::remove_dir_all(&tmp);
@@ -869,7 +919,7 @@ esac
         let home = tmp.join("home");
         let bin_dir = tmp.join("bin");
         fs::create_dir_all(&home).unwrap();
-        let fake_science = write_test_bins(&bin_dir);
+        let fake_science = write_test_bins(&bin_dir).canonicalize().unwrap();
         let open_log = tmp.join("open.log");
         let mock_upstream_port = start_mock_upstream();
         let proxy_port = free_port();
@@ -921,9 +971,13 @@ esac
             .unwrap();
         let handle = app.handle().clone();
 
-        let first =
-            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
-                .expect("first one-click should start proxy and sandbox");
+        let first = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
         assert_eq!(first["url"], format!("http://127.0.0.1:{sandbox_port}"));
         wait_http_health(proxy_port);
@@ -966,14 +1020,19 @@ esac
         assert_eq!(down_again_status["sandbox"], "green");
         assert_eq!(down_again_status["last_error"]["type"], "proxy_unhealthy");
 
-        let recovered =
-            sandbox_session::one_click_login(handle.clone(), state.clone(), lifecycle.as_ref())
-                .expect("one-click should manually recover a dead proxy");
+        let recovered = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+        )
+        .expect("one-click should manually recover a dead proxy");
         assert_eq!(recovered["action"], "reopened");
-        assert_eq!(
-            recovered["msg"],
-            "已用新配置重启代理，Science 沿用不变，已重新打开 Science。"
-        );
+        assert!(recovered["msg"]
+            .as_str()
+            .unwrap()
+            .starts_with("已用新配置重启代理，Science 沿用不变，已重新打开 Science。"));
+        assert_eq!(recovered["external_skill_installer"]["status"], "WARNING");
         assert_eq!(recovered["url"], format!("http://127.0.0.1:{sandbox_port}"));
         wait_http_health(proxy_port);
         assert_eq!(
@@ -1012,9 +1071,11 @@ esac
             let AppState {
                 sandbox,
                 sandbox_url,
+                science_runtime,
                 ..
             } = &mut *st;
-            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url);
+            let runtime = science_runtime.clone();
+            let _ = science::stop_sandbox(&handle, sandbox, sandbox_url, runtime.as_ref());
             st.stop_proxy();
         }
         let _ = fs::remove_dir_all(&tmp);

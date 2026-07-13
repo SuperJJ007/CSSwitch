@@ -748,11 +748,12 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "hkdf",
+ "libc",
  "serde",
  "serde_json",
  "sha2",

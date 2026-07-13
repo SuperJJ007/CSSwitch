@@ -8,10 +8,16 @@ use crate::runtime::operation::{
     self, OperationKind, OperationStage, OperationTrace, POLL_INTERVAL_MS,
 };
 use crate::runtime::proxy::ProxyAction;
-use crate::runtime::proxy_lifecycle::ensure_proxy;
+use crate::runtime::proxy_lifecycle::{
+    current_skill_install_bridge_key, ensure_proxy, skill_install_bridge_dir,
+};
 use crate::runtime::science::{
-    sandbox_home, sandbox_running_ours, sandbox_science_state, sandbox_url, stop_sandbox,
-    SandboxScienceState,
+    probe_known_runtime, probe_sandbox_runtime, sandbox_home, sandbox_running_ours, sandbox_url,
+    select_science_runtime, stop_sandbox, SandboxScienceState, ScienceRuntimeIdentity,
+};
+use crate::runtime::skill_install_bridge::{
+    attach_route_after_science_start, inspect_while_science_running, register_before_science_start,
+    RegistrationStatus,
 };
 use crate::runtime::system::{asset_root, log_path, open_in_browser, open_log, redact, tail_file};
 use crate::{config, lifecycle, lock, oauth_forge, proc, AppState, SharedAppState};
@@ -20,7 +26,12 @@ fn stop_sandbox_state<R: Runtime>(
     app: &tauri::AppHandle<R>,
     st: &mut AppState,
 ) -> Result<(), String> {
-    stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url)
+    let runtime = st.science_runtime.clone();
+    let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
+    if result.is_ok() {
+        st.science_runtime = None;
+    }
+    result
 }
 
 fn open_science_surface<R: Runtime>(
@@ -56,6 +67,39 @@ fn open_science_surface<R: Runtime>(
     Ok("browser")
 }
 
+fn installer_status_json(status: &RegistrationStatus) -> Value {
+    match status {
+        RegistrationStatus::Warning(message) => {
+            json!({"status": status.code(), "message": message})
+        }
+        _ => json!({"status": status.code()}),
+    }
+}
+
+fn append_installer_note(mut message: String, status: &RegistrationStatus) -> String {
+    if let Some(note) = status.user_note() {
+        message.push_str(&format!(" {note}"));
+    }
+    message
+}
+
+fn attach_route_best_effort<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    status: RegistrationStatus,
+    control_url: &str,
+) -> RegistrationStatus {
+    if !matches!(
+        status,
+        RegistrationStatus::Registered | RegistrationStatus::AlreadyRegistered
+    ) {
+        return status;
+    }
+    match attach_route_after_science_start(app, control_url) {
+        Ok(()) => status,
+        Err(error) => RegistrationStatus::Warning(error),
+    }
+}
+
 /// One-click session startup: active proxy, virtual login, sandbox, browser.
 ///
 /// Callers must hold the command serializer lock.
@@ -63,6 +107,7 @@ pub(crate) fn one_click_login<R: Runtime>(
     app: tauri::AppHandle<R>,
     state: SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
+    runtime_choice: Option<&str>,
 ) -> Result<Value, String> {
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     let dir = config::default_dir();
@@ -72,15 +117,44 @@ pub(crate) fn one_click_login<R: Runtime>(
     let sbx_home = sandbox_home();
     let auth_dir = sbx_home.join(".claude-science");
 
-    match sandbox_science_state(sport) {
+    let remembered_runtime = { lock(&state).science_runtime.clone() };
+    let (science_state, running_runtime) = match remembered_runtime {
+        Some(runtime) => {
+            let science_state = probe_known_runtime(sport, &runtime);
+            let running_runtime =
+                (science_state == SandboxScienceState::RunningHealthy).then_some(runtime);
+            (science_state, running_runtime)
+        }
+        None => probe_sandbox_runtime(sport)?,
+    };
+    let launch_runtime: ScienceRuntimeIdentity = match science_state {
         SandboxScienceState::RunningHealthy => {
+            let running_runtime =
+                running_runtime.ok_or("Science 状态为运行中，但无法确认其 binary 身份")?;
             if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
-                let (_, _, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
-                let url = sandbox_url(sport);
+                let (_pport, secret, proxy_action) =
+                    ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+                let installer_bridge = skill_install_bridge_dir(&secret)?;
+                // Science 已在运行时只读检查，不并发改写它的 MCP 配置。
+                let installer = match current_skill_install_bridge_key() {
+                    Ok(installer_key) => inspect_while_science_running(
+                        &app,
+                        &auth_dir,
+                        &installer_bridge,
+                        &installer_key,
+                    ),
+                    Err(error) => RegistrationStatus::Warning(error),
+                };
+                // Consume a dedicated one-time URL for control-plane attachment;
+                // the browser receives a fresh URL below.
+                let control_url = sandbox_url(sport, &running_runtime);
+                let installer = attach_route_best_effort(&app, installer, &control_url);
+                let url = sandbox_url(sport, &running_runtime);
                 {
                     let mut st = lock(&state);
                     st.sandbox_port = sport;
                     st.sandbox_url = Some(url.clone());
+                    st.science_runtime = Some(running_runtime.clone());
                 }
                 let base = match proxy_action {
                     ProxyAction::Reused => "已在运行",
@@ -91,28 +165,38 @@ pub(crate) fn one_click_login<R: Runtime>(
                     Ok(_) => format!("{base}，已重新打开 Science。"),
                     Err(_) => format!("{base}，服务已就绪，请手动打开：{url}"),
                 };
+                let msg = append_installer_note(msg, &installer);
                 trace.finish(format!(
                     "ok action=reopened proxy_action={}",
                     proxy_action.as_str()
                 ));
-                return Ok(json!({ "url": url, "msg": msg, "action": "reopened" }));
+                return Ok(json!({
+                    "url": url,
+                    "msg": msg,
+                    "action": "reopened",
+                    "external_skill_installer": installer_status_json(&installer)
+                }));
             }
-            let mut st = lock(&state);
-            if let Err(error) = stop_sandbox_state(&app, &mut st) {
-                trace.finish("error=sandbox_stop_for_login_refresh");
-                return Err(format!(
-                    "隔离 Science 登录状态失效，但停止旧进程失败：{error}"
-                ));
+            {
+                let mut st = lock(&state);
+                st.science_runtime = Some(running_runtime);
+                if let Err(error) = stop_sandbox_state(&app, &mut st) {
+                    trace.finish("error=sandbox_stop_for_login_refresh");
+                    return Err(format!(
+                        "隔离 Science 登录状态失效，但停止旧进程失败：{error}"
+                    ));
+                }
             }
+            select_science_runtime(runtime_choice)?
         }
-        SandboxScienceState::Stopped => {}
+        SandboxScienceState::Stopped => select_science_runtime(runtime_choice)?,
         SandboxScienceState::Unknown => {
             trace.finish("error=sandbox_state_unknown_before_start");
             return Err(format!(
                 "无法确认隔离 Science 状态（端口 {sport} 或 data-dir 状态不一致）。请先停止占用该端口的进程后重试。"
             ));
         }
-    }
+    };
 
     trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
     let (forged, login_action) =
@@ -128,6 +212,15 @@ pub(crate) fn one_click_login<R: Runtime>(
     }
 
     let (pport, secret, proxy_action) = ensure_proxy(&app, &state, lifecycle, Some(&trace))?;
+    let installer_bridge = skill_install_bridge_dir(&secret)?;
+    // 本地 MCP 注册是 best-effort：失败只降级该工具，绝不阻断 Science 启动。
+    let installer = match current_skill_install_bridge_key() {
+        Ok(installer_key) => {
+            register_before_science_start(&app, &auth_dir, &installer_bridge, &installer_key)
+        }
+        Err(error) => RegistrationStatus::Warning(error),
+    };
+
     let proxy_url = format!("http://127.0.0.1:{pport}/{secret}");
     let logf = open_log("sandbox.log").map_err(|e| format!("建日志失败：{e}"))?;
     {
@@ -153,6 +246,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         .arg(&proxy_url)
         .arg("--skip-oauth-forge")
         .env("SANDBOX_HOME", sandbox_home())
+        .env("SCIENCE_BIN", &launch_runtime.path)
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2))
         .status()
@@ -161,6 +255,15 @@ pub(crate) fn one_click_login<R: Runtime>(
         let tail = redact(&tail_file(&log_path("sandbox.log"), 600), &secret);
         trace.finish("error=sandbox_launch_failed");
         return Err(format!("起沙箱脚本失败。\n{tail}"));
+    }
+
+    // From this point onward stop/status/url must use the exact binary selected
+    // for this launch. Keep this identity in memory before health polling so a
+    // failed launch can still be stopped without guessing from the port.
+    {
+        let mut st = lock(&state);
+        st.sandbox_port = sport;
+        st.science_runtime = Some(launch_runtime.clone());
     }
 
     let mut ok = false;
@@ -187,7 +290,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         ));
     }
 
-    if !sandbox_running_ours(sport) {
+    if !sandbox_running_ours(sport, &launch_runtime) {
         {
             let mut st = lock(&state);
             let _ = stop_sandbox_state(&app, &mut st);
@@ -198,11 +301,16 @@ pub(crate) fn one_click_login<R: Runtime>(
         ));
     }
 
-    let url = sandbox_url(sport);
+    // Route attachment is best-effort and cannot fail Science startup. Use a
+    // dedicated one-time URL so the UI URL remains valid for the user.
+    let control_url = sandbox_url(sport, &launch_runtime);
+    let installer = attach_route_best_effort(&app, installer, &control_url);
+    let url = sandbox_url(sport, &launch_runtime);
     {
         let mut st = lock(&state);
         st.sandbox_port = sport;
         st.sandbox_url = Some(url.clone());
+        st.science_runtime = Some(launch_runtime.clone());
     }
     let started = match login_action {
         oauth_forge::LoginAction::Created => "已启动",
@@ -213,10 +321,16 @@ pub(crate) fn one_click_login<R: Runtime>(
         Ok(_) => format!("{started}。"),
         Err(_) => format!("{started}，服务已就绪，请手动打开：{url}"),
     };
+    let msg = append_installer_note(msg, &installer);
     trace.stage(OperationStage::OpenBrowser, "done");
     trace.finish(format!(
         "ok action=started proxy_action={}",
         proxy_action.as_str()
     ));
-    Ok(json!({ "url": url, "msg": msg, "action": "started" }))
+    Ok(json!({
+        "url": url,
+        "msg": msg,
+        "action": "started",
+        "external_skill_installer": installer_status_json(&installer)
+    }))
 }
