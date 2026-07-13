@@ -17,7 +17,10 @@ use crate::runtime::provider::{
     status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
-use crate::runtime::science::{settings_change_needs_teardown, stop_sandbox};
+use crate::runtime::remote_access::build_ssh_tunnel_plan;
+use crate::runtime::science::{
+    sandbox_science_state, settings_change_needs_teardown, stop_sandbox, SandboxScienceState,
+};
 use crate::runtime::settings::validate_runtime_ports;
 use crate::runtime::system::open_in_browser;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
@@ -436,6 +439,40 @@ pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
     let url = { lock(state.inner()).sandbox_url.clone() };
     let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
     open_in_browser(&url)
+}
+
+#[derive(Deserialize)]
+pub(crate) struct SshTunnelReq {
+    target: String,
+    #[serde(default = "default_ssh_port")]
+    ssh_port: u16,
+}
+
+fn default_ssh_port() -> u16 {
+    22
+}
+
+fn ssh_tunnel_info_inner(req: SshTunnelReq) -> Result<serde_json::Value, String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+    let science_port = cfg.sandbox_port;
+    if sandbox_science_state(science_port) != SandboxScienceState::RunningHealthy {
+        return Err("隔离 Science 尚未健康运行；请先完成「一键开始」。".to_string());
+    }
+    let plan = build_ssh_tunnel_plan(&req.target, req.ssh_port, science_port, cfg.proxy_port)?;
+    Ok(json!({
+        "command": plan.command,
+        "login_command": plan.login_command,
+        "science_port": science_port,
+        "preview_port": plan.preview_port,
+        "gateway_forwarded": false,
+        "warning": "先在访问端终端保持隧道命令运行，再在另一个终端运行登录命令。一次性链接只会出现在访问端终端，不进入 CSSwitch 前端、配置或日志。",
+    }))
+}
+
+/// Generate client-side SSH forwarding instructions. CSSwitch never starts SSH or changes sshd.
+#[tauri::command]
+pub(crate) async fn ssh_tunnel_info(req: SshTunnelReq) -> Result<serde_json::Value, String> {
+    run_blocking(move || ssh_tunnel_info_inner(req)).await
 }
 
 #[tauri::command]

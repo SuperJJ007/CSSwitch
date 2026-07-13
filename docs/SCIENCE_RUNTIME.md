@@ -9,9 +9,15 @@ Last focused verification: 2026-07-12, Claude Science `0.1.18-dev.20260709.t2111
 - Science's native Settings > Skills UI provides `Add skill` and `Import from GitHub`. The UI states that it accepts plugin-marketplace repositories or repositories with `skills/` directories.
 - A fresh isolated Science data-dir initialized standard multi-file Skill directories under `orgs/<org-id>/skills/<skill>/`, including `SKILL.md` plus optional `scripts`, `references`, and other resources. Science displayed those Skills without CSSwitch scanning or deploying them.
 - Science upgrades should reuse this data-dir. CSSwitch may select a newer Science executable, but must not treat the application bundle as the user-data source of truth.
+- For a new CSSwitch launch, executable selection is a no-symlink `SCIENCE_BIN` test/development override, then the no-symlink locally installed official app binary, then the no-symlink retained sandbox binary as fallback. Each candidate must pass `--version` before launch. CSSwitch never reads or clones `conda`, `runtime`, `seed-assets`, credentials, Skills, or any other content from the user's real `~/.claude-science`.
+- CSSwitch continues to pass `--no-auto-update`; it does not call the Science updater or host Science downloads. Updating the official local app changes the executable used on the next clean sandbox start.
+- A healthy older daemon is reused instead of being force-restarted. The 0.1.15 and 0.1.18 CLIs were verified to read and stop each other's daemon state against the same temporary data-dir.
+- Science 0.1.15 and 0.1.18 both expose `--host`, but their CLI recommends an SSH tunnel or TLS proxy instead of a public bind. CSSwitch explicitly passes `--host 127.0.0.1`, keeps the inference Gateway on loopback, and only emits user-run SSH client commands. It does not consume the one-time login URL; the access-side command does. Raw `serve` console output is discarded rather than copied into CSSwitch logs because it may contain a data-dir or Web UI URL. Because the observed implicit preview port differs by Science version, CSSwitch passes an explicit `--sandbox-port` for new launches instead of guessing it.
 - The Agent-facing `host.skills` SDK exposes `list`, `read`, `edit`, `publish`, and `delete`, but no local `install` or `import` method. The UI GitHub importer uses a separate marketplace API.
 
 ## What was not proved
+
+The focused 2026-07-13 runtime checks proved temporary-data-dir lifecycle compatibility, CSSwitch launch-script compatibility, and cross-version `status` / `stop`. They did not prove live-provider inference, real-account data migration, public-network exposure safety, or an SSH connection through a specific user's server.
 
 The 2026-07-12 isolated GitHub preview initially stayed at `Fetching...` for both configurations below:
 

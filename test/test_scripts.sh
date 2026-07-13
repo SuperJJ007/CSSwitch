@@ -49,6 +49,34 @@ if [ $rc -ne 0 ] && echo "$out" | grep -q "拒绝"; then ok "08765 rejected via 
 out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --dry-run 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && echo "$out" | grep -q "DRY-RUN OK"; then ok "valid port passes guards in dry-run"; else no "valid port dry-run failed (rc=$rc): $out"; fi
 
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 8764 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "预览端口"; then ok "preview port cannot collide with reserved 8765"; else no "preview port reached reserved 8765 (rc=$rc): $out"; fi
+
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 65535 --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "小于 65535"; then ok "preview port overflow rejected"; else no "preview port overflow accepted (rc=$rc): $out"; fi
+
+out="$(SANDBOX_HOME="$T/vh" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9931 --proxy-url http://127.0.0.1:9932/path-secret --dry-run 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "Gateway 端口冲突"; then ok "preview port cannot collide with Gateway"; else no "preview/Gateway collision accepted (rc=$rc): $out"; fi
+
+CAPTURE_FILE="$T/launch-args"
+FAKE_CAPTURE="$T/fake-capture"
+mkdir -p "$OUTER_HOME/.claude-science/runtime"
+printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nexit 0\n' > "$FAKE_CAPTURE"
+chmod +x "$FAKE_CAPTURE"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && grep -qx -- '--host' "$CAPTURE_FILE" && grep -qx -- '127.0.0.1' "$CAPTURE_FILE" && grep -qx -- '--sandbox-port' "$CAPTURE_FILE" && grep -qx -- '9941' "$CAPTURE_FILE"; then ok "launch pins loopback host and explicit Science preview port"; else no "launch omitted explicit loopback/preview port (rc=$rc): $out"; fi
+if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi
+if ! echo "$out" | grep -Fq "$T/vh-capture" && ! echo "$out" | grep -Fq "$FAKE_CAPTURE"; then ok "launch log redacts sandbox and binary paths"; else no "launch log exposed sensitive paths: $out"; fi
+
+python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",29992)); s.listen(); time.sleep(10)' &
+PREVIEW_HOLDER=$!
+sleep 0.2
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-preview-conflict" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 29991 --skip-oauth-forge 2>&1)"; rc=$?
+kill "$PREVIEW_HOLDER" 2>/dev/null || true
+wait "$PREVIEW_HOLDER" 2>/dev/null || true
+if [ $rc -ne 0 ] && echo "$out" | grep -q "预览端口.*占用"; then ok "launch rejects occupied preview listener without takeover"; else no "launch ignored occupied preview listener (rc=$rc): $out"; fi
+
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-link" SCIENCE_BIN="$FAKE_LINK" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9932 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接"; then ok "launch rejects explicit Science symlink"; else no "launch accepted explicit Science symlink (rc=$rc): $out"; fi
 

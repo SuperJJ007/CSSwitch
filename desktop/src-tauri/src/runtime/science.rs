@@ -46,14 +46,6 @@ pub(crate) fn first_http_url(stdout: &str) -> Option<String> {
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    path.is_file()
-        && path
-            .metadata()
-            .map(|m| m.permissions().mode() & 0o111 != 0)
-            .unwrap_or(false)
-}
-
-fn is_explicit_executable_file(path: &Path) -> bool {
     if !path.is_absolute() {
         return false;
     }
@@ -66,31 +58,54 @@ fn is_explicit_executable_file(path: &Path) -> bool {
             Err(_) => return false,
         }
     }
+    path.is_file()
+        && path
+            .metadata()
+            .map(|metadata| metadata.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+}
+
+fn is_explicit_executable_file(path: &Path) -> bool {
     is_executable_file(path)
 }
 
+fn science_bins_for_paths(
+    data_dir: &Path,
+    explicit_bin: Option<&Path>,
+    app_bin: &Path,
+) -> Vec<PathBuf> {
+    if let Some(bin) = explicit_bin {
+        return if is_explicit_executable_file(bin) {
+            vec![bin.to_path_buf()]
+        } else {
+            Vec::new()
+        };
+    }
+    let mut bins = Vec::with_capacity(2);
+    if is_executable_file(app_bin) {
+        bins.push(app_bin.to_path_buf());
+    }
+    let sandbox_bin = data_dir.join("bin").join("claude-science");
+    if sandbox_bin != app_bin && is_executable_file(&sandbox_bin) {
+        bins.push(sandbox_bin);
+    }
+    bins
+}
+
+#[cfg(test)]
 fn science_bin_for_paths(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
     app_bin: &Path,
 ) -> Option<PathBuf> {
-    if let Some(bin) = explicit_bin {
-        return is_explicit_executable_file(bin).then(|| bin.to_path_buf());
-    }
-    let sandbox_bin = data_dir.join("bin").join("claude-science");
-    if is_executable_file(&sandbox_bin) {
-        return Some(sandbox_bin);
-    }
-    if is_executable_file(app_bin) {
-        Some(app_bin.to_path_buf())
-    } else {
-        None
-    }
+    science_bins_for_paths(data_dir, explicit_bin, app_bin)
+        .into_iter()
+        .next()
 }
 
-fn science_bin_for(data_dir: &Path) -> Option<PathBuf> {
+fn science_bins_for(data_dir: &Path) -> Vec<PathBuf> {
     let explicit_bin = std::env::var_os("SCIENCE_BIN").map(PathBuf::from);
-    science_bin_for_paths(data_dir, explicit_bin.as_deref(), Path::new(SCIENCE_BIN))
+    science_bins_for_paths(data_dir, explicit_bin.as_deref(), Path::new(SCIENCE_BIN))
 }
 
 #[cfg(test)]
@@ -116,10 +131,10 @@ fn science_status_value(out: &Output) -> Option<bool> {
 }
 
 fn trusted_science_status(out: &Output) -> Option<bool> {
-    if out.status.success() {
-        science_status_value(out)
-    } else {
-        None
+    match science_status_value(out) {
+        Some(false) => Some(false),
+        Some(true) if out.status.success() => Some(true),
+        _ => None,
     }
 }
 
@@ -130,6 +145,7 @@ pub(crate) enum SandboxScienceState {
     Unknown,
 }
 
+#[cfg(test)]
 fn classify_sandbox_state(
     status: Option<bool>,
     health_ready: bool,
@@ -142,16 +158,70 @@ fn classify_sandbox_state(
     }
 }
 
+fn classify_known_runtime_state(
+    status: Option<bool>,
+    health_ready: bool,
+    port_accepts_tcp: bool,
+    listener_matches_runtime: bool,
+) -> SandboxScienceState {
+    match status {
+        Some(true) if health_ready && listener_matches_runtime => {
+            SandboxScienceState::RunningHealthy
+        }
+        Some(false) if !port_accepts_tcp => SandboxScienceState::Stopped,
+        _ => SandboxScienceState::Unknown,
+    }
+}
+
 fn loopback_port_accepts_tcp(port: u16) -> bool {
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     std::net::TcpStream::connect_timeout(&address, Duration::from_millis(250)).is_ok()
+}
+
+fn listener_uses_runtime(port: u16, runtime: &Path) -> bool {
+    let listener = Command::new("/usr/sbin/lsof")
+        .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
+        .output();
+    let Ok(listener) = listener else {
+        return false;
+    };
+    if !listener.status.success() {
+        return false;
+    }
+    let Ok(stdout) = String::from_utf8(listener.stdout) else {
+        return false;
+    };
+    let mut pids = stdout.lines().map(str::trim).filter(|pid| !pid.is_empty());
+    let Some(pid) = pids.next() else {
+        return false;
+    };
+    if pids.any(|other| other != pid) {
+        return false;
+    }
+    let Ok(expected) = runtime.canonicalize() else {
+        return false;
+    };
+    let text_files = Command::new("/usr/sbin/lsof")
+        .args(["-nP", "-a", "-p", pid, "-d", "txt", "-Fn"])
+        .output();
+    let Ok(text_files) = text_files else {
+        return false;
+    };
+    if !text_files.status.success() {
+        return false;
+    }
+    String::from_utf8_lossy(&text_files.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter_map(|path| Path::new(path).canonicalize().ok())
+        .any(|path| path == expected)
 }
 
 /// Return the sandbox UI URL, falling back to the plain localhost port.
 pub(crate) fn sandbox_url(port: u16) -> String {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
-    if let Some(bin) = science_bin_for(&data_dir) {
+    for bin in science_bins_for(&data_dir) {
         if let Ok(out) = Command::new(bin)
             .arg("url")
             .arg("--data-dir")
@@ -177,22 +247,44 @@ pub(crate) fn sandbox_running_ours(port: u16) -> bool {
 pub(crate) fn sandbox_science_state(port: u16) -> SandboxScienceState {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
-    let Some(bin) = science_bin_for(&data_dir) else {
-        return SandboxScienceState::Unknown;
+    let candidates = science_bins_for(&data_dir);
+    let mut saw_running = false;
+    let mut saw_stopped = false;
+    for bin in &candidates {
+        let status = Command::new(bin)
+            .arg("status")
+            .arg("--data-dir")
+            .arg(&data_dir)
+            .env("HOME", &home)
+            .output()
+            .ok()
+            .and_then(|out| trusted_science_status(&out));
+        saw_running |= status == Some(true);
+        saw_stopped |= status == Some(false);
+    }
+    let status = if saw_running {
+        Some(true)
+    } else if saw_stopped {
+        Some(false)
+    } else {
+        None
     };
-    let Ok(out) = Command::new(bin)
-        .arg("status")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .env("HOME", &home)
-        .output()
-    else {
+    if status.is_none() {
         return SandboxScienceState::Unknown;
-    };
-    let status = trusted_science_status(&out);
+    }
     let health_ready = proc::http_health(port, None, 400);
     let port_accepts_tcp = health_ready || loopback_port_accepts_tcp(port);
-    classify_sandbox_state(status, health_ready, port_accepts_tcp)
+    let listener_matches_runtime = status == Some(true)
+        && health_ready
+        && candidates
+            .iter()
+            .any(|runtime| listener_uses_runtime(port, runtime));
+    classify_known_runtime_state(
+        status,
+        health_ready,
+        port_accepts_tcp,
+        listener_matches_runtime,
+    )
 }
 
 /// Stop the sandbox Science process and clear the in-memory sandbox URL.
@@ -221,10 +313,9 @@ pub(crate) fn stop_sandbox<R: Runtime>(
                     Err(e) => err = Some(format!("调用停止沙箱脚本失败：{e}")),
                 }
             } else {
-                err = Some(format!(
-                    "找不到停止脚本 {}，无法确认沙箱已停止（沙箱可能仍在运行）。",
-                    stop.display()
-                ));
+                err = Some(
+                    "找不到打包的停止脚本，无法确认沙箱已停止（沙箱可能仍在运行）。".to_string(),
+                );
             }
         }
         None => {
@@ -251,9 +342,9 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_sandbox_state, first_http_url, sandbox_home, sandbox_running_ours, sandbox_url,
-        science_bin_for_paths, science_status_running, settings_change_needs_teardown,
-        trusted_science_status, SandboxScienceState,
+        classify_known_runtime_state, classify_sandbox_state, first_http_url, sandbox_home,
+        sandbox_running_ours, sandbox_url, science_bin_for_paths, science_status_running,
+        settings_change_needs_teardown, trusted_science_status, SandboxScienceState,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -360,7 +451,20 @@ mod tests {
         }
         assert_eq!(
             trusted_science_status(&status_output(1, r#"{"running":false}"#)),
-            None
+            Some(false),
+            "a stopped daemon may be reported with a non-zero CLI exit"
+        );
+    }
+
+    #[test]
+    fn known_runtime_state_requires_listener_binary_match() {
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, true),
+            SandboxScienceState::RunningHealthy
+        );
+        assert_eq!(
+            classify_known_runtime_state(Some(true), true, true, false),
+            SandboxScienceState::Unknown
         );
     }
 
@@ -390,7 +494,8 @@ mod tests {
 
         assert_eq!(
             science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
-            Some(sandbox_bin.as_path())
+            Some(app_bin.as_path()),
+            "the locally installed official app must win over the retained sandbox fallback"
         );
 
         let explicit_link = root.join("explicit-link");
@@ -424,6 +529,21 @@ mod tests {
 
         fs::set_permissions(&app_bin, fs::Permissions::from_mode(0o644))?;
         assert_eq!(science_bin_for_paths(&data_dir, None, &app_bin), None);
+        fs::remove_file(&sandbox_bin)?;
+        fs::set_permissions(&explicit_bin, fs::Permissions::from_mode(0o755))?;
+        symlink(&explicit_bin, &sandbox_bin)?;
+        assert_eq!(
+            science_bin_for_paths(&data_dir, None, &app_bin),
+            None,
+            "a retained sandbox symlink must never be executed"
+        );
+        fs::remove_file(&sandbox_bin)?;
+        write_fake_bin(&sandbox_bin, 0o755)?;
+        assert_eq!(
+            science_bin_for_paths(&data_dir, None, &app_bin).as_deref(),
+            Some(sandbox_bin.as_path()),
+            "an unusable official app must fall back to the retained sandbox binary"
+        );
         fs::remove_dir_all(root)?;
         Ok(())
     }

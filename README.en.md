@@ -140,6 +140,8 @@ CSSwitch's core boundary is simple: third-party model mode keeps credentials, da
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
 - Keys are not displayed in application logs, and the local gateway listens only on loopback.
+- Remote access only generates SSH client commands for Science and its preview port. It never forwards the credential-bearing Gateway port, enables Remote Login, or changes `sshd`; the one-time Science token is generated only in the access-side terminal, not returned to the CSSwitch UI.
+- New isolated Science launches prefer the binary from the locally installed official Claude Science app and fall back to the retained sandbox copy only when that candidate is unavailable. CSSwitch does not download Science and keeps `--no-auto-update`.
 - Official Claude mode tears down the third-party proxy path before handing you back to the real Science app.
 
 ## Current limitations

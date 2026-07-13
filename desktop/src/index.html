@@ -105,6 +105,24 @@
           <div class="fld"><label for="proxyPort">代理端口</label><input id="proxyPort" inputmode="numeric" value="18991" /></div>
           <div class="fld"><label for="sandboxPort">沙箱端口</label><input id="sandboxPort" inputmode="numeric" value="8990" /></div>
         </div>
+        <div class="remote-access">
+          <label>SSH 安全入口（不开放公网监听）</label>
+          <div class="ports">
+            <div class="fld"><label for="sshTarget">SSH 目标</label><input id="sshTarget" type="text" placeholder="user@server" autocomplete="off" spellcheck="false" /></div>
+            <div class="fld ssh-port"><label for="sshPort">SSH 端口</label><input id="sshPort" inputmode="numeric" value="22" /></div>
+          </div>
+          <button type="button" class="btn small" id="sshGenerateBtn">生成 SSH 访问命令</button>
+          <div id="sshResult" hidden>
+            <label for="sshCommand">在访问端电脑运行</label>
+            <textarea id="sshCommand" class="ssh-command" readonly spellcheck="false"></textarea>
+            <button type="button" class="btn small" id="sshCopyCommandBtn">复制命令</button>
+            <label for="sshLoginCommand">在另一个访问端终端生成一次性链接</label>
+            <textarea id="sshLoginCommand" class="ssh-command" readonly spellcheck="false"></textarea>
+            <button type="button" class="btn small" id="sshCopyLoginCommandBtn">复制登录命令</button>
+            <div class="hint" id="sshWarning"></div>
+          </div>
+          <div class="hint">CSSwitch 不启动 SSH、不修改远程登录或防火墙；Gateway 端口不会被转发。</div>
+        </div>
       </details>
 
       <!-- 反馈消息：有真实反馈（表单错误 / 回滚 / 保存结果 / 自检）才显示，空闲不占位。 -->

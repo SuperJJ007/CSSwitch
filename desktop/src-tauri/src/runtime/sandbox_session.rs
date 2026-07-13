@@ -67,6 +67,7 @@ pub(crate) fn one_click_login<R: Runtime>(
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    crate::runtime::settings::validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     let sport = cfg.sandbox_port;
 
     let sbx_home = sandbox_home();
@@ -114,10 +115,28 @@ pub(crate) fn one_click_login<R: Runtime>(
         }
     }
 
+    let preview_port = sport
+        .checked_add(1)
+        .ok_or("沙箱端口必须小于 65535，才能分配隔离预览端口。")?;
+    if proc::loopback_port_in_use(preview_port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
+        trace.finish("error=science_preview_port_in_use");
+        return Err(format!(
+            "隔离 Science 预览端口 {preview_port} 已被占用；未启动或结束任何占用者。请修改沙箱端口后重试。"
+        ));
+    }
+
     trace.stage(OperationStage::SandboxLogin, "ensure_virtual_login");
     let (forged, login_action) =
         oauth_forge::ensure_virtual_login(&auth_dir, "virtual@localhost.invalid", &sbx_home)
             .map_err(|e| format!("写虚拟登录失败：{e}"))?;
+    // Keep the full identity available for internal validation without writing
+    // UUIDs or filesystem paths to the sandbox log or frontend error state.
+    let _validated_login_identity = (
+        &forged.auth_dir,
+        &forged.account_uuid,
+        &forged.org_uuid,
+        &forged.enc_file,
+    );
 
     let root = asset_root(&app)
         .ok_or("找不到 scripts/launch-virtual-sandbox.sh（打包资源或仓库根均未命中）。")?;
@@ -135,12 +154,8 @@ pub(crate) fn one_click_login<R: Runtime>(
         let mut lw = &logf;
         let _ = writeln!(
             lw,
-            "[oauth] 虚拟登录已就绪（Rust，零 node；action={:?}）：auth_dir={} account={} org={} enc={}",
-            login_action,
-            forged.auth_dir.display(),
-            forged.account_uuid,
-            forged.org_uuid,
-            forged.enc_file.display()
+            "[oauth] 虚拟登录已就绪（Rust，零 node；action={:?}；isolated=true）",
+            login_action
         );
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;

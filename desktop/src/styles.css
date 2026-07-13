@@ -85,6 +85,13 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .adv summary::before{content:"▸";font-size:9px;margin-right:5px;display:inline-block}
 .adv[open] summary::before{content:"▾"}
 .adv .ports{margin-top:9px}
+.remote-access{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.remote-access>.btn{width:100%;margin-top:8px}
+.remote-access .ssh-port{max-width:92px}
+#sshResult{margin-top:10px}
+#sshResult>label{margin-top:9px}
+.ssh-command{height:76px;padding:8px 10px;line-height:1.45;resize:none;white-space:pre-wrap}
+#sshResult>.btn{width:100%;margin-top:6px}
 /* 模型来源提示（内置/未验证）用次要色，工具能力标注已在 option 文本里。 */
 #wizModelHint,#connModelHint{color:var(--sub)}
 /* profile 列表：每条已存配置一屏可见（图标/名/类别徽标/地址/模型/掩码 key/生效标记） */

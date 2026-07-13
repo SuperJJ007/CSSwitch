@@ -277,6 +277,7 @@ pub fn run() {
             commands::runtime::status,
             commands::runtime::boot_error,
             commands::runtime::open_url,
+            commands::runtime::ssh_tunnel_info,
             commands::diagnostics::run_doctor,
             commands::diagnostics::app_version,
             commands::diagnostics::open_release_page,
