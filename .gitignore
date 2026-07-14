@@ -42,7 +42,7 @@ scratchpad/
 .seed
 
 # Private project knowledge and reverse-engineering records. Keep these local.
-CLAUDE.md
+# CLAUDE.md is intentionally tracked as a compatibility pointer to AGENTS.md.
 desktop/README.md
 findings/
 scripts/daily-maintenance.prompt.md
@@ -55,6 +55,15 @@ test/A3_INSTALLED_APP_MANUAL_TEST.md
 test/decrypt-oauth.mjs
 test/test_make_virtual_oauth.mjs
 docs/*
+!docs/README.md
+!docs/architecture/
+!docs/architecture/**
+!docs/operations/
+!docs/operations/**
+!docs/features/
+!docs/features/**
+!docs/evidence/
+!docs/evidence/**
 !docs/EXTERNAL_SKILL_INSTALL.md
 !docs/assets/
 !docs/assets/**
@@ -66,3 +75,7 @@ docs/*
 !docs/references/**
 !docs/upgrade-and-rollback.md
 !docs/release-evidence-v0.4.2.md
+
+# Temporary Agent handoffs are local execution residue. Track only their policy.
+.agents/handoffs/*
+!.agents/handoffs/README.md

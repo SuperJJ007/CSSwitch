@@ -22,9 +22,9 @@ CSSwitch 是一个给 Claude Science 使用的本地配置转换器。它把 Sci
 
 > 当前版本主要支持 macOS Apple Silicon。首次打开未公证的 `.dmg` 应用时，macOS 可能需要你右键选择「打开」。
 
-[下载最新版](../../releases/latest) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
+[下载最新版](../../releases/latest) · [项目文档](./docs/README.md) · [更新日志](./CHANGELOG.md) · [报告问题](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [功能建议](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.5.0：** CSSwitch 可在第三方模型模式下通过一个合并后的本地 connector 安装或卸载外部 Skill。安装要求准确的公开 GitHub 目录 URL，并在 Science 审批后复制、原生绑定和验证；卸载只隔离 CSSwitch 自己导入的目录，再使用 Science 原生解绑。版本还优化了重复「一键开始」的 Science 版本探测与 Skill 路由同步，并可由用户显式授权隔离 Science 使用系统 `~/.ssh/config`。详见 [外部 Skill 安装桥](./docs/EXTERNAL_SKILL_INSTALL.md)和[架构说明](./docs/ARCHITECTURE.md)。
+> **0.5.0：** CSSwitch 可在第三方模型模式下通过一个合并后的本地 connector 安装或卸载外部 Skill。安装要求准确的公开 GitHub 目录 URL，并在 Science 审批后复制、原生绑定和验证；卸载只隔离 CSSwitch 自己导入的目录，再使用 Science 原生解绑。版本还优化了重复「一键开始」的 Science 版本探测与 Skill 路由同步，并可由用户显式授权隔离 Science 使用系统 `~/.ssh/config`。详见[外部 Skill bridge](./docs/features/external-skill-bridge.md)、[系统 SSH](./docs/features/system-ssh.md)和[架构说明](./docs/architecture/overview.md)。
 
 ## 目录
 
@@ -108,7 +108,7 @@ CSSwitch 不替你选择 Science 版本。正常启动使用当前安装的 Clau
 
 0.5.0 保留现有 v2 配置格式并继续复用 `~/.csswitch/sandbox/home/.claude-science`，因此已有 Science 组织、项目和 Skill 不会被迁移或覆盖。旧 `~/.csswitch/` Skill store/inventory 会原样保留但不再参与启动；外部 `~/.claude/skills` 也不会自动同步到 Science。
 
-完整步骤、备份位置和回滚边界见 [升级与回滚说明](./docs/upgrade-and-rollback.md)。
+完整步骤、备份位置和回滚边界见[升级与回滚说明](./docs/operations/upgrade-and-rollback.md)。
 
 ## 支持的模型来源
 
@@ -195,6 +195,8 @@ README 目前提供：
 ## 开发与构建
 
 用户不需要从源码运行。以下内容只给想调试或参与开发的人。
+
+维护者可从[项目文档总入口](./docs/README.md)查看架构、测试、发布、功能合同和版本证据。
 
 ```bash
 cd desktop

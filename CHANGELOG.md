@@ -116,7 +116,7 @@ CSSwitch follows semantic versioning. Older release notes remain available on th
 - Back up `~/.csswitch/config.json` before upgrading.
 - Rollback requires reinstalling the previous stable app; there is no runtime Python-backend switch.
 - The macOS build is Apple Silicon only, ad-hoc signed, and not notarized. First launch may require right-clicking the app and choosing “Open.”
-- See [Upgrade and rollback](docs/upgrade-and-rollback.md).
+- See [Upgrade and rollback](docs/operations/upgrade-and-rollback.md).
 
 ## Previous releases
 
