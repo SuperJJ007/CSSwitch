@@ -1,4 +1,4 @@
-# CSSwitch v0.5.0 真机验收
+# CSSwitch v0.6.0 真机验收
 
 本矩阵描述应如何验收，不表示各项已经通过。每次执行必须记录目标 commit / artifact、环境和结果；发布附件的既有结果见对应 [release evidence](../evidence/releases/README.md)。
 
@@ -17,7 +17,7 @@
 bash test/run_all.sh
 ```
 
-记录五层状态和 `current-env clean` / `release-ready green`，不要记录过期的固定 pass 数。构建发布候选前另跑 `--require-release-ready`。Python 仅供测试与 mock 使用；v0.5.0 runtime proxy 是 Rust sidecar。
+记录五层状态和 `current-env clean` / `release-ready green`，不要记录过期的固定 pass 数。构建发布候选前另跑 `--require-release-ready`。Python 仅供测试与 mock 使用；v0.6.0 runtime proxy 是 Rust sidecar。
 
 ## 3. 先在开发 HOME 构建
 
@@ -79,7 +79,7 @@ bash test/real_machine_guard.sh guard
 
 ## 5. 当前验收矩阵
 
-原有 RM-01～RM-18 保持历史语义；v0.5 新增场景从 RM-19 继续编号，避免源码注释和旧证据错指。
+原有 RM-01～RM-27 保持历史语义；v0.6 新增场景从 RM-28 继续编号，避免源码注释和旧证据错指。
 
 | ID | 场景 | 操作 | 必须满足 |
 |---|---|---|---|
@@ -110,6 +110,13 @@ bash test/real_machine_guard.sh guard
 | RM-25 | 运行中 Skill 配置漂移 | Science 运行时改变 MCP / route 预期 | 只读检查并返回 `RESTART_REQUIRED`；不并发改写；普通 Science 继续 |
 | RM-26 | 系统 SSH 默认 / opt-in | 无 fixture、创建 fixture、再移除 fixture | 默认关闭不阻断；启用时 wrapper 使用 `/usr/bin/ssh -F`；启用后 config / wrapper 缺失必须 fail closed |
 | RM-27 | SSH 非目标 | 检查文件与监听状态 | 不复制 `.ssh`、不启动 `sshd`、不改防火墙、不监听 `0.0.0.0`；真实 server 另行授权 |
+| RM-28 | GitHub 单请求进度 | 固定 commit 的慢速 bundle 安装 | 只生成一个 request；archive / fallback 复用同一 ID；进度持续更新；最终 response 唯一；status 与 `.processing` 清理 |
+| RM-29 | GitHub 重复复用 | 再安装 RM-28 的同一 URL | 返回 verified reuse；不重新下载、不重复提交、不覆盖已装内容；OPERON 绑定回读仍正确 |
+| RM-30 | GitHub 失败收口 | 网络失败、无效 commit、gateway 中断恢复 | 返回结构化终态；不自动重试；不留下部分 Skill；遗留 processing 在重启后转为 interruption 响应并清理 |
+| RM-31 | 本地包导入 | picker 取消；再导入单 Skill 与带 `_shared` 的 bundle ZIP / `.skill` | 取消不提交；前端不取得路径；单包 / wrapper / bundle 正确识别、校验、原子提交并绑定；同 archive 重复导入快速复用 |
+| RM-32 | bundle 卸载取消 | 从任意成员发起卸载并取消 | 首次只返回 bundle 名称、完整受影响 Skill 列表和确认 ID；不 detach、不移动、不写 quarantine；取消后无第二次工具调用 |
+| RM-33 | bundle 整包确认 | 重复 RM-32 并明确确认 | 精确 confirmation ID 校验；全部成员批量 detach 并整包 quarantine；不残留部分物理安装；不提供成员级删除 |
+| RM-34 | v0.5.0 干净升级 | 旧 route / split connector、用户 MCP / 未知字段、已装 GitHub Skill 与新本地 ZIP 组合 | 迁移到合并 connector；用户 MCP 与未知字段保留；重启恢复、重复安装、GitHub / ZIP bundle 整包卸载均按 v0.6 合同工作 |
 
 ## 6. Skill 证据词汇
 

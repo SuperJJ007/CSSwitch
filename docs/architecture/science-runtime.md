@@ -1,6 +1,6 @@
 # Science runtime 合同
 
-本文描述 v0.5.0 的稳定选择与身份合同。2026-07-13 的具体版本、错误 binary 事故与 E2E 证据见[日期化调查](../evidence/investigations/2026-07-13-science-runtime-and-skill-bridge.md)。
+本文描述 v0.6.0 的稳定选择与身份合同。2026-07-13 的具体版本、错误 binary 事故与 E2E 证据见[日期化调查](../evidence/investigations/2026-07-13-science-runtime-and-skill-bridge.md)。
 
 ## 分离四个事实
 

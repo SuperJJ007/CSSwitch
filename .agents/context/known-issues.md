@@ -4,14 +4,14 @@
 
 ## 分发
 
-- v0.6.0 沿用 ad-hoc 分发链路，没有 Developer ID 团队身份、notarization 或 stapled ticket；最终 DMG 发布后仍需逐项记录 Gatekeeper 结果。首次打开可能需要用户右键选择“打开”。
+- v0.6.0 公开附件只有 ad-hoc 签名，没有 Developer ID 团队身份、notarization 或 stapled ticket；Gatekeeper 对包内 app 的评估为 `rejected`。首次打开可能需要用户右键选择“打开”。
 
 ## Science / Skill
 
 - 发布者报告 v0.6.0 大部分真机验收成功，但未留下逐项结构化日志，不能外推为完整矩阵全部通过。
 - 安装、attach、load 与重启持久化不证明任一 Skill 的脚本、资产、网络、依赖或领域功能可用。
 - 仅给名称时的来源搜索由 provider / Agent 能力决定；私有仓库、更新 / 覆盖、永久删除、恢复 UI 和 bundle 成员级物理删除不受支持。
-- route attachment 与 `host.agents.attach_skill` 等是观察到的 Science 合同；Science App 更新后必须重跑聚焦兼容性验证。
+- route attachment、nonce / CSRF control plane 与 `OPERON` Skill 绑定是观察到的 Science 合同；Science App 更新后必须重跑聚焦兼容性验证。
 - Agent 控制面配置是多个顺序请求，不是原子事务；失败只降级为 warning，但已经完成的 route / connector / `customize` / prompt 步骤不会自动回滚。
 
 ## SSH

@@ -2,14 +2,18 @@
 
 最后复核：2026-07-16。
 
-## v0.6.0 发布候选
+## v0.6.0 已发布
 
 - 外部 Skill 安装支持准确公开 GitHub URL 与主面板本地 `.zip` / `.skill`；共享 package core 对单 Skill 和 bundle 执行一致的安全校验与原子提交。
 - GitHub 安装使用单请求协议，提供下载进度、终态响应、无自动重试、`.processing` 清理与 gateway 重启中断恢复。
 - bundle 从任意成员卸载会先返回完整受影响列表和整包确认；取消不改动，确认后整包批量解绑与隔离，不提供部分物理删除。
 - v0.5.0 旧 route / split connector 会迁移到合并 connector，并保留用户 MCP 项和未知字段；停止、重启恢复与重复安装均有自动化或定向验证。
-- `435d8b9` 合并主线文档维护体系后，`bash test/run_all.sh --require-release-ready` 退出 0；五层全部 pass，Tauri 232 passed / 3 explicit ignored，Gateway 102 passed。
+- `32aa062` 上 `bash test/run_all.sh --require-release-ready` 退出 0；五层全部 pass，Tauri 232 passed / 3 explicit ignored，Gateway 102 passed；其源码树与最终 `70950f1` 相同。
 - 发布者报告大部分 v0.6.0 真机验收成功并授权合并发布；没有逐项结构化日志，因此只记作部分人工验收。
+- PR #58 已合并；公开 peeled `v0.6.0`、发布时 `origin/main` 与最终构建 source 都是 `70950f1d1e8a18e8bd43db9b9a45e4e22ef2bcb4`。
+- 最终 DMG 为 9,701,904 bytes，SHA-256 `4a67973ef090e6d0a0dbc8e85d456c81d87733831555f6ea84cecb75e563dfb4`；GitHub asset 元数据相同，重新下载后逐字节一致且 `hdiutil verify` 通过。
+- 包内 app 为 0.6.0 arm64，desktop / gateway 齐全、旧 proxy 不存在；签名结构有效但身份为 ad-hoc、无 TeamIdentifier，Gatekeeper 拒绝且没有 stapled ticket。
+- `/Applications/CSSwitch Acceptance.app` 已从最终 `70950f1` 重新构建并安全替换，独立 bundle id 为 `com.csswitch.acceptance`；安装后二进制与 Acceptance 构建产物一致，UI 已重新打开且未自动启动 Gateway。正式 CSSwitch.app 未修改。
 
 ## v0.5.0 历史直接复核
 
