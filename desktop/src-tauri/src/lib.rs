@@ -5,10 +5,10 @@
 //! （绝不进 argv）；探活；把沙箱 URL 交系统浏览器打开。推理与协议转换由随包交付的
 //! Rust `csswitch-gateway` 完成；沙箱脚本仍作为受管子进程保留铁律护栏。
 //!
-//! 运行行为由生效 profile 的 `template_id` 经 [`templates`] 注册表派生出 adapter
-//! （deepseek | qwen | relay | openai-custom | openai-responses），再传给 Rust gateway。
+//! 运行行为由 typed provider-contract catalog 与生效 profile 合并成受限 launch plan，
+//! 再投影给 formal gateway、scratch 和前端；展示模板不再决定 adapter/鉴权/transport。
 //!
-//! 铁律相关：key 只在内存与 0600 的 config.json；回显前端只给掩码；沙箱端口/目录护栏
+//! 铁律相关：API key 只在内存与 0600 的 config.json，OAuth token 只在 CSSwitch Keychain；回显前端只给掩码/脱敏状态；沙箱端口/目录护栏
 //! 由被调脚本负责（对 8765 与真实目录失败关闭）；关窗只隐藏，显式退出停代理与沙箱。
 
 mod commands;
@@ -17,6 +17,7 @@ mod config_legacy;
 mod lifecycle;
 mod oauth_forge;
 mod proc;
+mod provider_contracts;
 mod runtime;
 mod scratch;
 mod templates;
@@ -43,7 +44,14 @@ fn decide_launch_with_auto_boot(cfg: &config::Config, auto_boot: bool) -> Launch
         return LaunchPath::OpenOfficial;
     }
     match cfg.active_profile() {
-        Some(p) if !p.api_key.trim().is_empty() => LaunchPath::BootScience,
+        Some(p)
+            if config::require_template_enabled(cfg, &p.template_id).is_ok()
+                && runtime::provider::resolve_launch_plan(p)
+                    .map(|plan| plan.public().credential_configured)
+                    .unwrap_or(false) =>
+        {
+            LaunchPath::BootScience
+        }
         _ => LaunchPath::ShowPanel,
     }
 }
@@ -187,18 +195,21 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
 }
 
 fn cleanup_for_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
-    let state = app.state::<SharedAppState>();
-    let mut st = lock(state.inner());
-    if let Some(runtime) = st.science_runtime.clone() {
-        let stop_result = {
-            let st = &mut *st;
-            stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, Some(&runtime))
-        };
-        if stop_result.is_ok() {
-            st.science_runtime = None;
+    let state = app.state::<SharedAppState>().inner().clone();
+    let lifecycle = app.state::<SharedLifecycle>().inner().clone();
+    lifecycle.with_serialized(|| {
+        let mut st = lock(&state);
+        if let Some(runtime) = st.science_runtime.clone() {
+            let stop_result = {
+                let st = &mut *st;
+                stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, Some(&runtime))
+            };
+            if stop_result.is_ok() {
+                st.science_runtime = None;
+            }
         }
-    }
-    st.stop_proxy();
+        st.stop_proxy();
+    });
 }
 
 fn mark_boot_failed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, error: String) {
@@ -280,6 +291,12 @@ pub fn run() {
         .manage(Arc::new(Mutex::new(AppState::default())))
         .manage(Arc::new(lifecycle::Lifecycle::new()))
         .invoke_handler(tauri::generate_handler![
+            commands::codex::set_experimental_codex_enabled,
+            commands::codex::codex_auth_status,
+            commands::codex::codex_auth_login,
+            commands::codex::codex_auth_logout,
+            commands::codex::codex_downgrade_preview,
+            commands::codex::codex_downgrade_export_all,
             commands::profiles::get_config,
             commands::profiles::list_templates,
             commands::runtime::set_settings,
@@ -407,6 +424,20 @@ mod tests {
         }
     }
 
+    fn codex_profile(id: &str) -> Profile {
+        Profile {
+            id: id.into(),
+            name: id.into(),
+            template_id: "codex".into(),
+            category: "experimental".into(),
+            api_format: "openai_responses".into(),
+            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_ref: Some("csswitch:codex:default".into()),
+            model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn decide_launch_defaults_to_showing_panel() {
         let active_with_key = Config {
@@ -469,6 +500,24 @@ mod tests {
         assert_eq!(
             decide_launch_with_auto_boot(&dangling_active, true),
             LaunchPath::ShowPanel
+        );
+
+        let codex_disabled = Config {
+            profiles: vec![codex_profile("codex-1")],
+            active_id: "codex-1".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&codex_disabled, true),
+            LaunchPath::ShowPanel
+        );
+        let codex_enabled = Config {
+            experimental_codex_enabled: true,
+            ..codex_disabled
+        };
+        assert_eq!(
+            decide_launch_with_auto_boot(&codex_enabled, true),
+            LaunchPath::BootScience
         );
     }
 

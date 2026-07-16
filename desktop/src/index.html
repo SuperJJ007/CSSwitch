@@ -43,20 +43,30 @@
         <div class="hint" id="wizTplHint"></div>
         <label style="margin-top:10px" for="wizName">名称</label>
         <input id="wizName" type="text" placeholder="给这套配置起个名字" autocomplete="off" spellcheck="false" />
-        <label style="margin-top:10px" for="wizBase">地址 base_url</label>
-        <div class="row">
+        <div id="wizBaseGroup" class="form-group">
+          <label for="wizBase">地址 base_url</label>
           <input id="wizBase" type="text" placeholder="https://your-relay/claude" autocomplete="off" spellcheck="false" />
-          <button class="btn small" id="wizFetchBtn">获取模型</button>
+          <div class="hint" id="wizBaseHint"></div>
         </div>
-        <div class="hint" id="wizBaseHint"></div>
-        <label style="margin-top:10px" id="wizModelLabel">模型</label>
-        <div id="wizModelInfo" class="modelinfo" hidden></div>
-        <input id="wizModel" list="wizModelList" aria-labelledby="wizModelLabel" autocomplete="off" spellcheck="false" />
-        <datalist id="wizModelList"></datalist>
-        <div class="hint" id="wizModelHint"></div>
-        <label style="margin-top:10px" for="wizKey">API Key / Token</label>
-        <input id="wizKey" type="password" placeholder="粘贴 key（只存本地）" autocomplete="off" spellcheck="false" />
-        <div class="hint">只存本地，不上传给 CSSwitch；使用时才作为鉴权发给你选的服务商。面板只回显末 4 位。</div>
+        <div id="wizModelGroup" class="form-group">
+          <div class="form-group-head">
+            <label id="wizModelLabel">模型</label>
+            <button class="btn small" id="wizFetchBtn">获取模型</button>
+          </div>
+          <div id="wizModelInfo" class="modelinfo" hidden></div>
+          <input id="wizModel" list="wizModelList" aria-labelledby="wizModelLabel" autocomplete="off" spellcheck="false" />
+          <datalist id="wizModelList"></datalist>
+          <div id="wizCodexCatalog" class="codex-catalog" hidden>
+            <div class="codex-catalog-meta" id="wizCodexCatalogMeta">尚未读取账号模型目录。</div>
+            <div class="codex-catalog-list" id="wizCodexCatalogList"></div>
+          </div>
+          <div class="hint" id="wizModelHint"></div>
+        </div>
+        <div id="wizKeyGroup" class="form-group">
+          <label for="wizKey">API Key / Token</label>
+          <input id="wizKey" type="password" placeholder="粘贴 key（只存本地）" autocomplete="off" spellcheck="false" />
+          <div class="hint">只存本地，不上传给 CSSwitch；使用时才作为鉴权发给你选的服务商。面板只回显末 4 位。</div>
+        </div>
         <div class="row" style="margin-top:12px">
           <button class="btn small" id="wizSaveBtn">创建</button>
           <button class="btn small" id="wizCancelBtn">取消</button>
@@ -66,20 +76,30 @@
       <!-- 连接编辑（base_url/model/key）：编辑生效条会走「校验→切换」事务 -->
       <div class="sec tp-only" id="connSec" hidden>
         <label id="connTitle">编辑连接</label>
-        <label style="margin-top:6px" for="connBase">地址 base_url</label>
-        <div class="row">
+        <div id="connBaseGroup" class="form-group compact">
+          <label for="connBase">地址 base_url</label>
           <input id="connBase" type="text" autocomplete="off" spellcheck="false" />
-          <button class="btn small" id="connFetchBtn">获取模型</button>
+          <div class="hint" id="connBaseHint"></div>
         </div>
-        <div class="hint" id="connBaseHint"></div>
-        <label style="margin-top:10px" id="connModelLabel">模型</label>
-        <div id="connModelInfo" class="modelinfo" hidden></div>
-        <input id="connModel" list="connModelList" aria-labelledby="connModelLabel" autocomplete="off" spellcheck="false" />
-        <datalist id="connModelList"></datalist>
-        <div class="hint" id="connModelHint"></div>
-        <label style="margin-top:10px" for="connKey">API Key / Token</label>
-        <input id="connKey" type="password" autocomplete="off" spellcheck="false" />
-        <div class="hint">留空＝不改；要清除请点「清除 key」。</div>
+        <div id="connModelGroup" class="form-group">
+          <div class="form-group-head">
+            <label id="connModelLabel">模型</label>
+            <button class="btn small" id="connFetchBtn">获取模型</button>
+          </div>
+          <div id="connModelInfo" class="modelinfo" hidden></div>
+          <input id="connModel" list="connModelList" aria-labelledby="connModelLabel" autocomplete="off" spellcheck="false" />
+          <datalist id="connModelList"></datalist>
+          <div id="connCodexCatalog" class="codex-catalog" hidden>
+            <div class="codex-catalog-meta" id="connCodexCatalogMeta">尚未读取账号模型目录。</div>
+            <div class="codex-catalog-list" id="connCodexCatalogList"></div>
+          </div>
+          <div class="hint" id="connModelHint"></div>
+        </div>
+        <div id="connKeyGroup" class="form-group">
+          <label for="connKey">API Key / Token</label>
+          <input id="connKey" type="password" autocomplete="off" spellcheck="false" />
+          <div class="hint">留空＝不改；要清除请点「清除 key」。</div>
+        </div>
         <div class="row" style="margin-top:12px">
           <button class="btn small" id="connSaveBtn">保存连接</button>
           <button class="btn small" id="connClearBtn">清除 key</button>
@@ -112,6 +132,31 @@
           </label>
           <div class="hint">启用后，Science 调用系统 OpenSSH 时会读取你的 <code>~/.ssh/config</code>。Include、IdentityFile、IdentityAgent、ProxyCommand 和 Match exec 按 OpenSSH 原规则生效；CSSwitch 不复制或链接整个 <code>.ssh</code>，也不启动 sshd 或开放端口。</div>
           <div class="hint">这相当于授权该隔离 Science 实例使用你已有的 SSH 身份；更改后需要重新「一键开始」。</div>
+        </div>
+        <div class="codex-experimental">
+          <div class="codex-experimental-title">
+            <span>Codex → Science</span>
+            <span class="badge warn">实验 · 非官方</span>
+          </div>
+          <label class="ssh-bridge-toggle" for="codexEnabled">
+            <input id="codexEnabled" type="checkbox" />
+            <span>启用 Codex 实验入口</span>
+          </label>
+          <div class="hint">默认关闭。CSSwitch 使用自己独立的 OAuth 与 Keychain 项，不读取、不修改 <code>~/.codex</code> 或 Codex 原生登录。关闭入口不会退出 CSSwitch 的 Codex 授权。</div>
+          <div class="codex-auth-box">
+            <div class="codex-auth-status" id="codexAuthStatus" aria-live="polite">尚未检查 CSSwitch Codex 登录状态。</div>
+            <div class="row codex-auth-actions">
+              <button class="btn small" id="codexStatusBtn">检查状态</button>
+              <button class="btn small" id="codexLoginBtn">登录 Codex</button>
+              <button class="btn small" id="codexLogoutBtn" disabled>退出登录</button>
+            </div>
+          </div>
+          <div class="codex-auth-box" id="codexDowngradeBox" hidden>
+            <div class="codex-auth-status">安装不支持 v3 的旧版前，可导出全部 Codex profile 的非敏感元数据并移除这些 profile，再把配置原子降为 v2。该操作保留 CSSwitch Keychain OAuth，完成后应用会立即退出。</div>
+            <div class="row codex-auth-actions">
+              <button class="btn small" id="codexDowngradeBtn">导出并降级到 v2</button>
+            </div>
+          </div>
         </div>
       </details>
 

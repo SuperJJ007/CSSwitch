@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::runtime::provider::adapter_for_profile;
+use crate::runtime::provider::resolve_launch_plan;
 use crate::{config, templates};
 
 const STATIC_CATALOG_JSON: &str = include_str!("../../../../catalog/capabilities.v1.json");
@@ -139,12 +139,18 @@ fn profile_api_format(p: &config::Profile) -> String {
 }
 
 pub(crate) fn context_for_profile(p: &config::Profile, shim_mode: &str) -> CatalogContext {
+    let resolved = resolve_launch_plan(p).ok();
     CatalogContext {
-        provider: adapter_for_profile(p).to_string(),
+        provider: resolved
+            .as_ref()
+            .map(|plan| plan.adapter.clone())
+            .unwrap_or_else(|| "unsupported".to_string()),
         api_format: profile_api_format(p),
         base_url: p.base_url.clone(),
         model: p.model.clone(),
-        thinking_policy: templates::thinking_policy_for(&p.template_id).to_string(),
+        thinking_policy: resolved
+            .map(|plan| plan.thinking_policy)
+            .unwrap_or_default(),
         shim_mode: shim_mode.to_string(),
     }
 }

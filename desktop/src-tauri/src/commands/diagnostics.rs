@@ -1,5 +1,6 @@
 use std::process::Command;
 
+use crate::provider_contracts::AuthMode;
 use crate::runtime::provider::adapter_for_profile;
 use crate::runtime::system::{asset_root, open_in_browser};
 use crate::{config, run_blocking, SharedAppState, SharedLifecycle};
@@ -31,14 +32,29 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
     let root = asset_root(app).ok_or("找不到 scripts/doctor.sh（打包资源或仓库根均未命中）。")?;
     let cfg = doctor_config_from(&config::default_dir())?;
     let doctor = root.join("scripts/doctor.sh");
-    // 生效 profile 的展示名（template_id）+ adapter + 有无 key；无生效配置则留空。
-    let (provider_label, adapter, has_key) = match cfg.active_profile() {
-        Some(p) => (
-            p.template_id.clone(),
-            adapter_for_profile(p),
-            !p.api_key.is_empty(),
-        ),
-        None => (String::new(), "", false),
+    // 生效 profile 的展示名（template_id）+ adapter + 脱敏认证类型；无生效配置则留空。
+    let (provider_label, adapter, auth_mode, has_key) = match cfg.active_profile() {
+        Some(profile) => {
+            let public = crate::runtime::provider::resolve_launch_plan(profile)
+                .ok()
+                .map(|plan| plan.public());
+            let auth_mode = match public.as_ref().map(|view| view.auth_mode) {
+                Some(AuthMode::ApiKey) => "api_key",
+                Some(AuthMode::KeychainOauth) => "keychain_oauth",
+                Some(AuthMode::None) => "none",
+                None => "",
+            };
+            let has_key = public.as_ref().is_some_and(|view| {
+                view.auth_mode == AuthMode::ApiKey && view.credential_configured
+            });
+            (
+                profile.template_id.clone(),
+                adapter_for_profile(profile),
+                auth_mode,
+                has_key,
+            )
+        }
+        None => (String::new(), String::new(), "", false),
     };
     let mut cmd = Command::new("bash");
     // 多 profile：传 template_id + adapter + key 有无（布尔）。doctor 不再按 provider 名写死、
@@ -46,6 +62,7 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
     cmd.arg(&doctor)
         .env("CSSWITCH_PROVIDER", &provider_label)
         .env("CSSWITCH_ADAPTER", adapter)
+        .env("CSSWITCH_AUTH_MODE", auth_mode)
         .env("CSSWITCH_KEY_PRESENT", if has_key { "1" } else { "0" })
         .env("CSSWITCH_PROXY_PORT", cfg.proxy_port.to_string())
         .env("CSSWITCH_SANDBOX_PORT", cfg.sandbox_port.to_string());
@@ -59,6 +76,23 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
         text.push_str("\n[stderr] ");
         text.push_str(err.trim());
     }
+    let codex_profile_count = cfg
+        .profiles
+        .iter()
+        .filter(|profile| profile.template_id == "codex")
+        .count();
+    let auth_summary = if cfg.experimental_codex_enabled || codex_profile_count > 0 {
+        super::codex::codex_auth_diagnostic_summary(app)
+    } else {
+        "auth=not_checked".into()
+    };
+    text.push_str("\n[Codex 实验]\n  开关=");
+    text.push_str(if cfg.experimental_codex_enabled {
+        "启用"
+    } else {
+        "关闭"
+    });
+    text.push_str(&format!("  配置数={codex_profile_count}  {auth_summary}\n"));
     Ok(text)
 }
 

@@ -1,22 +1,19 @@
-//! 模板注册表：单一来源（spec §5）。template_id 稳定持久于 Profile，据它派生
-//! 运行 adapter（模型策略/鉴权/上限）与 UI 能力（是否必选模型 / URL 可编辑 / 内置模型）。
-//! 前端 list_templates 取一次铺 UI，不在前端复制常量。
+//! UI 模板注册表：只保存名称、默认地址、图标和内置模型等展示元数据。
+//! adapter、鉴权、模型策略、transport、thinking 等启动 capability 的唯一来源是
+//! `catalog/provider-contracts.v1.json`；前端 list_templates 由两者合并后铺 UI。
 
 #[derive(Clone)]
 pub struct Template {
     pub id: &'static str,
     pub name: &'static str,
-    pub category: &'static str,   // official | cn_official | custom
+    pub category: &'static str, // official | cn_official | custom | experimental
     pub api_format: &'static str, // anthropic | openai_chat | openai_responses | gemini_native
-    pub adapter: &'static str, // Rust gateway provider：deepseek | qwen | relay | openai-custom | openai-responses
     pub base_url: &'static str, // 默认；空=用户填
     pub base_url_editable: bool,
-    pub requires_model_override: bool,
     pub builtin_models: &'static [&'static str],
     pub website_url: &'static str,
     pub icon: &'static str,
     pub icon_color: &'static str,
-    pub thinking_policy: &'static str, // relay thinking 策略：adaptive（默认）/ enabled（Kimi）/ ""（native）
 }
 
 pub fn all() -> &'static [Template] {
@@ -25,16 +22,6 @@ pub fn all() -> &'static [Template] {
 
 pub fn by_id(id: &str) -> Option<&'static Template> {
     TEMPLATES.iter().find(|t| t.id == id)
-}
-
-/// 未命中 → "relay"（通用 anthropic 兼容透传，双鉴权）。
-pub fn adapter_for(template_id: &str) -> &'static str {
-    by_id(template_id).map(|t| t.adapter).unwrap_or("relay")
-}
-
-/// 模板的 relay thinking 策略；未命中 → ""（native/未知不注入，代理走默认 auto→adaptive）。
-pub fn thinking_policy_for(template_id: &str) -> &'static str {
-    by_id(template_id).map(|t| t.thinking_policy).unwrap_or("")
 }
 
 /// 旧固定槽 id → 新 template_id（迁移用）。未知/遗留裸 relay → custom。
@@ -56,55 +43,44 @@ static TEMPLATES: &[Template] = &[
         name: "DeepSeek",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "deepseek",
         base_url: "https://api.deepseek.com/anthropic",
         base_url_editable: false,
-        requires_model_override: false,
         builtin_models: &["claude-opus-4-8", "claude-haiku-4-5"],
         website_url: "https://platform.deepseek.com",
         icon: "deepseek",
         icon_color: "#1E88E5",
-        thinking_policy: "",
     },
     Template {
         id: "glm",
         name: "智谱 GLM",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://open.bigmodel.cn/api/anthropic",
         base_url_editable: true,
-        requires_model_override: true, // #9：全 relay 统一 FIXED（选/填一个模型 → force）
         builtin_models: &["glm-5.2", "glm-4.7", "glm-4.6", "glm-4.5-air"], // 官方核定 2026-07-04：旗舰 glm-5.2
         website_url: "https://open.bigmodel.cn",
         icon: "glm",
         icon_color: "#2E6BE6",
-        thinking_policy: "adaptive",
     },
     Template {
         id: "xiaomi",
         name: "小米 MiMo",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://api.xiaomimimo.com/anthropic",
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &["mimo-v2.5-pro"],
         website_url: "https://xiaomimimo.com",
         icon: "xiaomi",
         icon_color: "#FF6900",
-        thinking_policy: "adaptive",
     },
     Template {
         id: "siliconflow",
         name: "硅基流动",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://api.siliconflow.cn",
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &[
             "deepseek-ai/DeepSeek-V4-Pro",
             "deepseek-ai/DeepSeek-V4-Flash",
@@ -114,47 +90,38 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://siliconflow.cn",
         icon: "siliconflow",
         icon_color: "#7C3AED",
-        thinking_policy: "adaptive",
     },
     Template {
         id: "kimi",
         name: "Kimi（Moonshot）",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://api.moonshot.cn/anthropic", // 国际站可改 api.moonshot.ai/anthropic
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"], // 官方核定 2026-07-04
         website_url: "https://platform.moonshot.cn",
         icon: "kimi",
         icon_color: "#16182F",
-        thinking_policy: "enabled",
     },
     Template {
         id: "minimax",
         name: "MiniMax",
         category: "cn_official",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://api.minimaxi.com/anthropic", // 国内站（真机验证：key 有效 + /v1/models 实时发现 200）；国际站改 api.minimax.io
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"], // 官方核定 2026-07-04：旗舰 M3（2026-06-01 GA）
         website_url: "https://platform.minimaxi.com",
         icon: "minimax",
         icon_color: "#E1341E",
-        thinking_policy: "adaptive",
     },
     Template {
         id: "openrouter",
         name: "OpenRouter",
         category: "custom",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "https://openrouter.ai/api",
         base_url_editable: true,
-        requires_model_override: true, // #9：全 relay 统一 FIXED
         builtin_models: &[
             "anthropic/claude-sonnet-5",
             "anthropic/claude-opus-4.8",
@@ -163,67 +130,66 @@ static TEMPLATES: &[Template] = &[
         website_url: "https://openrouter.ai",
         icon: "openrouter",
         icon_color: "#6467F2",
-        thinking_policy: "adaptive",
     },
     Template {
         id: "qwen",
         name: "通义千问",
         category: "cn_official",
         api_format: "openai_chat",
-        adapter: "qwen",
         base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         base_url_editable: false,
-        requires_model_override: false,
         builtin_models: &["qwen3.7-max", "qwen-plus-latest", "qwen-turbo"],
         website_url: "https://dashscope.aliyun.com",
         icon: "qwen",
         icon_color: "#615CED",
-        thinking_policy: "",
+    },
+    Template {
+        id: "codex",
+        name: "Codex（实验）",
+        category: "experimental",
+        api_format: "openai_responses",
+        base_url: "",
+        base_url_editable: false,
+        builtin_models: &[],
+        website_url: "https://developers.openai.com/codex/",
+        icon: "custom",
+        icon_color: "#111827",
     },
     Template {
         id: "custom-openai",
         name: "自定义 OpenAI",
         category: "custom",
         api_format: "openai_chat",
-        adapter: "openai-custom",
         base_url: "",
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &[],
         website_url: "",
         icon: "custom",
         icon_color: "#2563EB",
-        thinking_policy: "",
     },
     Template {
         id: "custom-openai-responses",
         name: "自定义 OpenAI Responses",
         category: "custom",
         api_format: "openai_responses",
-        adapter: "openai-responses",
         base_url: "",
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &[],
         website_url: "",
         icon: "custom",
         icon_color: "#0F766E",
-        thinking_policy: "",
     },
     Template {
         id: "custom",
         name: "自定义 Anthropic",
         category: "custom",
         api_format: "anthropic",
-        adapter: "relay",
         base_url: "",
         base_url_editable: true,
-        requires_model_override: true,
         builtin_models: &[],
         website_url: "",
         icon: "custom",
         icon_color: "#6B7280",
-        thinking_policy: "adaptive",
     },
 ];
 
@@ -273,7 +239,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn table_has_eleven_templates() {
+    fn table_has_twelve_templates_including_experimental_codex() {
         let ids: Vec<&str> = all().iter().map(|t| t.id).collect();
         assert_eq!(
             ids,
@@ -286,6 +252,7 @@ mod tests {
                 "minimax",
                 "openrouter",
                 "qwen",
+                "codex",
                 "custom-openai",
                 "custom-openai-responses",
                 "custom"
@@ -294,17 +261,20 @@ mod tests {
     }
 
     #[test]
-    fn adapter_mapping_is_correct() {
-        assert_eq!(adapter_for("deepseek"), "deepseek");
-        assert_eq!(adapter_for("qwen"), "qwen");
-        assert_eq!(adapter_for("glm"), "relay");
-        assert_eq!(adapter_for("kimi"), "relay");
-        assert_eq!(adapter_for("minimax"), "relay");
-        assert_eq!(adapter_for("openrouter"), "relay");
-        assert_eq!(adapter_for("custom-openai"), "openai-custom");
-        assert_eq!(adapter_for("custom-openai-responses"), "openai-responses");
-        assert_eq!(adapter_for("custom"), "relay");
-        assert_eq!(adapter_for("unknown-xyz"), "relay"); // 兜底
+    fn provider_contract_owns_adapter_mapping() {
+        assert_eq!(
+            crate::provider_contracts::contract_for("deepseek", "anthropic")
+                .unwrap()
+                .adapter,
+            "deepseek"
+        );
+        assert_eq!(
+            crate::provider_contracts::contract_for("custom-openai-responses", "openai_responses")
+                .unwrap()
+                .adapter,
+            "openai-responses"
+        );
+        assert!(crate::provider_contracts::contract_for("unknown-xyz", "anthropic").is_err());
     }
 
     #[test]
@@ -314,6 +284,7 @@ mod tests {
         assert_eq!(by_id("kimi").unwrap().api_format, "anthropic");
         assert_eq!(by_id("minimax").unwrap().api_format, "anthropic");
         assert_eq!(by_id("qwen").unwrap().api_format, "openai_chat");
+        assert_eq!(by_id("codex").unwrap().api_format, "openai_responses");
         assert_eq!(by_id("custom-openai").unwrap().api_format, "openai_chat");
         assert_eq!(
             by_id("custom-openai-responses").unwrap().api_format,
@@ -324,19 +295,24 @@ mod tests {
 
     #[test]
     fn requires_model_override_matches_capability() {
-        assert!(by_id("xiaomi").unwrap().requires_model_override);
-        assert!(by_id("siliconflow").unwrap().requires_model_override);
-        assert!(by_id("kimi").unwrap().requires_model_override);
-        assert!(by_id("minimax").unwrap().requires_model_override);
-        assert!(by_id("glm").unwrap().requires_model_override); // 改：全 relay 统一 force
-        assert!(by_id("custom-openai").unwrap().requires_model_override);
-        assert!(
-            by_id("custom-openai-responses")
-                .unwrap()
-                .requires_model_override
-        );
-        assert!(by_id("openrouter").unwrap().requires_model_override); // 改
-        assert!(by_id("custom").unwrap().requires_model_override);
+        for (id, api_format) in [
+            ("xiaomi", "anthropic"),
+            ("siliconflow", "anthropic"),
+            ("kimi", "anthropic"),
+            ("minimax", "anthropic"),
+            ("glm", "anthropic"),
+            ("custom-openai", "openai_chat"),
+            ("custom-openai-responses", "openai_responses"),
+            ("openrouter", "anthropic"),
+            ("custom", "anthropic"),
+        ] {
+            assert_eq!(
+                crate::provider_contracts::contract_for(id, api_format)
+                    .unwrap()
+                    .default_model_policy,
+                crate::provider_contracts::ModelPolicy::RequiredFixed
+            );
+        }
         // 旗舰默认 = builtin_models 首项（官方核定，2026-07-04）
         assert_eq!(by_id("glm").unwrap().builtin_models[0], "glm-5.2");
         assert_eq!(by_id("minimax").unwrap().builtin_models[0], "MiniMax-M3");
@@ -348,14 +324,24 @@ mod tests {
 
     #[test]
     fn thinking_policy_per_provider() {
-        // 真机 §3.5：Kimi 强制 thinking.type=enabled；MiniMax 及其它 relay 认 adaptive。
-        // native（deepseek/qwen）不经 relay thinking 注入，policy 为空。
-        assert_eq!(by_id("kimi").unwrap().thinking_policy, "enabled");
-        assert_eq!(by_id("minimax").unwrap().thinking_policy, "adaptive");
-        assert_eq!(by_id("glm").unwrap().thinking_policy, "adaptive");
-        assert_eq!(by_id("custom").unwrap().thinking_policy, "adaptive");
-        assert_eq!(by_id("deepseek").unwrap().thinking_policy, "");
-        assert_eq!(by_id("qwen").unwrap().thinking_policy, "");
+        assert_eq!(
+            crate::provider_contracts::contract_for("kimi", "anthropic")
+                .unwrap()
+                .thinking_policy,
+            "enabled"
+        );
+        assert_eq!(
+            crate::provider_contracts::contract_for("glm", "anthropic")
+                .unwrap()
+                .thinking_policy,
+            "adaptive"
+        );
+        assert_eq!(
+            crate::provider_contracts::contract_for("deepseek", "anthropic")
+                .unwrap()
+                .thinking_policy,
+            ""
+        );
     }
 
     #[test]

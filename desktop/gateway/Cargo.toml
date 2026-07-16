@@ -4,6 +4,10 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[features]
+default = []
+acceptance-keychain = []
+
 [[bin]]
 name = "csswitch-gateway"
 path = "src/main.rs"
@@ -18,7 +22,15 @@ csswitch-skill-install-core = { path = "../skill-package" }
 getrandom = "0.2"
 hmac = "0.12"
 libc = "0.2"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "stream"] }
 regex = "1"
+serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+url = "2"
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7"
+security-framework-sys = "2.17"

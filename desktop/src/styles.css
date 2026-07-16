@@ -89,6 +89,27 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .ssh-bridge-toggle{display:flex;align-items:center;gap:8px;margin:0;color:var(--ink);cursor:pointer}
 .ssh-bridge-toggle input{width:16px;height:16px;margin:0;padding:0;flex:0 0 auto;accent-color:var(--accent)}
 .ssh-bridge-toggle span{font-size:11.5px;font-weight:600}
+.form-group{margin-top:10px}
+.form-group.compact{margin-top:6px}
+.form-group-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:5px}
+.form-group-head label{margin:0}
+.form-group-head .btn{height:27px}
+.codex-experimental{margin-top:12px;padding-top:10px;border-top:1px solid var(--line)}
+.codex-experimental-title{display:flex;align-items:center;justify-content:space-between;gap:8px;
+  margin-bottom:9px;font-size:12px;font-weight:700}
+.badge.warn{color:#9a5a00;border-color:color-mix(in srgb,var(--amber) 55%,var(--line));
+  background:color-mix(in srgb,var(--amber) 10%,var(--panel))}
+.codex-auth-box{margin-top:9px;padding:9px;border:1px solid var(--line);border-radius:9px;background:var(--field)}
+.codex-auth-status{font-size:10.5px;line-height:1.5;color:var(--sub)}
+.codex-auth-actions{margin-top:8px;flex-wrap:wrap}
+.codex-auth-actions .btn{flex:1 1 auto;padding:0 8px}
+.codex-catalog{margin-top:8px;border:1px solid var(--line);border-radius:9px;background:var(--field);overflow:hidden}
+.codex-catalog-meta{padding:7px 9px;border-bottom:1px solid var(--line);font-size:10px;color:var(--sub)}
+.codex-catalog-list{max-height:132px;overflow:auto;padding:5px 9px}
+.codex-model-item{padding:4px 0;font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
+  color:var(--ink);word-break:break-all}
+.codex-model-item+.codex-model-item{border-top:1px solid var(--line)}
+.codex-model-empty{padding:5px 0;font-size:10.5px;color:var(--sub)}
 /* 模型来源提示（内置/未验证）用次要色，工具能力标注已在 option 文本里。 */
 #wizModelHint,#connModelHint{color:var(--sub)}
 /* profile 列表：每条已存配置一屏可见（图标/名/类别徽标/地址/模型/掩码 key/生效标记） */

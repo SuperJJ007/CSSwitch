@@ -9,10 +9,7 @@ use crate::runtime::profile::{
     ConnectionEdit,
 };
 use crate::runtime::profile_switch::{scratch_validate_candidate, set_active_profile_txn};
-use crate::runtime::provider::{
-    adapter_for_profile, reject_openai_custom_anthropic_base, relay_missing_base_url,
-    relay_missing_model,
-};
+use crate::runtime::provider::{reject_openai_custom_anthropic_base, resolve_launch_plan};
 use crate::{config, lifecycle, lock, run_blocking, SharedAppState, SharedLifecycle};
 
 #[tauri::command]
@@ -22,8 +19,9 @@ pub(crate) fn get_config() -> Result<serde_json::Value, String> {
 
 /// 模板注册表交前端铺 UI（新建向导用）。
 #[tauri::command]
-pub(crate) fn list_templates() -> Vec<serde_json::Value> {
-    build_list_templates()
+pub(crate) fn list_templates() -> Result<Vec<serde_json::Value>, String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    Ok(build_list_templates(cfg.experimental_codex_enabled))
 }
 
 // ---------- profile CRUD 命令（薄包装 *_inner，统一经串行器） ----------
@@ -172,6 +170,7 @@ fn update_profile_connection_inner_cmd(
             .profile_by_id(&id)
             .cloned()
             .ok_or_else(|| format!("找不到 profile：{id}"))?;
+        config::require_template_enabled(&cfg, &candidate.template_id)?;
         // 生效【后】的候选连接（None=不改则沿用旧值），active/非 active 共用一份。
         let edit = ConnectionEdit::new(
             base_url.clone(),
@@ -180,15 +179,19 @@ fn update_profile_connection_inner_cmd(
             key.clone(),
         );
         edit.apply(&mut candidate);
-        let adapter = adapter_for_profile(&candidate);
-        reject_openai_custom_anthropic_base(adapter, &candidate.base_url)?;
+        let resolved = resolve_launch_plan(&candidate)?;
+        reject_openai_custom_anthropic_base(&resolved.adapter, &candidate.base_url)?;
         // 保存前守卫（修 P2）：relay/自定义端点清空 base_url → 不可用连接（激活必失败）。
         // 校验生效后的 base_url，空则拒绝落盘、绝不谎报「已保存」；native 走硬编码端点，空无妨。
-        if relay_missing_base_url(adapter, &candidate.base_url) {
+        if resolved.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired
+            && candidate.base_url.trim().is_empty()
+        {
             return Err("中转 / 自定义端点必须填写连接地址（base_url），连接未保存。".to_string());
         }
         // 保存前守卫（修 #9 P1-a）：relay/自定义端点空 model → 无 force → 退回 passthrough（显示 claude）。
-        if relay_missing_model(adapter, &candidate.model) {
+        if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+            && candidate.model.trim().is_empty()
+        {
             return Err("中转 / 自定义端点必须选择或填写一个模型，连接未保存。".to_string());
         }
         if cfg.active_id == id {
@@ -248,6 +251,11 @@ fn set_active_profile_inner_cmd(
     skip_verify: bool,
 ) -> Result<serde_json::Value, String> {
     lifecycle.with_serialized(|| {
+        let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+        let profile = cfg
+            .profile_by_id(&id)
+            .ok_or_else(|| format!("找不到 profile：{id}"))?;
+        config::require_template_enabled(&cfg, &profile.template_id)?;
         set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, skip_verify, None)
     })
 }

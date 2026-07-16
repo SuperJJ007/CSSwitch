@@ -1,5 +1,9 @@
 pub mod anthropic_compat;
 pub mod auth;
+pub mod codex_auth;
+pub(crate) mod codex_models;
+pub mod codex_protocol;
+pub(crate) mod codex_transport;
 pub mod config;
 pub mod connect;
 pub mod dsml_shim;
@@ -8,6 +12,7 @@ pub mod models;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod policy;
+pub(crate) mod provider_contracts;
 pub mod science_control;
 pub mod server;
 pub mod skill_install;

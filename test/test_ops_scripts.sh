@@ -64,6 +64,11 @@ if echo "$out" | grep -q "已配置"; then ok "doctor reports key present (已�
 out2="$(CSSWITCH_PROVIDER=deepseek CSSWITCH_ADAPTER=deepseek CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"
 if echo "$out2" | grep -q "尚未填 key"; then ok "doctor reports key absent when KEY_PRESENT unset"; else no "doctor absent-key wording drift: $out2"; fi
 
+# Codex OAuth 契约：只说明 CSSwitch Keychain OAuth；不能误写成 config.json 中有 key。
+out3="$(CSSWITCH_PROVIDER=codex CSSWITCH_ADAPTER=codex CSSWITCH_AUTH_MODE=keychain_oauth CSSWITCH_KEY_PRESENT=1 CSSWITCH_CONFIG="$T/nope.json" "$DOCTOR" 2>&1)"
+if echo "$out3" | grep -q "CSSwitch Keychain OAuth"; then ok "doctor reports Codex OAuth credential class"; else no "doctor missed Codex OAuth credential class: $out3"; fi
+if echo "$out3" | grep -q "key 已配置在 config.json"; then no "doctor misreported Codex OAuth as config key"; else ok "doctor never reports Codex OAuth as config key"; fi
+
 # config 权限：0644 → 警告应为 600（不改变退出码，仍 0）
 CFG644="$T/cfg644.json"; echo '{}' > "$CFG644"; chmod 644 "$CFG644"
 out="$(CSSWITCH_CONFIG="$CFG644" "$DOCTOR" 2>&1)"; rc=$?

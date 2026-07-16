@@ -62,6 +62,8 @@ pub struct GatewayHealth {
     pub provider: String,
     pub shim: String,
     pub launch_id: String,
+    pub provider_contract_id: String,
+    pub provider_contract_digest: String,
 }
 
 /// 读取 Rust gateway 声明的运行身份。
@@ -105,6 +107,16 @@ fn gateway_health_matches(
     expected_shim: Option<&str>,
     expected_launch_id: Option<&str>,
 ) -> bool {
+    let contract_matches = match expected_provider {
+        Some("codex") => crate::provider_contracts::gateway_contract_identity("codex")
+            .ok()
+            .flatten()
+            .is_some_and(|identity| {
+                actual.provider_contract_id == identity.contract_id
+                    && actual.provider_contract_digest == identity.catalog_digest
+            }),
+        _ => true,
+    };
     actual.gateway == expected_gateway
         && expected_provider
             .map(|expected| actual.provider == expected)
@@ -115,6 +127,7 @@ fn gateway_health_matches(
         && expected_launch_id
             .map(|expected| !expected.is_empty() && actual.launch_id == expected)
             .unwrap_or(true)
+        && contract_matches
 }
 
 fn http_health_response(port: u16, secret: Option<&str>, timeout_ms: u64) -> Option<String> {
@@ -181,6 +194,8 @@ fn gateway_health_from_response(resp: &str) -> Option<GatewayHealth> {
         provider: string_field("provider"),
         shim: string_field("shim"),
         launch_id: string_field("launch_id"),
+        provider_contract_id: string_field("provider_contract_id"),
+        provider_contract_digest: string_field("provider_contract_digest"),
     })
 }
 
@@ -417,6 +432,8 @@ mod tests {
                 provider: "deepseek".into(),
                 shim: "rewrite".into(),
                 launch_id: "launch-new".into(),
+                provider_contract_id: "".into(),
+                provider_contract_digest: "".into(),
             })
         );
     }
@@ -436,6 +453,8 @@ mod tests {
             provider: "deepseek".into(),
             shim: "off".into(),
             launch_id: "old-launch".into(),
+            provider_contract_id: "".into(),
+            provider_contract_digest: "".into(),
         };
         assert!(!gateway_health_matches(
             &old,
@@ -457,6 +476,36 @@ mod tests {
             Some("deepseek"),
             Some("off"),
             Some(""),
+        ));
+    }
+
+    #[test]
+    fn managed_codex_health_requires_compiled_provider_contract_identity() {
+        let identity = crate::provider_contracts::gateway_contract_identity("codex")
+            .unwrap()
+            .unwrap();
+        let mut health = GatewayHealth {
+            gateway: "rust".into(),
+            provider: "codex".into(),
+            shim: "off".into(),
+            launch_id: "launch".into(),
+            provider_contract_id: identity.contract_id,
+            provider_contract_digest: identity.catalog_digest,
+        };
+        assert!(gateway_health_matches(
+            &health,
+            "rust",
+            Some("codex"),
+            Some("off"),
+            Some("launch")
+        ));
+        health.provider_contract_digest = "wrong".into();
+        assert!(!gateway_health_matches(
+            &health,
+            "rust",
+            Some("codex"),
+            Some("off"),
+            Some("launch")
         ));
     }
 

@@ -2,9 +2,10 @@ use std::path::Path;
 
 use serde_json::{json, Value};
 
+use crate::provider_contracts::{CredentialSource, EndpointPolicy};
 use crate::runtime::operation::{OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::merge_and_sort_models;
-use crate::runtime::provider::{key_env_for_adapter, reject_openai_custom_anthropic_base};
+use crate::runtime::provider::{reject_openai_custom_anthropic_base, resolve_launch_plan};
 use crate::{config, scratch, templates};
 
 pub(crate) struct ModelDiscoveryRequest {
@@ -58,22 +59,6 @@ fn effective_api_format_from_dir(
     Ok(tpl.api_format.to_string())
 }
 
-fn discovery_adapter(
-    template_id: &str,
-    tpl_adapter: &'static str,
-    api_format: &str,
-) -> &'static str {
-    if template_id == "custom" {
-        match api_format {
-            "openai_chat" => "openai-custom",
-            "openai_responses" => "openai-responses",
-            _ => tpl_adapter,
-        }
-    } else {
-        tpl_adapter
-    }
-}
-
 fn build_fetch_models_contract_response(
     outcome: &scratch::ProbeOutcome,
     status: Option<u16>,
@@ -84,6 +69,25 @@ fn build_fetch_models_contract_response(
         scratch::ProbeOutcome::Ok => {
             let v: Value =
                 serde_json::from_str(body).map_err(|e| format!("解析模型列表失败：{e}"))?;
+            let diagnostics = v.get("diagnostics");
+            let reported_source = diagnostics
+                .and_then(|value| value.get("source"))
+                .and_then(Value::as_str)
+                .filter(|source| {
+                    matches!(
+                        *source,
+                        "live" | "fresh-cache" | "revalidated-cache" | "stale-cache"
+                    )
+                })
+                .unwrap_or("live");
+            let stale = diagnostics
+                .and_then(|value| value.get("stale"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let age_seconds = diagnostics
+                .and_then(|value| value.get("age_seconds"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
             let live: Vec<(String, Option<bool>)> = v
                 .get("data")
                 .and_then(|d| d.as_array())
@@ -97,15 +101,20 @@ fn build_fetch_models_contract_response(
                         .collect()
                 })
                 .unwrap_or_default();
-            if live.is_empty() {
+            if live.is_empty() && !builtin.is_empty() {
                 return Ok(json!({
                     "models": merge_and_sort_models(vec![], builtin),
-                    "source": "builtin", "error_kind": null, "upstream_status": 200
+                    "source": "builtin", "error_kind": null, "upstream_status": 200,
+                    "stale": false, "age_seconds": 0
                 }));
             }
             Ok(json!({
                 "models": merge_and_sort_models(live, builtin),
-                "source": "live", "error_kind": null, "upstream_status": 200
+                "source": reported_source,
+                "error_kind": if stale { json!("network") } else { Value::Null },
+                "upstream_status": 200,
+                "stale": stale,
+                "age_seconds": age_seconds
             }))
         }
         scratch::ProbeOutcome::Auth(code) => {
@@ -122,7 +131,9 @@ fn build_fetch_models_contract_response(
                 "models": merge_and_sort_models(vec![], builtin),
                 "source": source,
                 "error_kind": error_kind,
-                "upstream_status": status
+                "upstream_status": status,
+                "stale": false,
+                "age_seconds": 0
             }))
         }
     }
@@ -147,44 +158,71 @@ pub(crate) fn fetch_models(
     req: ModelDiscoveryRequest,
 ) -> Result<Value, String> {
     let tid = req.template_id.trim();
+    let current_cfg =
+        config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    config::require_template_enabled(&current_cfg, tid)?;
     let tpl = templates::by_id(tid).ok_or_else(|| format!("未知模板：{tid}"))?;
     let base_url = if tpl.base_url_editable {
         req.base_url.trim().to_string()
     } else {
         tpl.base_url.to_string()
     };
-    if base_url.is_empty() || !(base_url.starts_with("http://") || base_url.starts_with("https://"))
-    {
-        return Err("请先填写 base_url（http:// 或 https:// 开头）。".into());
-    }
     let api_format = effective_api_format_from_dir(
         &config::default_dir(),
         tpl,
         req.profile_id.as_deref(),
         req.api_format.as_deref(),
     )?;
-    let key = resolve_probe_key(req.profile_id.as_deref(), &req.key)?;
-    let adapter = discovery_adapter(tid, tpl.adapter, &api_format);
-    reject_openai_custom_anthropic_base(adapter, &base_url)?;
-    let backend = scratch::backend_for_app(&app, adapter)?;
+    let contract = crate::provider_contracts::contract_for(tid, &api_format)?;
+    if contract.endpoint_policy == EndpointPolicy::ProfileRequired
+        && (base_url.is_empty()
+            || !(base_url.starts_with("http://") || base_url.starts_with("https://")))
+    {
+        return Err("请先填写 base_url（http:// 或 https:// 开头）。".into());
+    }
+    let mut candidate = if let Some(profile_id) = req.profile_id.as_deref() {
+        config::load_from(&config::default_dir())
+            .map_err(|error| error.to_string())?
+            .profile_by_id(profile_id)
+            .cloned()
+            .ok_or_else(|| format!("找不到 profile：{profile_id}"))?
+    } else {
+        config::Profile {
+            template_id: tid.to_string(),
+            category: tpl.category.to_string(),
+            api_format: api_format.clone(),
+            credential_source: contract.default_credential_source,
+            credential_ref: (contract.default_credential_source == CredentialSource::KeychainOauth)
+                .then(|| "csswitch:codex:default".to_string()),
+            model_policy: contract.default_model_policy,
+            ..Default::default()
+        }
+    };
+    candidate.template_id = tid.to_string();
+    candidate.api_format = api_format;
+    candidate.base_url = base_url;
+    if candidate.credential_source == CredentialSource::ApiKey {
+        candidate.api_key = resolve_probe_key(req.profile_id.as_deref(), &req.key)?;
+    }
+    let resolved = resolve_launch_plan(&candidate)?;
+    let scratch_plan = resolved.scratch();
+    reject_openai_custom_anthropic_base(&scratch_plan.provider, &scratch_plan.endpoint)?;
+    let backend = scratch::backend_for_app(&app, &scratch_plan.provider)?;
     let trace = OperationTrace::start(
         OperationKind::FetchModels,
-        format!("template_id={tid} adapter={adapter}"),
+        format!("template_id={tid} adapter={}", scratch_plan.provider),
     );
+    let (key_env, key) = scratch_plan.credential_parts();
 
     let res = scratch::scratch_probe(
         &backend,
         &scratch::ScratchTarget {
-            provider: adapter,
-            key_env: key_env_for_adapter(adapter),
-            base_url: &base_url,
-            key: &key,
+            provider: &scratch_plan.provider,
+            key_env,
+            base_url: &scratch_plan.endpoint,
+            key,
             model: None,
-            relay_thinking: if matches!(api_format.as_str(), "openai_chat" | "openai_responses") {
-                ""
-            } else {
-                tpl.thinking_policy
-            },
+            relay_thinking: &scratch_plan.thinking_policy,
         },
         scratch::ProbeKind::Models,
         Some(&trace),
@@ -197,11 +235,11 @@ pub(crate) fn fetch_models(
             let live_count = live_model_count_from_body(&res.body)?;
             let response =
                 build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)?;
-            if live_count == 0 {
-                trace.finish("ok source=builtin empty_live");
-            } else {
-                trace.finish(format!("ok source=live count={live_count}"));
-            }
+            let source = response
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            trace.finish(format!("ok source={source} count={live_count}"));
             Ok(response)
         }
         scratch::ProbeOutcome::Auth(code) => {
@@ -221,8 +259,8 @@ pub(crate) fn fetch_models(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fetch_models_contract_response, discovery_adapter, effective_api_format_from_dir,
-        resolve_probe_key, resolve_probe_key_from_dir,
+        build_fetch_models_contract_response, effective_api_format_from_dir, resolve_probe_key,
+        resolve_probe_key_from_dir,
     };
     use crate::{config, runtime::profile::create_profile_inner, scratch::ProbeOutcome};
 
@@ -259,16 +297,20 @@ mod tests {
     }
 
     #[test]
-    fn custom_profile_api_format_drives_model_discovery_adapter() {
+    fn provider_contract_drives_model_discovery_adapter() {
         assert_eq!(
-            discovery_adapter("custom", "relay", "openai_chat"),
+            crate::provider_contracts::contract_for("custom", "openai_chat")
+                .unwrap()
+                .adapter,
             "openai-custom"
         );
         assert_eq!(
-            discovery_adapter("custom", "relay", "openai_responses"),
+            crate::provider_contracts::contract_for("custom", "openai_responses")
+                .unwrap()
+                .adapter,
             "openai-responses"
         );
-        assert_eq!(discovery_adapter("glm", "relay", "openai_chat"), "relay");
+        assert!(crate::provider_contracts::contract_for("glm", "openai_chat").is_err());
     }
 
     #[test]
@@ -328,6 +370,28 @@ mod tests {
         assert_eq!(empty_live["error_kind"], serde_json::Value::Null);
         assert_eq!(empty_live["upstream_status"], 200);
         assert_eq!(empty_live["models"][0]["id"], "m-builtin");
+
+        let empty_dynamic = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[],"diagnostics":{"source":"live","stale":false,"age_seconds":0}}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(empty_dynamic["source"], "live");
+        assert!(empty_dynamic["models"].as_array().unwrap().is_empty());
+
+        let stale = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[{"id":"m-cached"}],"diagnostics":{"source":"stale-cache","stale":true,"age_seconds":301}}"#,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(stale["source"], "stale-cache");
+        assert_eq!(stale["stale"], true);
+        assert_eq!(stale["age_seconds"], 301);
+        assert_eq!(stale["error_kind"], "network");
     }
 
     #[test]

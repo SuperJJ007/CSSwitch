@@ -1,5 +1,5 @@
 # 真机验收文档已迁移
 
-当前 v0.5.0 真机矩阵见 [docs/operations/real-machine-acceptance.md](../docs/operations/real-machine-acceptance.md)。
+当前 v0.6.0 + Codex 实验桥接真机矩阵见 [docs/operations/real-machine-acceptance.md](../docs/operations/real-machine-acceptance.md)。
 
-此兼容指针计划保留到 v0.5.0 之后的下一个正式发布。
+此文件只保留为兼容入口；矩阵、护栏命令和结果术语以 operations 文档为准。

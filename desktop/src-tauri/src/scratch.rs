@@ -11,6 +11,7 @@ use std::time::Duration;
 use crate::runtime::operation::{self, OperationStage, OperationTrace};
 
 /// 探测类型：Models 验端点+鉴权（透传预设保存/获取模型）；Message 验具体模型（选了模型时）。
+#[derive(Clone, Copy)]
 pub enum ProbeKind {
     Models,
     Message,
@@ -114,7 +115,10 @@ pub fn scratch_env(
     model: Option<&str>,
     relay_thinking: &str,
 ) -> Vec<(String, String)> {
-    let mut v = vec![(key_env.to_string(), key.to_string())];
+    let mut v = Vec::new();
+    if !key_env.is_empty() {
+        v.push((key_env.to_string(), key.to_string()));
+    }
     if !base_url.is_empty() {
         let env = if matches!(provider, "openai-custom" | "openai-responses") {
             "CSSWITCH_OPENAI_BASE_URL"
@@ -164,6 +168,7 @@ pub(crate) fn backend_for_app<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     adapter: &str,
 ) -> Result<ScratchBackend, String> {
+    crate::commands::codex::ensure_provider_auth_ready(app, adapter)?;
     let shim_mode = crate::runtime::provider::current_shim_mode_for_adapter(adapter);
     let bin = crate::runtime::proxy_lifecycle::gateway_bin_path(app).ok_or(
         "找不到 csswitch-gateway 二进制；请重新安装完整应用，开发态可设置绝对 CSSWITCH_GATEWAY_BIN。",
@@ -232,14 +237,19 @@ pub fn scratch_probe(
             ),
         );
     }
-    crate::runtime::proxy_lifecycle::configure_managed_proxy_command(
+    if let Err(error) = crate::runtime::proxy_lifecycle::configure_managed_proxy_command(
         &mut cmd,
         target.provider,
         backend.shim_mode(),
         port,
         &secret,
         &launch_id,
-    );
+    ) {
+        return ProbeResult {
+            status: None,
+            body: error,
+        };
+    }
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     // key/base_url/model 经 env 注入（绝不进 argv，避免 ps 泄露）；native 不带 relay base。
     for (k, v) in scratch_env(
@@ -326,12 +336,12 @@ pub fn scratch_probe(
             if let Some(t) = trace {
                 t.stage(OperationStage::ScratchUpstreamProbe, "GET /v1/models");
             }
-            match crate::proc::http_get_body(
-                port,
-                Some(&secret),
-                "/v1/models",
-                operation::UPSTREAM_PROBE_TIMEOUT_MS,
-            ) {
+            let timeout_ms = if target.provider == "codex" {
+                operation::CODEX_MODELS_PROBE_TIMEOUT_MS
+            } else {
+                operation::UPSTREAM_PROBE_TIMEOUT_MS
+            };
+            match crate::proc::http_get_body(port, Some(&secret), "/v1/models", timeout_ms) {
                 Some((code, body)) => ProbeResult {
                     status: Some(code),
                     body,
@@ -612,6 +622,12 @@ mod tests {
             "",
         );
         assert!(!env.iter().any(|(k, _)| k == "CSSWITCH_RELAY_THINKING"));
+    }
+
+    #[test]
+    fn scratch_env_gateway_owned_auth_never_invents_a_key_env() {
+        let env = scratch_env("codex", "", "", "", None, "");
+        assert!(env.is_empty());
     }
 
     #[test]

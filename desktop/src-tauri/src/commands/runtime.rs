@@ -13,7 +13,7 @@ use crate::runtime::diagnostics::{
 use crate::runtime::operation::{self, OperationKind, OperationTrace};
 use crate::runtime::profile::profile_capabilities;
 use crate::runtime::provider::{
-    adapter_for_profile, current_shim_mode_for_adapter, gateway_kind_for_adapter,
+    current_shim_mode_for_adapter, gateway_kind_for_adapter, resolve_launch_plan,
     status_upstream_endpoint,
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
@@ -75,7 +75,7 @@ fn status_runtime_identity(
     (gateway_kind, runtime_shim_mode, current_shim_mode)
 }
 
-fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+pub(crate) fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
     let runtime = st.science_runtime.clone();
     let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
     if result.is_ok() {
@@ -394,10 +394,12 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         // 上游灯读生效 profile 的 adapter/base_url；无生效配置 → 空（灯显黄，不误探）。
         let (adapter, base_url, active_profile, catalog_profile) = match cfg.active_profile() {
             Some(p) => {
-                let adapter = adapter_for_profile(p).to_string();
+                let (adapter, endpoint) = resolve_launch_plan(p)
+                    .map(|plan| (plan.adapter, plan.endpoint))
+                    .unwrap_or_else(|_| ("unsupported".to_string(), String::new()));
                 (
                     adapter,
-                    p.base_url.clone(),
+                    endpoint,
                     json!({
                         "id": p.id,
                         "name": p.name,

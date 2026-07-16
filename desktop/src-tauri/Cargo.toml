@@ -5,6 +5,12 @@ description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
 authors = ["CSSwitch"]
 edition = "2021"
 
+[features]
+default = []
+# Compile-time-only handoff to build.rs so the bundled Gateway uses a separate
+# Keychain namespace in the isolated real-machine Acceptance app.
+acceptance-keychain = []
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]

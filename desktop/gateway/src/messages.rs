@@ -77,6 +77,7 @@ fn post_with_timeouts(
     body: Vec<u8>,
     timeouts: InferenceTimeouts,
 ) -> Result<Response, UpstreamError> {
+    let api_key = cfg.api_key.as_deref().unwrap_or("");
     let request = inference_client(timeouts)?
         .post(&cfg.upstream_url)
         .header("content-type", "application/json")
@@ -85,16 +86,16 @@ fn post_with_timeouts(
         || cfg.provider == "openai-custom"
         || cfg.provider == "openai-responses"
     {
-        request.header("authorization", format!("Bearer {}", cfg.api_key))
+        request.header("authorization", format!("Bearer {api_key}"))
     } else if cfg.provider == "relay" {
         request
             .header("anthropic-version", "2023-06-01")
-            .header("x-api-key", &cfg.api_key)
-            .header("authorization", format!("Bearer {}", cfg.api_key))
+            .header("x-api-key", api_key)
+            .header("authorization", format!("Bearer {api_key}"))
     } else {
         request
             .header("anthropic-version", "2023-06-01")
-            .header("x-api-key", &cfg.api_key)
+            .header("x-api-key", api_key)
     };
     request.body(body).send().map_err(|e| UpstreamError {
         status: 502,
@@ -110,16 +111,17 @@ fn post(cfg: &GatewayConfig, body: Vec<u8>) -> Result<Response, UpstreamError> {
 fn get_once(cfg: &GatewayConfig, url: &str) -> Result<UpstreamBody, UpstreamError> {
     // Model discovery intentionally retains its existing provider-specific
     // client contract. Its timeout/error semantics are handled separately.
+    let api_key = cfg.api_key.as_deref().unwrap_or("");
     let request = models_client(models_timeout_secs(&cfg.provider))?
         .get(url)
         .header("user-agent", UPSTREAM_UA);
     let request = if cfg.provider == "openai-custom" || cfg.provider == "openai-responses" {
-        request.header("authorization", format!("Bearer {}", cfg.api_key))
+        request.header("authorization", format!("Bearer {api_key}"))
     } else if cfg.provider == "relay" {
         request
             .header("anthropic-version", "2023-06-01")
-            .header("x-api-key", &cfg.api_key)
-            .header("authorization", format!("Bearer {}", cfg.api_key))
+            .header("x-api-key", api_key)
+            .header("authorization", format!("Bearer {api_key}"))
     } else {
         request
     };
@@ -466,12 +468,14 @@ mod tests {
             provider: "deepseek".to_string(),
             port: 0,
             auth_secret: None,
-            api_key: "fake-key".to_string(),
+            api_key: Some("fake-key".to_string()),
             upstream_url,
             models_url: None,
             forced_model: None,
             relay_thinking: None,
             shim_mode: "off".to_string(),
+            codex_state_root: None,
+            codex_contract: None,
             launch_id: "timeout-test".to_string(),
             skill_data_dir: None,
             skill_bridge_dir: None,

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -12,7 +12,7 @@ use crate::auth::{strip_path_secret, AuthResult};
 use crate::config::GatewayConfig;
 use crate::{
     anthropic_compat::{self, AnthropicMetadata, KimiServerToolFilter},
-    connect,
+    codex_auth, codex_models, codex_protocol, codex_transport, connect,
     dsml_shim::{DsmlDetector, DsmlStreamRewriter},
     messages, models, openai_chat, openai_responses, policy,
 };
@@ -32,6 +32,12 @@ struct RequestHead {
     method: String,
     target: String,
     headers: HashMap<String, String>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct CodexComponents<'a> {
+    transport: Option<&'a codex_transport::CodexTransport>,
+    models: Option<&'a codex_models::CodexModelCatalog>,
 }
 
 struct RequestNonceGenerator {
@@ -201,6 +207,22 @@ fn write_json(stream: &mut TcpStream, status: u16, reason: &str, value: Value) {
     write_response(stream, status, reason, "application/json", &body);
 }
 
+fn write_codex_models_response(
+    stream: &mut TcpStream,
+    snapshot: &codex_models::CodexModelsSnapshot,
+) {
+    let body = json_bytes(snapshot.response_body());
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nx-csswitch-model-source: {}\r\nx-csswitch-model-age-seconds: {}\r\nconnection: close\r\n\r\n",
+        body.len(),
+        snapshot.source().as_str(),
+        snapshot.age_seconds(),
+    );
+    let _ = stream.write_all(&body);
+    let _ = stream.flush();
+}
+
 fn typed_error_json(
     stream: &mut TcpStream,
     status: u16,
@@ -228,6 +250,16 @@ fn forbidden_json(stream: &mut TcpStream) {
 
 fn invalid_request_json(stream: &mut TcpStream, detail: &str) {
     typed_error_json(stream, 400, "Bad Request", "invalid_request_error", detail);
+}
+
+fn request_too_large_json(stream: &mut TcpStream) {
+    typed_error_json(
+        stream,
+        413,
+        "Payload Too Large",
+        "invalid_request_error",
+        "request body is too large",
+    );
 }
 
 fn not_found_json(stream: &mut TcpStream, path: &str) {
@@ -273,6 +305,7 @@ fn handle_get(
     cfg: &GatewayConfig,
     target: &str,
     relay_models: &models::RelayModelCache,
+    codex_models: Option<&codex_models::CodexModelCatalog>,
 ) {
     let path = match strip_path_secret(dequery(target), cfg.auth_secret.as_deref()) {
         AuthResult::Ok(path) => path,
@@ -282,20 +315,76 @@ fn handle_get(
         }
     };
     match path.as_str() {
-        "/health" => write_json(
-            stream,
-            200,
-            "OK",
-            json!({
+        "/health" => {
+            let mut health = json!({
                 "status": "ok",
                 "gateway": "rust",
                 "provider": cfg.provider,
                 "shim": cfg.shim_mode,
                 "launch_id": cfg.launch_id,
-            }),
-        ),
+            });
+            if let Some(contract) = cfg.codex_contract.as_ref() {
+                let object = health
+                    .as_object_mut()
+                    .expect("health response is an object");
+                object.insert(
+                    "provider_contract_id".into(),
+                    Value::String(contract.contract_id.clone()),
+                );
+                object.insert(
+                    "provider_contract_digest".into(),
+                    Value::String(contract.catalog_digest.clone()),
+                );
+            }
+            write_json(stream, 200, "OK", health)
+        }
         "/v1/models" if cfg.provider == "qwen" => {
             write_json(stream, 200, "OK", models::qwen_models_response())
+        }
+        "/v1/models" if cfg.provider == "codex" => {
+            let Some(catalog) = codex_models else {
+                models_error_json(
+                    stream,
+                    502,
+                    "internal",
+                    None,
+                    "Codex model catalog is unavailable",
+                );
+                return;
+            };
+            let secrets = match load_codex_inference_secrets(cfg) {
+                Ok(secrets) => secrets,
+                Err(error) => {
+                    typed_error_json(
+                        stream,
+                        error.status,
+                        status_reason(error.status),
+                        error.error_type,
+                        error.message,
+                    );
+                    return;
+                }
+            };
+            match catalog.list(&secrets) {
+                Ok(snapshot) => write_codex_models_response(stream, &snapshot),
+                Err(error) => {
+                    if error.upstream_status == Some(401) {
+                        if let Some(root) = cfg.codex_state_root.clone() {
+                            let _ = codex_auth::refresh_production_for_generation(
+                                root,
+                                secrets.auth_generation(),
+                            );
+                        }
+                    }
+                    models_error_json(
+                        stream,
+                        error.status,
+                        error.error_kind,
+                        error.upstream_status,
+                        error.detail,
+                    );
+                }
+            }
         }
         "/v1/models"
             if cfg.provider == "openai-custom"
@@ -601,12 +690,523 @@ fn apply_dsml_nonstream(
     }
 }
 
+fn unix_time_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(i64::MAX)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodexAuthLoadError {
+    status: u16,
+    error_type: &'static str,
+    message: &'static str,
+}
+
+fn map_codex_auth_error(error: codex_auth::OAuthFlowError) -> CodexAuthLoadError {
+    if error.code == codex_auth::OAuthErrorCode::NotAuthenticated {
+        CodexAuthLoadError {
+            status: 401,
+            error_type: "authentication_error",
+            message: "Codex login is required",
+        }
+    } else if error.retryable {
+        CodexAuthLoadError {
+            status: 503,
+            error_type: "api_error",
+            message: "Codex authentication is temporarily unavailable",
+        }
+    } else {
+        CodexAuthLoadError {
+            status: 500,
+            error_type: "api_error",
+            message: "Codex authentication state is unavailable",
+        }
+    }
+}
+
+fn load_codex_inference_secrets(
+    cfg: &GatewayConfig,
+) -> Result<codex_auth::InferenceSecrets, CodexAuthLoadError> {
+    let state_root = cfg.codex_state_root.clone().ok_or(CodexAuthLoadError {
+        status: 500,
+        error_type: "api_error",
+        message: "Codex auth state root is unavailable",
+    })?;
+    let mut secrets = codex_auth::production_inference_snapshot(state_root.clone())
+        .map_err(map_codex_auth_error)?;
+    if secrets
+        .expires_at()
+        .is_some_and(|expires_at| expires_at <= unix_time_seconds())
+    {
+        let generation = secrets.auth_generation();
+        codex_auth::refresh_production_for_generation(state_root.clone(), generation)
+            .map_err(map_codex_auth_error)?;
+        secrets =
+            codex_auth::production_inference_snapshot(state_root).map_err(map_codex_auth_error)?;
+    }
+    Ok(secrets)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexPumpError {
+    UpstreamRead,
+    Protocol,
+    DownstreamWrite,
+    Cancelled,
+}
+
+fn emit_codex_events<F>(
+    reducer: &mut codex_protocol::ResponsesReducer<'_>,
+    events: Vec<Value>,
+    emit: &mut F,
+) -> Result<bool, CodexPumpError>
+where
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    for event in events {
+        for translated in reducer.apply(event).map_err(|_| CodexPumpError::Protocol)? {
+            emit(&sse_event(translated.event, &translated.data))
+                .map_err(|_| CodexPumpError::DownstreamWrite)?;
+        }
+        if reducer.is_complete() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn pump_codex_stream<R, F>(
+    mut upstream: R,
+    reducer: &mut codex_protocol::ResponsesReducer<'_>,
+    mut emit: F,
+) -> Result<(), CodexPumpError>
+where
+    R: Read,
+    F: FnMut(&[u8]) -> std::io::Result<()>,
+{
+    let mut decoder = codex_protocol::SseDecoder::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        match upstream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let mut offset = 0;
+                while offset < read {
+                    let (event, consumed) = decoder
+                        .feed_next(&buffer[offset..read])
+                        .map_err(|_| CodexPumpError::Protocol)?;
+                    offset += consumed;
+                    if let Some(event) = event {
+                        if emit_codex_events(reducer, vec![event], &mut emit)? {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::ConnectionAborted => {
+                return Err(CodexPumpError::Cancelled);
+            }
+            Err(_) => return Err(CodexPumpError::UpstreamRead),
+        }
+    }
+    let tail = decoder.finish().map_err(|_| CodexPumpError::Protocol)?;
+    if emit_codex_events(reducer, tail, &mut emit)? {
+        return Ok(());
+    }
+    reducer
+        .finish_stream()
+        .map_err(|_| CodexPumpError::Protocol)
+}
+
+fn finish_codex_stream_error(stream: &mut TcpStream) {
+    let _ = write_chunk(stream, &stream_error_event("Codex upstream protocol error"));
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+}
+
+fn forward_codex_stream<R: Read>(
+    stream: &mut TcpStream,
+    mut upstream: R,
+    reducer: &mut codex_protocol::ResponsesReducer<'_>,
+) {
+    if write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n"
+    )
+    .and_then(|_| stream.flush())
+    .is_err()
+    {
+        return;
+    }
+    match pump_codex_stream(&mut upstream, reducer, |chunk| write_chunk(stream, chunk)) {
+        Ok(()) => {}
+        Err(CodexPumpError::DownstreamWrite | CodexPumpError::Cancelled) => return,
+        Err(CodexPumpError::UpstreamRead | CodexPumpError::Protocol) => {
+            finish_codex_stream_error(stream);
+            return;
+        }
+    }
+    let _ = stream.write_all(b"0\r\n\r\n");
+    let _ = stream.flush();
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexNonstreamError {
+    UpstreamRead,
+    Protocol,
+    DownstreamClosed,
+}
+
+#[cfg(unix)]
+fn downstream_closed(stream: &TcpStream) -> bool {
+    use std::os::fd::AsRawFd;
+
+    let mut byte = [0_u8; 1];
+    let result = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            byte.as_mut_ptr().cast(),
+            byte.len(),
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    if result == 0 {
+        true
+    } else if result > 0 {
+        false
+    } else {
+        !matches!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        )
+    }
+}
+
+#[cfg(not(unix))]
+fn downstream_closed(_stream: &TcpStream) -> bool {
+    false
+}
+
+struct DownstreamCancellationWatch {
+    stop: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl DownstreamCancellationWatch {
+    fn start(
+        stream: &TcpStream,
+        cancellation: codex_transport::CodexCancellation,
+    ) -> std::io::Result<Self> {
+        let downstream = stream.try_clone()?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_for_thread = Arc::clone(&stop);
+        let handle = thread::spawn(move || {
+            while !stop_for_thread.load(Ordering::Acquire) {
+                if downstream_closed(&downstream) {
+                    cancellation.cancel();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(25));
+            }
+        });
+        Ok(Self {
+            stop,
+            handle: Some(handle),
+        })
+    }
+}
+
+impl Drop for DownstreamCancellationWatch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn collect_codex_nonstream<R: Read>(
+    mut upstream: R,
+    downstream: &TcpStream,
+    reducer: &mut codex_protocol::ResponsesReducer<'_>,
+) -> Result<(), CodexNonstreamError> {
+    let mut decoder = codex_protocol::SseDecoder::new();
+    let mut buffer = [0_u8; 8192];
+    loop {
+        if downstream_closed(downstream) {
+            return Err(CodexNonstreamError::DownstreamClosed);
+        }
+        match upstream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => {
+                let mut offset = 0;
+                while offset < read {
+                    let (event, consumed) = decoder
+                        .feed_next(&buffer[offset..read])
+                        .map_err(|_| CodexNonstreamError::Protocol)?;
+                    offset += consumed;
+                    if let Some(event) = event {
+                        reducer
+                            .apply(event)
+                            .map_err(|_| CodexNonstreamError::Protocol)?;
+                        if reducer.is_complete() {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionAborted
+                    || downstream_closed(downstream) =>
+            {
+                return Err(CodexNonstreamError::DownstreamClosed);
+            }
+            Err(_) => return Err(CodexNonstreamError::UpstreamRead),
+        }
+    }
+    for event in decoder
+        .finish()
+        .map_err(|_| CodexNonstreamError::Protocol)?
+    {
+        reducer
+            .apply(event)
+            .map_err(|_| CodexNonstreamError::Protocol)?;
+        if reducer.is_complete() {
+            return Ok(());
+        }
+    }
+    reducer
+        .finish_stream()
+        .map_err(|_| CodexNonstreamError::Protocol)
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CodexRequestPolicy<'a> {
+    reasoning_effort: Option<&'a str>,
+    supports_reasoning_summary: bool,
+    supports_parallel_tool_calls: bool,
+}
+
+fn handle_codex_messages_with_policy(
+    stream: &mut TcpStream,
+    raw: &Value,
+    is_stream: bool,
+    secrets: codex_auth::InferenceSecrets,
+    transport: &codex_transport::CodexTransport,
+    policy: CodexRequestPolicy<'_>,
+    mut auth_rejected: impl FnMut(u16, u64),
+) {
+    let target_model = match raw.get("model").and_then(Value::as_str) {
+        Some(model) if !model.trim().is_empty() => model,
+        _ => {
+            invalid_request_json(stream, "model is required for Codex");
+            return;
+        }
+    };
+    let signer = match codex_protocol::ThinkingSigner::new(secrets.thinking_key()) {
+        Ok(signer) => signer,
+        Err(_) => {
+            api_error_json(stream, 500, "Codex thinking key is unavailable");
+            return;
+        }
+    };
+    let context = codex_protocol::RequestContext {
+        target_model,
+        auth_epoch: secrets.auth_epoch(),
+        account_hash: secrets.account_hash(),
+        reasoning_effort: policy.reasoning_effort,
+        supports_reasoning_summary: policy.supports_reasoning_summary,
+        supports_parallel_tool_calls: policy.supports_parallel_tool_calls,
+    };
+    let translated = match codex_protocol::translate_anthropic_request(raw, &context, &signer) {
+        Ok(translated) => translated,
+        Err(error) => {
+            if error.kind == codex_protocol::ProtocolErrorKind::Bounds {
+                request_too_large_json(stream);
+            } else {
+                invalid_request_json(stream, error.detail);
+            }
+            return;
+        }
+    };
+    let body = match serde_json::to_vec(&translated) {
+        Ok(body) => body,
+        Err(_) => {
+            invalid_request_json(stream, "Codex request encoding failed");
+            return;
+        }
+    };
+    let generation = secrets.auth_generation();
+    let cancellation = codex_transport::CodexCancellation::default();
+    let _cancellation_watch = match DownstreamCancellationWatch::start(stream, cancellation.clone())
+    {
+        Ok(watch) => watch,
+        Err(_) => {
+            api_error_json(stream, 500, "Codex cancellation monitor is unavailable");
+            return;
+        }
+    };
+    let upstream = match transport.open_responses(&secrets, body, cancellation) {
+        Ok(upstream) => upstream,
+        Err(error) => {
+            if error.cancelled {
+                return;
+            }
+            if let Some(status @ (401 | 403)) = error.upstream_status {
+                auth_rejected(status, generation);
+            }
+            api_error_json(stream, error.status, error.detail);
+            return;
+        }
+    };
+    let mut reducer = codex_protocol::ResponsesReducer::new(
+        target_model,
+        secrets.auth_epoch(),
+        secrets.account_hash(),
+        &signer,
+    );
+    if is_stream {
+        forward_codex_stream(stream, upstream, &mut reducer);
+    } else {
+        match collect_codex_nonstream(upstream, stream, &mut reducer) {
+            Err(CodexNonstreamError::DownstreamClosed) => {}
+            Err(CodexNonstreamError::UpstreamRead | CodexNonstreamError::Protocol) => {
+                api_error_json(stream, 502, "Codex upstream protocol error");
+            }
+            Ok(()) => match reducer.nonstream_response() {
+                Ok(response) => write_json(stream, 200, "OK", response),
+                Err(_) => api_error_json(stream, 502, "Codex upstream protocol error"),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+fn handle_codex_messages_with_secrets(
+    stream: &mut TcpStream,
+    raw: &Value,
+    is_stream: bool,
+    secrets: codex_auth::InferenceSecrets,
+    transport: &codex_transport::CodexTransport,
+    auth_rejected: impl FnMut(u16, u64),
+) {
+    handle_codex_messages_with_policy(
+        stream,
+        raw,
+        is_stream,
+        secrets,
+        transport,
+        CodexRequestPolicy::default(),
+        auth_rejected,
+    );
+}
+
+fn handle_codex_messages(
+    stream: &mut TcpStream,
+    cfg: &GatewayConfig,
+    raw: &Value,
+    is_stream: bool,
+    transport: &codex_transport::CodexTransport,
+    catalog: &codex_models::CodexModelCatalog,
+) {
+    let secrets = match load_codex_inference_secrets(cfg) {
+        Ok(secrets) => secrets,
+        Err(error) => {
+            typed_error_json(
+                stream,
+                error.status,
+                status_reason(error.status),
+                error.error_type,
+                error.message,
+            );
+            return;
+        }
+    };
+    let auth_epoch = secrets.auth_epoch().to_string();
+    let auth_generation = secrets.auth_generation();
+    let account_hash = secrets.account_hash().to_string();
+    let state_root = cfg.codex_state_root.clone();
+    handle_codex_messages_with_catalog(
+        stream,
+        raw,
+        is_stream,
+        secrets,
+        transport,
+        catalog,
+        move |status, generation| {
+            catalog.invalidate_identity(&auth_epoch, auth_generation, &account_hash);
+            if status == 401 {
+                if let Some(root) = state_root.clone() {
+                    let _ = codex_auth::refresh_production_for_generation(root, generation);
+                }
+            }
+        },
+    );
+}
+
+fn handle_codex_messages_with_catalog(
+    stream: &mut TcpStream,
+    raw: &Value,
+    is_stream: bool,
+    secrets: codex_auth::InferenceSecrets,
+    transport: &codex_transport::CodexTransport,
+    catalog: &codex_models::CodexModelCatalog,
+    mut auth_rejected: impl FnMut(u16, u64),
+) {
+    let requested_model = match raw.get("model").and_then(Value::as_str) {
+        Some(model) if !model.trim().is_empty() => model,
+        _ => {
+            invalid_request_json(stream, "model is required for Codex");
+            return;
+        }
+    };
+    let snapshot = match catalog.list(&secrets) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            if error.upstream_status == Some(401) {
+                auth_rejected(401, secrets.auth_generation());
+            }
+            models_error_json(
+                stream,
+                error.status,
+                error.error_kind,
+                error.upstream_status,
+                error.detail,
+            );
+            return;
+        }
+    };
+    let Some(target_model) = snapshot.resolve_science_model(requested_model) else {
+        invalid_request_json(stream, "model is not available for this Codex account");
+        return;
+    };
+    let mut mapped_request = raw.clone();
+    mapped_request["model"] = Value::String(target_model.raw_id().to_string());
+    handle_codex_messages_with_policy(
+        stream,
+        &mapped_request,
+        is_stream,
+        secrets,
+        transport,
+        CodexRequestPolicy {
+            reasoning_effort: target_model.default_reasoning_effort(),
+            supports_reasoning_summary: target_model.supports_reasoning_summary(),
+            supports_parallel_tool_calls: target_model.supports_parallel_tool_calls(),
+        },
+        auth_rejected,
+    );
+}
+
 fn handle_messages(
     stream: &mut TcpStream,
     cfg: &GatewayConfig,
     body: Vec<u8>,
     request_nonces: Option<&RequestNonceGenerator>,
     relay_models: &models::RelayModelCache,
+    codex: CodexComponents<'_>,
 ) {
     let raw: Value = match serde_json::from_slice(&body) {
         Ok(v) => v,
@@ -617,6 +1217,18 @@ fn handle_messages(
     };
     let known_tools = known_tools_from_request(&raw);
     let is_stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if cfg.provider == "codex" {
+        let Some(transport) = codex.transport else {
+            api_error_json(stream, 502, "Codex transport is unavailable");
+            return;
+        };
+        let Some(catalog) = codex.models else {
+            api_error_json(stream, 502, "Codex model catalog is unavailable");
+            return;
+        };
+        handle_codex_messages(stream, cfg, &raw, is_stream, transport, catalog);
+        return;
+    }
     let dsml_request_nonce =
         (cfg.provider == "deepseek" && cfg.shim_mode == "rewrite" && !known_tools.is_empty())
             .then(|| request_nonces.map(RequestNonceGenerator::next_nonce))
@@ -778,6 +1390,7 @@ fn handle_post(
     head: &RequestHead,
     request_nonces: Option<&RequestNonceGenerator>,
     relay_models: &models::RelayModelCache,
+    codex: CodexComponents<'_>,
 ) {
     let path = match strip_path_secret(dequery(target), cfg.auth_secret.as_deref()) {
         AuthResult::Ok(path) => path,
@@ -793,6 +1406,10 @@ fn handle_post(
             return;
         }
     };
+    if cfg.provider == "codex" && codex_protocol::validate_request_body_size(len).is_err() {
+        request_too_large_json(stream);
+        return;
+    }
     let body = if len == 0 {
         b"{}".to_vec()
     } else {
@@ -808,7 +1425,7 @@ fn handle_post(
         not_found_json(stream, &path);
         return;
     }
-    handle_messages(stream, cfg, body, request_nonces, relay_models);
+    handle_messages(stream, cfg, body, request_nonces, relay_models, codex);
 }
 
 #[cfg(unix)]
@@ -1318,6 +1935,8 @@ fn handle_one(
     mut stream: TcpStream,
     request_nonces: Option<Arc<RequestNonceGenerator>>,
     relay_models: Arc<models::RelayModelCache>,
+    codex_transport: Option<Arc<codex_transport::CodexTransport>>,
+    codex_models: Option<Arc<codex_models::CodexModelCatalog>>,
 ) {
     let head = match read_head(&mut stream) {
         Ok(head) => head,
@@ -1328,7 +1947,13 @@ fn handle_one(
     };
     match head.method.as_str() {
         "CONNECT" => connect::handle_connect(&head.target, stream),
-        "GET" => handle_get(&mut stream, &cfg, &head.target, &relay_models),
+        "GET" => handle_get(
+            &mut stream,
+            &cfg,
+            &head.target,
+            &relay_models,
+            codex_models.as_deref(),
+        ),
         "POST" => {
             let target = head.target.clone();
             handle_post(
@@ -1338,6 +1963,10 @@ fn handle_one(
                 &head,
                 request_nonces.as_deref(),
                 &relay_models,
+                CodexComponents {
+                    transport: codex_transport.as_deref(),
+                    models: codex_models.as_deref(),
+                },
             )
         }
         _ => not_found_json(&mut stream, &head.target),
@@ -1347,6 +1976,34 @@ fn handle_one(
 pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
     let request_nonces = if cfg.provider == "deepseek" && cfg.shim_mode == "rewrite" {
         Some(Arc::new(RequestNonceGenerator::new()?))
+    } else {
+        None
+    };
+    let codex_transport = if cfg.provider == "codex" {
+        let contract = cfg
+            .codex_contract
+            .as_ref()
+            .ok_or("Codex provider contract is unavailable")?;
+        Some(Arc::new(
+            codex_transport::CodexTransport::production(contract)
+                .map_err(|error| error.to_string())?,
+        ))
+    } else {
+        None
+    };
+    let codex_models = if cfg.provider == "codex" {
+        let contract = cfg
+            .codex_contract
+            .as_ref()
+            .ok_or("Codex provider contract is unavailable")?;
+        let state_root = cfg
+            .codex_state_root
+            .clone()
+            .ok_or("Codex model catalog state root is unavailable")?;
+        Some(Arc::new(
+            codex_models::CodexModelCatalog::production(state_root, contract)
+                .map_err(|error| error.to_string())?,
+        ))
     } else {
         None
     };
@@ -1361,7 +2018,18 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
                 let cfg = cfg.clone();
                 let request_nonces = request_nonces.clone();
                 let relay_models = Arc::clone(&relay_models);
-                thread::spawn(move || handle_one(cfg, stream, request_nonces, relay_models));
+                let codex_transport = codex_transport.clone();
+                let codex_models = codex_models.clone();
+                thread::spawn(move || {
+                    handle_one(
+                        cfg,
+                        stream,
+                        request_nonces,
+                        relay_models,
+                        codex_transport,
+                        codex_models,
+                    )
+                });
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -1372,9 +2040,12 @@ pub fn serve(cfg: GatewayConfig) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::io::{Cursor, Error, ErrorKind, Read};
-    use std::sync::{Arc, Barrier};
+    use std::io::{Cursor, Error, ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier, Mutex};
     use std::thread;
+    use std::time::{Duration, Instant};
 
     use serde_json::{json, Map, Value};
 
@@ -1385,10 +2056,19 @@ mod tests {
         write_bridge_response_once, write_bridge_status, BridgeProgress,
     };
     use super::{
-        forward_stream_body, stream_error_event, KimiServerToolFilter, RequestNonceGenerator,
-        StreamFilter, StreamTermination,
+        collect_codex_nonstream, forward_stream_body, handle_codex_messages_with_catalog,
+        handle_codex_messages_with_secrets, handle_post, map_codex_auth_error, pump_codex_stream,
+        stream_error_event, write_codex_models_response, CodexComponents, CodexNonstreamError,
+        CodexPumpError, KimiServerToolFilter, RequestHead, RequestNonceGenerator, StreamFilter,
+        StreamTermination,
     };
+    use crate::codex_auth::{InferenceSecrets, OAuthErrorCode, OAuthFlowError};
+    use crate::codex_models::CodexModelCatalog;
+    use crate::codex_protocol::{ResponsesReducer, ThinkingSigner, MAX_REQUEST_BYTES};
+    use crate::codex_transport::CodexTransport;
+    use crate::config::{GatewayConfig, DEFAULT_CODEX_UPSTREAM_URL};
     use crate::dsml_shim::DsmlStreamRewriter;
+    use crate::models::RelayModelCache;
 
     struct FailingReader;
 
@@ -1400,6 +2080,767 @@ mod tests {
 
     struct CountingEofReader {
         reads: usize,
+    }
+
+    fn bind_loopback() -> TcpListener {
+        loop {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            if listener.local_addr().unwrap().port() != 8765 {
+                return listener;
+            }
+        }
+    }
+
+    fn capture_tcp_response(handler: impl FnOnce(&mut TcpStream)) -> Vec<u8> {
+        let listener = bind_loopback();
+        let address = listener.local_addr().unwrap();
+        let reader = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).unwrap();
+            response
+        });
+        let (mut stream, _) = listener.accept().unwrap();
+        handler(&mut stream);
+        drop(stream);
+        reader.join().unwrap()
+    }
+
+    fn read_mock_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut expected = None;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buffer).unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&buffer[..read]);
+            if expected.is_none() {
+                if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&request[..end]);
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    expected = Some(end + 4 + length);
+                }
+            }
+            if expected.is_some_and(|length| request.len() >= length) {
+                return request;
+            }
+        }
+    }
+
+    type MockCodexTransport = (
+        CodexTransport,
+        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<Vec<u8>>>>,
+        thread::JoinHandle<()>,
+    );
+
+    fn mock_codex_transport(response: Vec<u8>) -> MockCodexTransport {
+        let listener = bind_loopback();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let count_for_thread = Arc::clone(&count);
+        let requests_for_thread = Arc::clone(&requests);
+        let handle = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut quiet_deadline = None;
+            loop {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        count_for_thread.fetch_add(1, Ordering::SeqCst);
+                        requests_for_thread
+                            .lock()
+                            .unwrap()
+                            .push(read_mock_http_request(&mut stream));
+                        stream.write_all(&response).unwrap();
+                        stream.flush().unwrap();
+                        quiet_deadline = Some(Instant::now() + Duration::from_millis(150));
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        if quiet_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                            || Instant::now() >= deadline
+                        {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("mock Codex accept failed: {error}"),
+                }
+            }
+        });
+        let transport = CodexTransport::for_test(format!("http://{address}/responses")).unwrap();
+        (transport, count, requests, handle)
+    }
+
+    fn mock_codex_model_catalog(
+        model_ids: &[&str],
+    ) -> (
+        CodexModelCatalog,
+        thread::JoinHandle<()>,
+        std::path::PathBuf,
+    ) {
+        let models: Vec<Value> = model_ids
+            .iter()
+            .enumerate()
+            .map(|(priority, model)| {
+                json!({
+                    "slug": model,
+                    "display_name": model,
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "priority": priority,
+                    "default_reasoning_level": "medium",
+                    "supported_reasoning_levels": [{"effort": "medium", "description": "default"}],
+                    "supports_reasoning_summary_parameter": true,
+                    "supports_parallel_tool_calls": true,
+                })
+            })
+            .collect();
+        mock_codex_model_catalog_with_models(models)
+    }
+
+    fn mock_codex_model_catalog_with_models(
+        models: Vec<Value>,
+    ) -> (
+        CodexModelCatalog,
+        thread::JoinHandle<()>,
+        std::path::PathBuf,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let listener = bind_loopback();
+        let address = listener.local_addr().unwrap();
+        let body = serde_json::to_vec(&json!({"models": models})).unwrap();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            read_mock_http_request(&mut stream);
+            stream.write_all(&response).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        });
+        let mut random = [0_u8; 8];
+        getrandom::getrandom(&mut random).unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "csswitch-server-codex-models-{}-{}",
+            std::process::id(),
+            u64::from_ne_bytes(random)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let catalog =
+            CodexModelCatalog::for_test(format!("http://{address}/models"), root.clone()).unwrap();
+        (catalog, server, root)
+    }
+
+    fn http_sse_response(body: &[u8]) -> Vec<u8> {
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(body);
+        response
+    }
+
+    fn complete_codex_sse() -> Vec<u8> {
+        [
+            json!({"type": "response.created", "response": {"id": "resp"}}),
+            json!({"type": "response.output_text.delta", "item_id": "msg", "delta": "hello"}),
+            json!({"type": "response.output_item.done", "item": {"type": "message", "id": "msg", "content": [{"type": "output_text", "text": "hello"}]}}),
+            json!({"type": "response.completed", "response": {"usage": {"input_tokens": 2, "output_tokens": 1}}}),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>()
+        .into_bytes()
+    }
+
+    fn codex_request(stream: bool) -> Value {
+        json!({
+            "model": "gpt-test",
+            "max_tokens": 128,
+            "stream": stream,
+            "messages": [{"role": "user", "content": "hello"}],
+        })
+    }
+
+    fn http_body(response: &[u8]) -> &[u8] {
+        let end = response
+            .windows(4)
+            .position(|part| part == b"\r\n\r\n")
+            .unwrap();
+        &response[end + 4..]
+    }
+
+    #[test]
+    fn codex_handler_streams_upstream_once_for_stream_and_nonstream() {
+        for is_stream in [false, true] {
+            let (transport, count, requests, upstream) =
+                mock_codex_transport(http_sse_response(&complete_codex_sse()));
+            let response = capture_tcp_response(|stream| {
+                handle_codex_messages_with_secrets(
+                    stream,
+                    &codex_request(is_stream),
+                    is_stream,
+                    InferenceSecrets::for_test("access", "account"),
+                    &transport,
+                    |_, _| panic!("successful request must not reject auth"),
+                )
+            });
+            upstream.join().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            if is_stream {
+                let text = String::from_utf8_lossy(&response);
+                assert!(text.contains("event: message_start"));
+                assert!(text.contains("event: message_stop"));
+            } else {
+                let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
+                assert_eq!(body["content"][0]["text"], "hello");
+                assert_eq!(
+                    body["usage"],
+                    json!({"input_tokens": 2, "output_tokens": 1})
+                );
+            }
+            let request = requests.lock().unwrap()[0].clone();
+            let upstream_body: Value = serde_json::from_slice(http_body(&request)).unwrap();
+            assert_eq!(upstream_body["stream"], true);
+            assert_eq!(upstream_body["store"], false);
+            assert_eq!(upstream_body["model"], "gpt-test");
+        }
+    }
+
+    #[test]
+    fn codex_catalog_capabilities_drive_each_selected_model_request() {
+        let models = vec![
+            json!({
+                "slug": "gpt-sequential",
+                "display_name": "Sequential",
+                "visibility": "list",
+                "supported_in_api": false,
+                "priority": 0,
+                "default_reasoning_level": "low",
+                "supported_reasoning_levels": [{"effort": "low"}],
+                "supports_reasoning_summary_parameter": false,
+                "supports_parallel_tool_calls": false
+            }),
+            json!({
+                "slug": "gpt-parallel",
+                "display_name": "Parallel",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 1,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "medium"}, {"effort": "high"}],
+                "supports_reasoning_summary_parameter": true,
+                "supports_parallel_tool_calls": true
+            }),
+        ];
+        let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
+        let mut models_server = Some(models_server);
+
+        for (index, (alias, effort, summary, parallel)) in [
+            ("claude-csswitch-codex-gpt-sequential", "low", false, false),
+            ("claude-csswitch-codex-gpt-parallel", "high", true, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (transport, posts, requests, upstream) =
+                mock_codex_transport(http_sse_response(&complete_codex_sse()));
+            let mut request = codex_request(false);
+            request["model"] = json!(alias);
+            request["tools"] = json!([{
+                "name": "read",
+                "description": "read",
+                "input_schema": {"type": "object"}
+            }]);
+            request["tool_choice"] = json!({"type": "auto"});
+            let response = capture_tcp_response(|stream| {
+                handle_codex_messages_with_catalog(
+                    stream,
+                    &request,
+                    false,
+                    InferenceSecrets::for_test("access", "account"),
+                    &transport,
+                    &catalog,
+                    |_, _| panic!("successful request must not reject auth"),
+                )
+            });
+            if index == 0 {
+                models_server.take().unwrap().join().unwrap();
+            }
+            upstream.join().unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+            let upstream_body: Value =
+                serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+            assert_eq!(
+                upstream_body["model"],
+                alias.trim_start_matches("claude-csswitch-codex-")
+            );
+            assert_eq!(upstream_body["reasoning"]["effort"], effort);
+            assert_eq!(upstream_body["reasoning"].get("summary").is_some(), summary);
+            assert_eq!(upstream_body["parallel_tool_calls"], parallel);
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_named_tool_choice_posts_exact_function_and_unknown_name_posts_nothing() {
+        let mut request = codex_request(false);
+        request["tools"] = json!([{
+            "name": "read",
+            "description": "read",
+            "input_schema": {"type": "object"}
+        }]);
+        request["tool_choice"] = json!({"type": "tool", "name": "read"});
+        let (transport, posts, requests, upstream) =
+            mock_codex_transport(http_sse_response(&complete_codex_sse()));
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_secrets(
+                stream,
+                &request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &transport,
+                |_, _| panic!("successful request must not reject auth"),
+            )
+        });
+        upstream.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 200 OK"));
+        assert_eq!(posts.load(Ordering::SeqCst), 1);
+        let upstream_body: Value =
+            serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+        assert_eq!(
+            upstream_body["tool_choice"],
+            json!({"type": "function", "name": "read"})
+        );
+
+        request["tool_choice"] = json!({"type": "tool", "name": "missing"});
+        let unreachable = CodexTransport::for_test("http://127.0.0.1:1/responses".into()).unwrap();
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_secrets(
+                stream,
+                &request,
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &unreachable,
+                |_, _| panic!("invalid request must not reject auth"),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response).contains("forced tool is not declared"));
+    }
+
+    #[test]
+    fn codex_raw_or_unknown_account_model_is_rejected_before_inference_post() {
+        let (catalog, models_server, root) = mock_codex_model_catalog(&["gpt-known"]);
+        let transport = CodexTransport::for_test("http://127.0.0.1:1/responses".into()).unwrap();
+        let response = capture_tcp_response(|stream| {
+            handle_codex_messages_with_catalog(
+                stream,
+                &codex_request(false),
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &transport,
+                &catalog,
+                |_, _| panic!("unknown model must not reject auth"),
+            )
+        });
+        models_server.join().unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
+        assert!(String::from_utf8_lossy(&response)
+            .contains("model is not available for this Codex account"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_models_response_exposes_science_aliases_and_cache_diagnostics() {
+        let (catalog, models_server, root) = mock_codex_model_catalog(&["gpt-alpha", "gpt-beta"]);
+        let snapshot = catalog
+            .list(&InferenceSecrets::for_test("access", "account"))
+            .unwrap();
+        models_server.join().unwrap();
+        let response = capture_tcp_response(|stream| {
+            write_codex_models_response(stream, &snapshot);
+        });
+        let head = String::from_utf8_lossy(
+            &response[..response
+                .windows(4)
+                .position(|part| part == b"\r\n\r\n")
+                .unwrap()],
+        );
+        assert!(head.contains("x-csswitch-model-source: live"));
+        assert!(head.contains("x-csswitch-model-age-seconds: 0"));
+        let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
+        assert_eq!(body["data"].as_array().unwrap().len(), 2);
+        assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-alpha");
+        assert_eq!(body["data"][0]["display_name"], "Codex / gpt-alpha");
+        assert_eq!(body["diagnostics"]["source"], "live");
+        assert_eq!(body["diagnostics"]["stale"], false);
+        assert!(!serde_json::to_string(&body)
+            .unwrap()
+            .contains("\"id\":\"gpt-alpha\""));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_inference_401_and_403_invalidate_catalog_without_repost() {
+        for (status, reason, expected_refreshes) in
+            [(401, "Unauthorized", 1), (403, "Forbidden", 0)]
+        {
+            let (catalog, models_server, root) = mock_codex_model_catalog(&["gpt-known"]);
+            let (transport, posts, requests, upstream) = mock_codex_transport(
+                format!(
+                    "HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+                )
+                .into_bytes(),
+            );
+            let secrets = InferenceSecrets::for_test("access", "account");
+            let auth_epoch = secrets.auth_epoch().to_string();
+            let auth_generation = secrets.auth_generation();
+            let account_hash = secrets.account_hash().to_string();
+            let refreshes = Arc::new(AtomicUsize::new(0));
+            let refreshes_for_handler = Arc::clone(&refreshes);
+            let mut request = codex_request(false);
+            request["model"] = json!("claude-csswitch-codex-gpt-known");
+            let response = capture_tcp_response(|stream| {
+                handle_codex_messages_with_catalog(
+                    stream,
+                    &request,
+                    false,
+                    secrets,
+                    &transport,
+                    &catalog,
+                    |rejected_status, _| {
+                        catalog.invalidate_identity(&auth_epoch, auth_generation, &account_hash);
+                        if rejected_status == 401 {
+                            refreshes_for_handler.fetch_add(1, Ordering::SeqCst);
+                        }
+                    },
+                )
+            });
+            models_server.join().unwrap();
+            upstream.join().unwrap();
+            assert!(response.starts_with(format!("HTTP/1.1 {status}").as_bytes()));
+            assert_eq!(posts.load(Ordering::SeqCst), 1);
+            assert_eq!(refreshes.load(Ordering::SeqCst), expected_refreshes);
+            let upstream_body: Value =
+                serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+            assert_eq!(upstream_body["model"], "gpt-known");
+            assert!(!root.join("codex-models-cache.v2.json").exists());
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn codex_401_refreshes_only_for_next_request_and_never_reposts() {
+        let response =
+            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec();
+        let (transport, count, _requests, upstream) = mock_codex_transport(response);
+        let refreshes = Arc::new(AtomicUsize::new(0));
+        let refreshes_for_handler = Arc::clone(&refreshes);
+        let downstream = capture_tcp_response(|stream| {
+            handle_codex_messages_with_secrets(
+                stream,
+                &codex_request(false),
+                false,
+                InferenceSecrets::for_test("access", "account"),
+                &transport,
+                |status, _| {
+                    assert_eq!(status, 401);
+                    refreshes_for_handler.fetch_add(1, Ordering::SeqCst);
+                },
+            )
+        });
+        upstream.join().unwrap();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(refreshes.load(Ordering::SeqCst), 1);
+        assert!(downstream.starts_with(b"HTTP/1.1 401 Unauthorized"));
+    }
+
+    #[test]
+    fn codex_429_empty_200_and_interrupted_sse_do_not_retry() {
+        let cases = [
+            (
+                b"HTTP/1.1 429 Too Many Requests\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_vec(),
+                false,
+                "HTTP/1.1 429",
+            ),
+            (http_sse_response(b""), false, "HTTP/1.1 502"),
+            (
+                http_sse_response(
+                    b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"m\",\"delta\":\"partial\"}\n\n",
+                ),
+                true,
+                "event: error",
+            ),
+        ];
+        for (response, is_stream, expected) in cases {
+            let (transport, count, _requests, upstream) = mock_codex_transport(response);
+            let refreshes = Arc::new(AtomicUsize::new(0));
+            let refreshes_for_handler = Arc::clone(&refreshes);
+            let downstream = capture_tcp_response(|stream| {
+                handle_codex_messages_with_secrets(
+                    stream,
+                    &codex_request(is_stream),
+                    is_stream,
+                    InferenceSecrets::for_test("access", "account"),
+                    &transport,
+                    |_, _| {
+                        refreshes_for_handler.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            });
+            upstream.join().unwrap();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert_eq!(refreshes.load(Ordering::SeqCst), 0);
+            let text = String::from_utf8_lossy(&downstream);
+            assert!(text.contains(expected));
+            if is_stream {
+                assert_eq!(text.matches("event: error").count(), 1);
+            }
+        }
+    }
+
+    struct OneReadThenPanic {
+        bytes: Option<Vec<u8>>,
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl Read for OneReadThenPanic {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let read_number = self.reads.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(
+                read_number, 0,
+                "downstream cancellation must stop upstream reads"
+            );
+            let bytes = self.bytes.take().unwrap();
+            buffer[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
+        }
+    }
+
+    #[test]
+    fn codex_downstream_cancellation_stops_before_another_upstream_read() {
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let upstream = OneReadThenPanic {
+            bytes: Some(
+                b"data: {\"type\":\"response.created\",\"response\":{\"id\":\"r\"}}\n\n".to_vec(),
+            ),
+            reads: Arc::clone(&reads),
+        };
+        let result = pump_codex_stream(upstream, &mut reducer, |_| {
+            Err(Error::new(ErrorKind::BrokenPipe, "client closed"))
+        });
+        assert_eq!(result, Err(CodexPumpError::DownstreamWrite));
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn codex_terminal_event_stops_stream_and_nonstream_before_another_read() {
+        let mut bytes = complete_codex_sse();
+        bytes.extend_from_slice(b"data: [DONE]\n\n");
+
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut stream_reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let stream_reads = Arc::new(AtomicUsize::new(0));
+        let stream_result = pump_codex_stream(
+            OneReadThenPanic {
+                bytes: Some(bytes.clone()),
+                reads: Arc::clone(&stream_reads),
+            },
+            &mut stream_reducer,
+            |_| Ok(()),
+        );
+        assert_eq!(stream_result, Ok(()));
+        assert_eq!(stream_reads.load(Ordering::SeqCst), 1);
+
+        let mut nonstream_reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        let nonstream_reads = Arc::new(AtomicUsize::new(0));
+        let result = Arc::new(Mutex::new(None));
+        let result_for_handler = Arc::clone(&result);
+        let _ = capture_tcp_response(|downstream| {
+            *result_for_handler.lock().unwrap() = Some(collect_codex_nonstream(
+                OneReadThenPanic {
+                    bytes: Some(bytes),
+                    reads: Arc::clone(&nonstream_reads),
+                },
+                downstream,
+                &mut nonstream_reducer,
+            ));
+        });
+        assert_eq!(*result.lock().unwrap(), Some(Ok(())));
+        assert_eq!(nonstream_reads.load(Ordering::SeqCst), 1);
+    }
+
+    struct MustNotRead;
+
+    impl Read for MustNotRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> std::io::Result<usize> {
+            panic!("closed nonstream downstream must cancel before upstream read")
+        }
+    }
+
+    #[test]
+    fn codex_nonstream_closed_downstream_cancels_before_upstream_read() {
+        let listener = bind_loopback();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address).unwrap();
+        let (downstream, _) = listener.accept().unwrap();
+        drop(client);
+        thread::sleep(Duration::from_millis(10));
+
+        let signer = ThinkingSigner::new(&[9_u8; 32]).unwrap();
+        let epoch = "ab".repeat(16);
+        let mut reducer = ResponsesReducer::new("gpt", &epoch, "cdcd", &signer);
+        assert_eq!(
+            collect_codex_nonstream(MustNotRead, &downstream, &mut reducer),
+            Err(CodexNonstreamError::DownstreamClosed)
+        );
+    }
+
+    #[test]
+    fn codex_disconnect_cancels_stalled_upstream_for_stream_and_nonstream() {
+        for is_stream in [false, true] {
+            let upstream_listener = bind_loopback();
+            let upstream_address = upstream_listener.local_addr().unwrap();
+            let upstream_requests = Arc::new(AtomicUsize::new(0));
+            let upstream_requests_for_server = Arc::clone(&upstream_requests);
+            let (upstream_ready_tx, upstream_ready_rx) = std::sync::mpsc::channel();
+            let (release_upstream_tx, release_upstream_rx) = std::sync::mpsc::channel();
+            let upstream = thread::spawn(move || {
+                let (mut stream, _) = upstream_listener.accept().unwrap();
+                read_mock_http_request(&mut stream);
+                upstream_requests_for_server.fetch_add(1, Ordering::SeqCst);
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 1048576\r\nconnection: close\r\n\r\n",
+                    )
+                    .unwrap();
+                stream.flush().unwrap();
+                upstream_ready_tx.send(()).unwrap();
+                let _ = release_upstream_rx.recv_timeout(Duration::from_secs(2));
+            });
+            let transport =
+                CodexTransport::for_test(format!("http://{upstream_address}/responses")).unwrap();
+
+            let downstream_listener = bind_loopback();
+            let downstream_address = downstream_listener.local_addr().unwrap();
+            let downstream_client = TcpStream::connect(downstream_address).unwrap();
+            let (mut downstream, _) = downstream_listener.accept().unwrap();
+            let (handler_done_tx, handler_done_rx) = std::sync::mpsc::channel();
+            let handler = thread::spawn(move || {
+                handle_codex_messages_with_secrets(
+                    &mut downstream,
+                    &codex_request(is_stream),
+                    is_stream,
+                    InferenceSecrets::for_test("access", "account"),
+                    &transport,
+                    |_, _| panic!("cancelled request must not reject auth"),
+                );
+                handler_done_tx.send(()).unwrap();
+            });
+
+            upstream_ready_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap();
+            drop(downstream_client);
+            handler_done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("downstream disconnect must cancel a stalled upstream read");
+            assert_eq!(upstream_requests.load(Ordering::SeqCst), 1);
+
+            release_upstream_tx.send(()).unwrap();
+            handler.join().unwrap();
+            upstream.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn codex_auth_errors_distinguish_login_from_transient_refresh_failure() {
+        let missing = map_codex_auth_error(OAuthFlowError {
+            code: OAuthErrorCode::NotAuthenticated,
+            retryable: false,
+            message: "missing",
+        });
+        assert_eq!(missing.status, 401);
+        assert_eq!(missing.error_type, "authentication_error");
+
+        let network = map_codex_auth_error(OAuthFlowError {
+            code: OAuthErrorCode::OAuthNetwork,
+            retryable: true,
+            message: "network",
+        });
+        assert_eq!(network.status, 503);
+        assert_eq!(network.error_type, "api_error");
+        assert_ne!(network.message, "Codex login is required");
+    }
+
+    #[test]
+    fn codex_request_body_limit_returns_413_before_reading_body() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "content-length".to_string(),
+            (MAX_REQUEST_BYTES + 1).to_string(),
+        );
+        let head = RequestHead {
+            method: "POST".into(),
+            target: "/v1/messages".into(),
+            headers,
+        };
+        let cfg = GatewayConfig {
+            provider: "codex".into(),
+            port: 0,
+            auth_secret: None,
+            api_key: None,
+            upstream_url: DEFAULT_CODEX_UPSTREAM_URL.into(),
+            models_url: None,
+            forced_model: None,
+            relay_thinking: None,
+            shim_mode: "off".into(),
+            codex_state_root: None,
+            codex_contract: None,
+            launch_id: "test".into(),
+            skill_data_dir: None,
+            skill_bridge_dir: None,
+            skill_bridge_token: None,
+            science_host_context: None,
+        };
+        let response = capture_tcp_response(|stream| {
+            handle_post(
+                stream,
+                &cfg,
+                "/v1/messages",
+                &head,
+                None,
+                &RelayModelCache::default(),
+                CodexComponents::default(),
+            )
+        });
+        assert!(response.starts_with(b"HTTP/1.1 413 Payload Too Large"));
     }
 
     #[cfg(unix)]

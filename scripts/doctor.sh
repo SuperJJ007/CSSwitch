@@ -5,7 +5,8 @@
 #   - 端口命中真实实例保留端口 8765 直接失败（铁律）。
 # 覆盖变量（便于测试与自定义）：
 #   CSSWITCH_PROVIDER (生效 template_id，如 deepseek/qwen/glm/xiaomi/…)
-#   CSSWITCH_ADAPTER  (deepseek|qwen|relay)   CSSWITCH_KEY_PRESENT (0|1)
+#   CSSWITCH_ADAPTER  (deepseek|qwen|relay|codex)   CSSWITCH_KEY_PRESENT (0|1)
+#   CSSWITCH_AUTH_MODE (api_key|keychain_oauth|none)
 #   CSSWITCH_PROXY_PORT  CSSWITCH_SANDBOX_PORT  CSSWITCH_CONFIG (config.json 路径)
 #   CSSWITCH_GATEWAY_BIN  SCIENCE_BIN
 #   CSSWITCH_DOCTOR_CHECK_REAL_HOME=1  显式 opt-in 后才检查 $HOME/.claude-science 是否存在
@@ -13,6 +14,7 @@ set -u
 
 PROVIDER="${CSSWITCH_PROVIDER:-}"
 ADAPTER="${CSSWITCH_ADAPTER:-}"
+AUTH_MODE="${CSSWITCH_AUTH_MODE:-api_key}"
 KEY_PRESENT="${CSSWITCH_KEY_PRESENT:-0}"
 PROXY_PORT="${CSSWITCH_PROXY_PORT:-18991}"
 SANDBOX_PORT="${CSSWITCH_SANDBOX_PORT:-8990}"
@@ -37,10 +39,14 @@ echo "[Science 二进制]"
 if [ -x "$SCIENCE_BIN" ]; then pass "找到 $SCIENCE_BIN"; else warn "未找到 Science 二进制（一键越登录需要）：$SCIENCE_BIN"; fi
 
 echo "[生效配置]"
-# 多 profile：key 存 config.json（不再看 shell 环境变量）。app 传来 template_id + adapter +
-# key 有无（KEY_PRESENT）。任一模板都不该在这里「未知 provider」失败。
+# 多 profile：app 传来 template_id + adapter + 认证类型，以及 API-key profile 的 key 有无。
+# OAuth 凭据绝不进入 config.json 或脚本环境；脱敏状态由 app 另列在 [Codex 实验]。
 if [ -z "$PROVIDER" ]; then
   warn "当前没有「生效」配置（在面板点「设为当前」选一条）"
+elif [ "$AUTH_MODE" = "keychain_oauth" ]; then
+  pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· CSSwitch Keychain OAuth（脱敏状态见 [Codex 实验]）"
+elif [ "$AUTH_MODE" = "none" ]; then
+  pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· 无需凭据"
 elif [ "$KEY_PRESENT" = "1" ]; then
   pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· key 已配置在 config.json（值不显示）"
 else

@@ -8,6 +8,17 @@ pub(crate) const POLL_INTERVAL_MS: u64 = 100;
 pub(crate) const LOCAL_HEALTH_TIMEOUT_MS: u64 = 400;
 pub(crate) const SCRATCH_READY_BUDGET_MS: u64 = 4_000;
 pub(crate) const UPSTREAM_PROBE_TIMEOUT_MS: u64 = 20_000;
+const CODEX_AUTH_MUTATION_LOCK_BUDGET_MS: u64 = 5_000;
+const CODEX_AUTH_REFRESH_REQUEST_BUDGET_MS: u64 = 30_000;
+const CODEX_MODELS_REQUEST_ATTEMPTS: u64 = 3;
+const CODEX_MODELS_REQUEST_BUDGET_MS: u64 = 30_000;
+const CODEX_MODELS_RETRY_BACKOFF_BUDGET_MS: u64 = 750;
+const CODEX_MODELS_LOCAL_MARGIN_MS: u64 = 5_000;
+pub(crate) const CODEX_MODELS_PROBE_TIMEOUT_MS: u64 = CODEX_AUTH_MUTATION_LOCK_BUDGET_MS
+    + CODEX_AUTH_REFRESH_REQUEST_BUDGET_MS
+    + CODEX_MODELS_REQUEST_ATTEMPTS * CODEX_MODELS_REQUEST_BUDGET_MS
+    + CODEX_MODELS_RETRY_BACKOFF_BUDGET_MS
+    + CODEX_MODELS_LOCAL_MARGIN_MS;
 pub(crate) const PROXY_REUSE_HEALTH_TIMEOUT_MS: u64 = 500;
 pub(crate) const PROXY_HEALTH_BUDGET_MS: u64 = 4_000;
 pub(crate) const SANDBOX_HEALTH_BUDGET_MS: u64 = 8_000;
@@ -148,7 +159,12 @@ fn stage_delta_ms(previous_elapsed_ms: u128, elapsed_ms: u128) -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_detail, stage_delta_ms};
+    use super::{
+        sanitize_detail, stage_delta_ms, CODEX_AUTH_MUTATION_LOCK_BUDGET_MS,
+        CODEX_AUTH_REFRESH_REQUEST_BUDGET_MS, CODEX_MODELS_LOCAL_MARGIN_MS,
+        CODEX_MODELS_PROBE_TIMEOUT_MS, CODEX_MODELS_REQUEST_ATTEMPTS,
+        CODEX_MODELS_REQUEST_BUDGET_MS, CODEX_MODELS_RETRY_BACKOFF_BUDGET_MS,
+    };
 
     #[test]
     fn sanitize_detail_keeps_log_one_line() {
@@ -159,5 +175,16 @@ mod tests {
     fn stage_delta_is_since_previous_stage() {
         assert_eq!(stage_delta_ms(10, 25), 15);
         assert_eq!(stage_delta_ms(25, 10), 0);
+    }
+
+    #[test]
+    fn codex_models_probe_budget_covers_refresh_catalog_retries_and_margin() {
+        let required = CODEX_AUTH_MUTATION_LOCK_BUDGET_MS
+            + CODEX_AUTH_REFRESH_REQUEST_BUDGET_MS
+            + CODEX_MODELS_REQUEST_ATTEMPTS * CODEX_MODELS_REQUEST_BUDGET_MS
+            + CODEX_MODELS_RETRY_BACKOFF_BUDGET_MS
+            + CODEX_MODELS_LOCAL_MARGIN_MS;
+        assert_eq!(CODEX_MODELS_PROBE_TIMEOUT_MS, required);
+        assert_eq!(CODEX_MODELS_PROBE_TIMEOUT_MS, 130_750);
     }
 }

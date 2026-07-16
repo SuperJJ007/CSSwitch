@@ -32,17 +32,26 @@ fn stage_gateway_sidecar() {
         gateway_dir.join("src").display()
     );
     println!("cargo:rerun-if-env-changed=CSSWITCH_SKIP_GATEWAY_STAGE");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_ACCEPTANCE_KEYCHAIN");
+    let acceptance_keychain = std::env::var_os("CARGO_FEATURE_ACCEPTANCE_KEYCHAIN").is_some();
     if std::env::var("CSSWITCH_SKIP_GATEWAY_STAGE").is_ok() {
+        if acceptance_keychain {
+            panic!("Acceptance Keychain build cannot skip Gateway staging");
+        }
         return;
     }
 
-    let status = Command::new(&cargo)
+    let mut command = Command::new(&cargo);
+    command
         .current_dir(&gateway_dir)
         .arg("build")
         .arg("--release")
         .arg("--target")
-        .arg(&target)
-        .status();
+        .arg(&target);
+    if acceptance_keychain {
+        command.arg("--features").arg("acceptance-keychain");
+    }
+    let status = command.status();
     if !matches!(status, Ok(s) if s.success()) {
         panic!("failed to build csswitch-gateway sidecar for target {target}");
     }

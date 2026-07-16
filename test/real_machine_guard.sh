@@ -11,8 +11,9 @@ TEST_ROOT="${CSSWITCH_REAL_TEST_ROOT:-${TMPDIR:-/tmp}/csswitch-real-machine-${UI
 TEST_HOME="$TEST_ROOT/home"
 STATE_DIR="$TEST_ROOT/state"
 BASELINE="$STATE_DIR/port-8765.pids"
-PROXY_PORT="${CSSWITCH_TEST_PROXY_PORT:-18991}"
-SANDBOX_PORT="${CSSWITCH_TEST_SANDBOX_PORT:-8990}"
+PORT_STATE="$STATE_DIR/runtime-ports.v1"
+PROXY_PORT="${CSSWITCH_TEST_PROXY_PORT:-}"
+SANDBOX_PORT="${CSSWITCH_TEST_SANDBOX_PORT:-}"
 SCIENCE_BIN="${SCIENCE_BIN:-/Applications/Claude Science.app/Contents/Resources/bin/claude-science}"
 
 die() { echo "FAIL: $*" >&2; exit 1; }
@@ -60,19 +61,86 @@ validate_ports() {
   case "$PROXY_PORT:$SANDBOX_PORT" in
     *[!0-9:]*|:*) die "测试端口必须是整数" ;;
   esac
+  [ "$PROXY_PORT" -ge 1 ] && [ "$PROXY_PORT" -le 65535 ] || die "代理端口超出 1..65535"
+  [ "$SANDBOX_PORT" -ge 1 ] && [ "$SANDBOX_PORT" -le 65535 ] || die "沙箱端口超出 1..65535"
   [ "$PROXY_PORT" -ne 8765 ] || die "代理端口命中真实实例保留端口 8765"
   [ "$SANDBOX_PORT" -ne 8765 ] || die "沙箱端口命中真实实例保留端口 8765"
+  [ "$PROXY_PORT" -ne 1455 ] && [ "$PROXY_PORT" -ne 1457 ] || die "代理端口不得占用 Codex OAuth callback 1455 / 1457"
+  [ "$SANDBOX_PORT" -ne 1455 ] && [ "$SANDBOX_PORT" -ne 1457 ] || die "沙箱端口不得占用 Codex OAuth callback 1455 / 1457"
   [ "$PROXY_PORT" -ne "$SANDBOX_PORT" ] || die "代理端口与沙箱端口不能相同"
 }
 
+pick_dynamic_port() {
+  command -v python3 >/dev/null 2>&1 || die "动态端口分配需要 python3（仅测试护栏使用）"
+  python3 - <<'PY'
+import socket
+s = socket.socket()
+s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1])
+s.close()
+PY
+}
+
+load_stored_ports() {
+  [ ! -L "$PORT_STATE" ] || die "端口状态文件是符号链接，拒绝：$PORT_STATE"
+  [ -f "$PORT_STATE" ] || return 1
+  PROXY_PORT="$(awk -F= '$1 == "proxy" { print $2 }' "$PORT_STATE")"
+  SANDBOX_PORT="$(awk -F= '$1 == "sandbox" { print $2 }' "$PORT_STATE")"
+  validate_ports
+}
+
+resolve_ports() {
+  if [ -n "$PROXY_PORT" ] || [ -n "$SANDBOX_PORT" ]; then
+    [ -n "$PROXY_PORT" ] && [ -n "$SANDBOX_PORT" ] || die "必须同时设置两个测试端口"
+    validate_ports
+    return
+  fi
+  load_stored_ports || die "缺少动态端口状态；先运行 preflight"
+}
+
+persist_ports() {
+  {
+    echo "proxy=$PROXY_PORT"
+    echo "sandbox=$SANDBOX_PORT"
+  } | write_fresh "$PORT_STATE"
+  chmod 600 "$PORT_STATE"
+}
+
 listener_pids() {
-  lsof -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | sort -u || true
+  local lsof_bin output rc
+  lsof_bin="$(command -v lsof 2>/dev/null || true)"
+  [ -n "$lsof_bin" ] && [ -x "$lsof_bin" ] || \
+    die "端口安全检查需要可执行 lsof；无法观察 listener 时拒绝继续"
+  "$lsof_bin" -v >/dev/null 2>&1 || die "lsof 自检失败；无法观察 listener 时拒绝继续"
+  set +e
+  output="$("$lsof_bin" -nP -t -iTCP:"$1" -sTCP:LISTEN 2>/dev/null)"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) [ -n "$output" ] || die "lsof 报告成功但未返回 listener；拒绝不确定状态" ;;
+    1) [ -z "$output" ] || die "lsof 查询返回不一致结果；拒绝不确定状态" ;;
+    *) die "lsof 查询失败（rc=$rc）；无法观察 listener 时拒绝继续" ;;
+  esac
+  [ -z "$output" ] || printf '%s\n' "$output" | sort -u
+}
+
+write_listener_snapshot() {
+  local port="$1" target="$2" observed
+  # Check the assignment itself before examining output.  Wrapping `$(...)`
+  # directly in `[` would hide a failed listener query behind `[`'s status.
+  observed="$(listener_pids "$port")" || \
+    die "无法可靠查询端口 $port 的 listener；拒绝继续"
+  if [ -n "$observed" ]; then
+    printf '%s\n' "$observed" | write_fresh "$target"
+  else
+    : | write_fresh "$target"
+  fi
 }
 
 assert_real_unchanged() {
   [ -f "$BASELINE" ] || die "缺少 8765 基线；先运行 preflight"
   local now="$STATE_DIR/port-8765.now"
-  listener_pids 8765 | write_fresh "$now" # 删任何预置软链后写全新文件，绝不经软链写真实文件
+  write_listener_snapshot 8765 "$now" # 删任何预置软链后写全新文件，绝不经软链写真实文件
   if ! cmp -s "$BASELINE" "$now"; then
     echo "基线 PID: $(tr '\n' ' ' <"$BASELINE")" >&2
     echo "当前 PID: $(tr '\n' ' ' <"$now")" >&2
@@ -82,30 +150,54 @@ assert_real_unchanged() {
 }
 
 assert_port_free() {
-  local p="$1"
-  [ -z "$(listener_pids "$p")" ] || die "测试端口 $p 已被占用"
+  local p="$1" pids
+  pids="$(listener_pids "$p")" || \
+    die "无法可靠查询端口 $p 的 listener；拒绝继续"
+  [ -z "$pids" ] || die "测试端口 $p 已被占用"
 }
 
 preflight() {
-  validate_ports
-  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" # mkdir/chmod 前：拒绝预置软链
+  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$PORT_STATE" # mkdir/chmod 前：拒绝预置软链
   umask 077
   mkdir -p "$TEST_HOME" "$STATE_DIR"
   chmod 700 "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR"
   assert_isolated_from_real_home "$TEST_HOME" # mkdir 后：解析父链，确认不在真实 HOME 内
-  listener_pids 8765 | write_fresh "$BASELINE" # 同理：删软链后写全新基线文件
+  if [ -z "$PROXY_PORT" ] && [ -z "$SANDBOX_PORT" ]; then
+    if ! load_stored_ports; then
+      PROXY_PORT="$(pick_dynamic_port)"
+      while [ "$PROXY_PORT" = "8765" ] || [ "$PROXY_PORT" = "1455" ] || [ "$PROXY_PORT" = "1457" ]; do
+        PROXY_PORT="$(pick_dynamic_port)"
+      done
+      SANDBOX_PORT="$(pick_dynamic_port)"
+      while [ "$SANDBOX_PORT" = "$PROXY_PORT" ] || [ "$SANDBOX_PORT" = "8765" ] || [ "$SANDBOX_PORT" = "1455" ] || [ "$SANDBOX_PORT" = "1457" ]; do
+        SANDBOX_PORT="$(pick_dynamic_port)"
+      done
+    fi
+  fi
+  resolve_ports
+  persist_ports
+  write_listener_snapshot 8765 "$BASELINE" # 同理：删软链后写全新基线文件
   assert_port_free "$PROXY_PORT"
   assert_port_free "$SANDBOX_PORT"
+  local callback_1455 callback_1457
+  callback_1455="$(listener_pids 1455)" || \
+    die "无法可靠查询端口 1455 的 listener；拒绝继续"
+  callback_1457="$(listener_pids 1457)" || \
+    die "无法可靠查询端口 1457 的 listener；拒绝继续"
+  if [ -n "$callback_1455" ] && [ -n "$callback_1457" ]; then
+    die "Codex OAuth callback 端口 1455 与 1457 均被占用；不停止未知 listener，请先自行确认"
+  fi
   [ -x "$SCIENCE_BIN" ] || die "未找到可执行 Science：$SCIENCE_BIN"
   [ -x "$PROJ/desktop/src-tauri/target/release/desktop" ] || \
     echo "WARN: release 测试二进制尚未构建"
   pass "测试 HOME 已隔离：$TEST_HOME"
   pass "测试端口空闲：$PROXY_PORT / $SANDBOX_PORT"
+  pass "Codex OAuth callback 1455 / 1457 至少一个空闲（固定上游兼容端口，不动态改写）"
   assert_real_unchanged
 }
 
 prepare_legacy() {
-  validate_ports
+  resolve_ports
   [ -f "$BASELINE" ] || die "先运行 preflight"
   [ -n "${DEEPSEEK_API_KEY:-}" ] || die "DEEPSEEK_API_KEY 未设置"
   [ -n "${DASHSCOPE_API_KEY:-}" ] || die "DASHSCOPE_API_KEY 未设置"
@@ -131,10 +223,37 @@ prepare_legacy() {
   pass "已在独立测试 HOME 写入 v1 迁移样本（key 未回显）"
 }
 
+prepare_codex() {
+  resolve_ports
+  [ -f "$BASELINE" ] || die "先运行 preflight"
+  command -v jq >/dev/null 2>&1 || die "prepare-codex 需要 jq"
+  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$TEST_HOME/.csswitch"
+  assert_isolated_from_real_home "$TEST_HOME"
+  local cfg_dir="$TEST_HOME/.csswitch"
+  local cfg="$cfg_dir/config.json"
+  [ ! -e "$cfg" ] && [ ! -L "$cfg" ] || die "隔离 config 已存在；为避免覆盖验收状态，请使用新的 CSSWITCH_REAL_TEST_ROOT"
+  umask 077
+  mkdir -p "$cfg_dir"
+  chmod 700 "$cfg_dir"
+  jq -n \
+    --argjson proxy_port "$PROXY_PORT" \
+    --argjson sandbox_port "$SANDBOX_PORT" \
+    '{schema_version:3,profiles:[],active_id:"",proxy_port:$proxy_port,sandbox_port:$sandbox_port,reuse_system_ssh:false,experimental_codex_enabled:false,secret:"",mode:"proxy",pending_notice:null}' \
+    | write_fresh "$cfg"
+  chmod 600 "$cfg"
+  pass "已写入隔离 v3 空配置：动态端口、Codex 实验默认关闭、无 profile / token / Keychain 内容"
+}
+
 assert_running() {
+  resolve_ports
   assert_real_unchanged
-  [ -n "$(listener_pids "$PROXY_PORT")" ] || die "代理端口 $PROXY_PORT 未监听"
-  [ -n "$(listener_pids "$SANDBOX_PORT")" ] || die "沙箱端口 $SANDBOX_PORT 未监听"
+  local proxy_pids sandbox_pids
+  proxy_pids="$(listener_pids "$PROXY_PORT")" || \
+    die "无法可靠查询端口 $PROXY_PORT 的 listener；拒绝继续"
+  sandbox_pids="$(listener_pids "$SANDBOX_PORT")" || \
+    die "无法可靠查询端口 $SANDBOX_PORT 的 listener；拒绝继续"
+  [ -n "$proxy_pids" ] || die "代理端口 $PROXY_PORT 未监听"
+  [ -n "$sandbox_pids" ] || die "沙箱端口 $SANDBOX_PORT 未监听"
   local sbx_home="$TEST_HOME/.csswitch/sandbox/home"
   local data_dir="$sbx_home/.claude-science"
   local out
@@ -147,6 +266,7 @@ assert_running() {
 }
 
 assert_stopped() {
+  resolve_ports
   assert_real_unchanged
   assert_port_free "$PROXY_PORT"
   assert_port_free "$SANDBOX_PORT"
@@ -154,6 +274,7 @@ assert_stopped() {
 }
 
 show_env() {
+  resolve_ports
   cat <<EOF
 CSSWITCH_REAL_TEST_ROOT=$TEST_ROOT
 HOME=$TEST_HOME
@@ -166,12 +287,13 @@ EOF
 case "${1:-}" in
   preflight) preflight ;;
   prepare-legacy) prepare_legacy ;;
+  prepare-codex) prepare_codex ;;
   guard) assert_real_unchanged ;;
   assert-running) assert_running ;;
   assert-stopped) assert_stopped ;;
   env) show_env ;;
   *)
-    echo "usage: $0 {preflight|prepare-legacy|guard|assert-running|assert-stopped|env}" >&2
+    echo "usage: $0 {preflight|prepare-legacy|prepare-codex|guard|assert-running|assert-stopped|env}" >&2
     exit 2
     ;;
 esac

@@ -3,8 +3,7 @@ use serde_json::{json, Value};
 use crate::runtime::operation::{OperationKind, OperationStage, OperationTrace};
 use crate::runtime::profile::{nonactive_probe_verdict, probe_kind_for, ConnectionEdit};
 use crate::runtime::provider::{
-    assert_format_supported, is_native_adapter, proxy_args_for,
-    reject_openai_custom_anthropic_base, relay_missing_model, should_scratch_candidate,
+    assert_format_supported, is_native_adapter, proxy_args_for, reject_openai_custom_anthropic_base,
 };
 use crate::runtime::proxy_lifecycle::start_proxy_for;
 use crate::runtime::transaction::{
@@ -17,7 +16,8 @@ pub(crate) fn scratch_validate_candidate(
     app: &tauri::AppHandle,
     candidate: &config::Profile,
 ) -> Result<bool, String> {
-    let launch = proxy_args_for(candidate);
+    let launch = proxy_args_for(candidate)?;
+    let scratch_plan = launch.scratch();
     let trace = OperationTrace::start(
         OperationKind::ValidateConnection,
         format!(
@@ -25,22 +25,23 @@ pub(crate) fn scratch_validate_candidate(
             candidate.id, candidate.template_id, launch.adapter
         ),
     );
-    if !should_scratch_candidate(&launch.adapter, &launch.key, &launch.base_url) {
+    if !scratch_plan.should_probe() {
         trace.finish("skipped reason=missing_key_or_base");
         return Ok(false);
     }
-    let backend = scratch::backend_for_app(app, &launch.adapter)?;
+    let (key_env, key) = scratch_plan.credential_parts();
+    let backend = scratch::backend_for_app(app, &scratch_plan.provider)?;
     let res = scratch::scratch_probe(
         &backend,
         &scratch::ScratchTarget {
-            provider: &launch.adapter,
-            key_env: launch.key_env,
-            base_url: &launch.base_url,
-            key: &launch.key,
-            model: Some(&launch.model),
-            relay_thinking: launch.thinking_policy,
+            provider: &scratch_plan.provider,
+            key_env,
+            base_url: &scratch_plan.endpoint,
+            key,
+            model: Some(&scratch_plan.model),
+            relay_thinking: &scratch_plan.thinking_policy,
         },
-        probe_kind_for(&launch.adapter, &launch.model),
+        probe_kind_for(&scratch_plan.provider, &scratch_plan.model),
         Some(&trace),
     );
     let outcome = scratch::classify(res.status);
@@ -65,6 +66,7 @@ pub(crate) fn set_active_profile_txn(
         .profile_by_id(id)
         .cloned()
         .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    config::require_template_enabled(&cfg, &candidate.template_id)?;
     if let Some(edit) = conn_edit {
         edit.apply(&mut candidate);
     }
@@ -75,16 +77,24 @@ pub(crate) fn set_active_profile_txn(
         ("未切换", "当前配置不变")
     };
     assert_format_supported(&candidate)?;
-    let launch = proxy_args_for(&candidate);
-    reject_openai_custom_anthropic_base(&launch.adapter, &candidate.base_url)?;
-    if launch.key.is_empty() {
-        return Err(format!("「{}」还没填 API key，请先填写。", candidate.name));
+    let launch = proxy_args_for(&candidate)?;
+    let formal_plan = launch.formal();
+    reject_openai_custom_anthropic_base(&formal_plan.adapter, &candidate.base_url)?;
+    if !formal_plan.credential_configured() {
+        return Err(format!(
+            "「{}」还没配置凭据，请先填写或登录。",
+            candidate.name
+        ));
     }
-    let native = is_native_adapter(&launch.adapter);
-    if !native && launch.base_url.is_empty() {
+    let native = is_native_adapter(&formal_plan.adapter);
+    if formal_plan.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired
+        && formal_plan.endpoint.is_empty()
+    {
         return Err("该配置需要填 base_url（http:// 或 https:// 开头）。".into());
     }
-    if relay_missing_model(&launch.adapter, &candidate.model) {
+    if formal_plan.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+        && formal_plan.model.trim().is_empty()
+    {
         return Err(
             "该配置需要选择或填写一个模型（中转/自定义端点必填），请在连接编辑里补上。".into(),
         );
@@ -99,7 +109,7 @@ pub(crate) fn set_active_profile_txn(
         },
         format!(
             "profile_id={} template_id={} adapter={} skip_verify={}",
-            candidate.id, candidate.template_id, launch.adapter, skip_verify
+            candidate.id, candidate.template_id, formal_plan.adapter, skip_verify
         ),
     );
 
@@ -107,18 +117,20 @@ pub(crate) fn set_active_profile_txn(
         trace.stage(OperationStage::ScratchUpstreamProbe, "skipped_by_user");
         true
     } else {
-        let backend = scratch::backend_for_app(app, &launch.adapter)?;
+        let scratch_plan = launch.scratch();
+        let (key_env, key) = scratch_plan.credential_parts();
+        let backend = scratch::backend_for_app(app, &scratch_plan.provider)?;
         let res = scratch::scratch_probe(
             &backend,
             &scratch::ScratchTarget {
-                provider: &launch.adapter,
-                key_env: launch.key_env,
-                base_url: &launch.base_url,
-                key: &launch.key,
-                model: Some(&launch.model),
-                relay_thinking: launch.thinking_policy,
+                provider: &scratch_plan.provider,
+                key_env,
+                base_url: &scratch_plan.endpoint,
+                key,
+                model: Some(&scratch_plan.model),
+                relay_thinking: &scratch_plan.thinking_policy,
             },
-            probe_kind_for(&launch.adapter, &launch.model),
+            probe_kind_for(&scratch_plan.provider, &scratch_plan.model),
             Some(&trace),
         );
         let outcome = scratch::classify(res.status);

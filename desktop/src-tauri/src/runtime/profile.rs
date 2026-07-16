@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::json;
 
 use crate::runtime::provider::{
-    adapter_for_profile, assert_format_supported, is_native_adapter, is_openai_adapter,
-    reject_openai_custom_anthropic_base, relay_missing_model,
+    assert_format_supported, is_native_adapter, reject_openai_custom_anthropic_base,
+    resolve_launch_plan, resolve_template_plan, PublicPlanView,
 };
 use crate::{config, scratch, templates};
 
@@ -23,68 +23,51 @@ pub(crate) fn is_main_list_model(id: &str) -> bool {
     false
 }
 
-fn build_capabilities(
-    adapter: &str,
-    api_format: &str,
-    model_required: bool,
-    thinking_policy: &str,
-) -> serde_json::Value {
-    let model_discovery = if is_native_adapter(adapter) {
-        "builtin_static"
-    } else if is_openai_adapter(adapter) || matches!(api_format, "openai_chat" | "openai_responses")
-    {
-        "openai_models_or_manual"
-    } else {
-        "anthropic_models_or_manual"
+fn build_capabilities(view: PublicPlanView) -> serde_json::Value {
+    let tools_hint = match view.transport {
+        crate::provider_contracts::Transport::OpenaiChat
+        | crate::provider_contracts::Transport::OpenaiResponses
+        | crate::provider_contracts::Transport::CodexResponsesSse => "translated",
+        crate::provider_contracts::Transport::AnthropicMessages
+            if is_native_adapter(&view.adapter) =>
+        {
+            "native"
+        }
+        crate::provider_contracts::Transport::AnthropicMessages => "passthrough",
     };
-    let tools_hint = match api_format {
-        "openai_chat" | "openai_responses" => "translated",
-        "anthropic" if is_native_adapter(adapter) => "native",
-        "anthropic" => "passthrough",
-        _ => "unknown",
-    };
+    let model_discovery =
+        serde_json::to_value(view.model_discovery).unwrap_or_else(|_| json!("unknown"));
+    let public_plan = serde_json::to_value(&view).unwrap_or_else(|_| json!({"status": "error"}));
     json!({
-        "base_url_required": !is_native_adapter(adapter),
-        "model_required": model_required,
+        "auth_mode": view.auth_mode,
+        "credential_source": view.credential_source,
+        "base_url_required": view.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired,
+        "model_required": view.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed,
         "model_discovery": model_discovery,
-        "supports_thinking_policy": !thinking_policy.is_empty(),
-        "thinking_policy": thinking_policy,
+        "supports_thinking_policy": !view.thinking_policy.is_empty(),
+        "thinking_policy": view.thinking_policy,
         "supports_tools_hint": tools_hint,
+        "provider_plan": public_plan,
     })
 }
 
 pub(crate) fn template_capabilities(t: &templates::Template) -> serde_json::Value {
-    build_capabilities(
-        t.adapter,
-        t.api_format,
-        t.requires_model_override,
-        t.thinking_policy,
-    )
+    match resolve_template_plan(t.id, t.api_format) {
+        Ok(plan) => build_capabilities(plan.public()),
+        Err(error) => json!({"status": "error", "error": error}),
+    }
 }
 
 pub(crate) fn profile_capabilities(p: &config::Profile) -> serde_json::Value {
-    match templates::by_id(&p.template_id) {
-        Some(t) => {
-            let api_format = if p.api_format.trim().is_empty() {
-                t.api_format
-            } else {
-                &p.api_format
-            };
-            build_capabilities(
-                t.adapter,
-                api_format,
-                t.requires_model_override,
-                t.thinking_policy,
-            )
-        }
-        None => {
-            let api_format = if p.api_format.trim().is_empty() {
-                "anthropic"
-            } else {
-                &p.api_format
-            };
-            build_capabilities("relay", api_format, true, "")
-        }
+    let mut normalized = p.clone();
+    if normalized.api_format.trim().is_empty() {
+        normalized.api_format = templates::by_id(&normalized.template_id)
+            .map(|template| template.api_format.to_string())
+            .unwrap_or_else(|| "anthropic".to_string());
+    }
+    match resolve_launch_plan(&normalized) {
+        Ok(plan) => build_capabilities(plan.public()),
+        Err(error) => json!({"status": "error", "error": error}),
     }
 }
 
@@ -105,6 +88,8 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
                 "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
                 "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
                 "key": key_masked.clone(), "has_key": !p.api_key.is_empty(), "key_masked": key_masked,
+                "credential_source": p.credential_source, "model_policy": p.model_policy,
+                "has_credential": resolve_launch_plan(p).map(|plan| plan.public().credential_configured).unwrap_or(false),
                 "capabilities": profile_capabilities(p), "icon": p.icon, "icon_color": p.icon_color,
                 "website_url": p.website_url, "sort_index": p.sort_index, "notes": p.notes,
             })
@@ -112,21 +97,35 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
         .collect();
     Ok(json!({
         "schema_version": cfg.schema_version, "active_id": cfg.active_id, "profiles": profiles,
-        "templates": build_list_templates(), "proxy_port": cfg.proxy_port,
+        "templates": build_list_templates(cfg.experimental_codex_enabled), "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port, "reuse_system_ssh": cfg.reuse_system_ssh,
+        "experimental_codex_enabled": cfg.experimental_codex_enabled,
         "mode": cfg.mode, "pending_notice": notice,
     }))
 }
 
 /// 模板注册表交前端铺 UI（单一来源，前端不复制常量）。
-pub(crate) fn build_list_templates() -> Vec<serde_json::Value> {
+pub(crate) fn build_list_templates(experimental_codex_enabled: bool) -> Vec<serde_json::Value> {
     templates::all()
         .iter()
+        .filter(|template| template.id != "codex" || experimental_codex_enabled)
         .map(|t| {
+            let contract = crate::provider_contracts::contract_for(t.id, t.api_format).ok();
+            let adapter = contract
+                .as_ref()
+                .map(|contract| contract.adapter.clone())
+                .unwrap_or_else(|| "unsupported".to_string());
+            let requires_model_override = contract
+                .as_ref()
+                .map(|contract| {
+                    contract.default_model_policy
+                        == crate::provider_contracts::ModelPolicy::RequiredFixed
+                })
+                .unwrap_or(false);
             json!({
                 "id": t.id, "name": t.name, "category": t.category, "api_format": t.api_format,
-                "adapter": t.adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
-                "requires_model_override": t.requires_model_override,
+                "adapter": adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
+                "requires_model_override": requires_model_override,
                 "builtin_models": t.builtin_models, "icon": t.icon, "icon_color": t.icon_color,
                 "website_url": t.website_url, "capabilities": template_capabilities(t),
             })
@@ -142,12 +141,20 @@ pub(crate) fn create_profile_inner(
     base_url_override: Option<&str>,
     model: Option<&str>,
 ) -> Result<String, String> {
+    let cfg = config::load_from(dir).map_err(|error| error.to_string())?;
+    config::require_template_enabled(&cfg, template_id)?;
     let tpl = templates::by_id(template_id).ok_or_else(|| format!("未知模板：{template_id}"))?;
     let id = config::new_id();
     let base_url = base_url_override
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| tpl.base_url.to_string());
+    let contract = crate::provider_contracts::contract_for(template_id, tpl.api_format)?;
+    if contract.default_credential_source != crate::provider_contracts::CredentialSource::ApiKey
+        && key.is_some_and(|value| !value.is_empty())
+    {
+        return Err("OAuth profile 不能通过 API-key 创建入口写入 key".into());
+    }
     let p = config::Profile {
         id: id.clone(),
         name: name.to_string(),
@@ -155,8 +162,19 @@ pub(crate) fn create_profile_inner(
         category: tpl.category.to_string(),
         api_format: tpl.api_format.to_string(),
         base_url,
-        api_key: key.unwrap_or("").to_string(),
+        api_key: if contract.default_credential_source
+            == crate::provider_contracts::CredentialSource::ApiKey
+        {
+            key.unwrap_or("").to_string()
+        } else {
+            String::new()
+        },
         model: model.unwrap_or("").to_string(),
+        credential_source: contract.default_credential_source,
+        credential_ref: (contract.default_credential_source
+            == crate::provider_contracts::CredentialSource::KeychainOauth)
+            .then(|| "csswitch:codex:default".to_string()),
+        model_policy: contract.default_model_policy,
         website_url: Some(tpl.website_url.to_string()),
         icon: Some(tpl.icon.to_string()),
         icon_color: Some(tpl.icon_color.to_string()),
@@ -165,10 +183,16 @@ pub(crate) fn create_profile_inner(
         notes: None,
     };
     assert_format_supported(&p)?; // custom 选了不支持格式则拒
-    let adapter = adapter_for_profile(&p);
-    reject_openai_custom_anthropic_base(adapter, &p.base_url)?;
-    // 守卫（修 #9 P1-a）：relay/自定义端点必须带 model（force 前提）。
-    if relay_missing_model(adapter, &p.model) {
+    let resolved = resolve_launch_plan(&p)?;
+    reject_openai_custom_anthropic_base(&resolved.adapter, &p.base_url)?;
+    if resolved.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired
+        && p.base_url.trim().is_empty()
+    {
+        return Err("中转 / 自定义端点必须填写连接地址（base_url），未创建。".to_string());
+    }
+    if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+        && p.model.trim().is_empty()
+    {
         return Err("中转 / 自定义端点必须选择或填写一个模型，未创建。".to_string());
     }
     config::update(dir, |c| c.profiles.push(p)).map_err(|e| e.to_string())?;
@@ -230,21 +254,27 @@ pub(crate) fn update_profile_connection_inner(
     model: Option<&str>,
     key: Option<&str>,
 ) -> Result<(), String> {
-    if let Some(fmt) = api_format {
-        let probe = config::Profile {
-            api_format: fmt.to_string(),
-            ..Default::default()
-        };
-        assert_format_supported(&probe)?;
-    }
-    // 未命中 id → Err（不静默 Ok，修 MP-1 Minor [4]）。
-    if config::load_from(dir)
-        .map_err(|e| e.to_string())?
+    let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
+    let mut candidate = cfg
         .profile_by_id(id)
-        .is_none()
-    {
-        return Err(format!("找不到 profile：{id}"));
+        .cloned()
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    if let Some(u) = base_url {
+        candidate.base_url = u.to_string();
     }
+    if let Some(f) = api_format {
+        candidate.api_format = f.to_string();
+    }
+    if let Some(m) = model {
+        candidate.model = m.to_string();
+    }
+    if let Some(k) = key.filter(|value| !value.is_empty()) {
+        if candidate.credential_source != crate::provider_contracts::CredentialSource::ApiKey {
+            return Err("OAuth profile 不能通过 API-key 编辑入口写入 key".into());
+        }
+        candidate.api_key = k.to_string();
+    }
+    resolve_launch_plan(&candidate)?;
     config::write_rolling_backup(dir).ok(); // 覆盖前留底
     config::update(dir, |c| {
         if let Some(p) = c.profile_by_id_mut(id) {
@@ -494,6 +524,30 @@ mod tests {
     }
 
     #[test]
+    fn create_codex_profile_requires_explicit_experimental_flag() {
+        let d = tmpdir_profile();
+        let disabled = create_profile_inner(&d, "codex", "Codex", None, None, None).unwrap_err();
+        assert!(disabled.contains("实验功能"));
+        assert!(config::load_from(&d).unwrap().profiles.is_empty());
+
+        config::update(&d, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let id = create_profile_inner(&d, "codex", "Codex", None, None, None).unwrap();
+        let cfg = config::load_from(&d).unwrap();
+        let profile = cfg.profile_by_id(&id).unwrap();
+        assert_eq!(profile.api_format, "openai_responses");
+        assert_eq!(
+            profile.credential_source,
+            crate::provider_contracts::CredentialSource::KeychainOauth
+        );
+        assert_eq!(
+            profile.credential_ref.as_deref(),
+            Some("csswitch:codex:default")
+        );
+        assert!(profile.api_key.is_empty());
+        assert!(profile.model.is_empty());
+    }
+
+    #[test]
     fn create_relay_without_model_is_rejected() {
         // 修 #9 P1-a：后端命令层直接创建 relay/自定义端点空 model 也被拦（不变量不可绕过）。
         let d = tmpdir_profile();
@@ -596,7 +650,7 @@ mod tests {
         )
         .unwrap();
         let v = build_get_config(&d).unwrap();
-        assert_eq!(v["schema_version"], 2);
+        assert_eq!(v["schema_version"], 3);
         let arr = v["profiles"].as_array().unwrap();
         let p = arr.iter().find(|p| p["id"] == id).unwrap();
         assert!(p["key"].as_str().unwrap().ends_with("9999"));
@@ -670,9 +724,19 @@ mod tests {
     }
 
     #[test]
-    fn list_templates_has_eleven() {
-        let v = build_list_templates();
+    fn list_templates_hides_codex_until_experimental_flag_is_enabled() {
+        let d = tmpdir_profile();
+        let default_config = build_get_config(&d).unwrap();
+        assert_eq!(default_config["experimental_codex_enabled"], false);
+        assert!(!default_config["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == "codex"));
+
+        let v = build_list_templates(false);
         assert_eq!(v.len(), 11);
+        assert!(!v.iter().any(|t| t["id"] == "codex"));
         assert!(v.iter().any(|t| t["id"] == "custom"));
         assert!(v.iter().any(|t| t["id"] == "custom-openai"));
         assert!(v.iter().any(|t| t["id"] == "custom-openai-responses"));
@@ -687,11 +751,29 @@ mod tests {
             "openai_models_or_manual"
         );
         assert_eq!(custom["capabilities"]["base_url_required"], true);
+
+        let enabled = build_list_templates(true);
+        assert_eq!(enabled.len(), 12);
+        let codex = enabled.iter().find(|t| t["id"] == "codex").unwrap();
+        assert_eq!(codex["capabilities"]["auth_mode"], "keychain_oauth");
+        assert_eq!(
+            codex["capabilities"]["model_discovery"],
+            "codex_account_catalog"
+        );
+
+        config::update(&d, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let enabled_config = build_get_config(&d).unwrap();
+        assert_eq!(enabled_config["experimental_codex_enabled"], true);
+        assert!(enabled_config["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["id"] == "codex"));
     }
 
     #[test]
     fn all_templates_include_the_full_capability_contract_shape() {
-        let templates = build_list_templates();
+        let templates = build_list_templates(true);
         let template_fields = [
             "id",
             "name",
@@ -708,6 +790,8 @@ mod tests {
             "capabilities",
         ];
         let capability_fields = [
+            "auth_mode",
+            "credential_source",
             "base_url_required",
             "model_required",
             "model_discovery",
@@ -770,10 +854,27 @@ mod tests {
                 matches!(
                     capabilities["model_discovery"].as_str(),
                     Some(
-                        "builtin_static" | "anthropic_models_or_manual" | "openai_models_or_manual"
+                        "builtin_static"
+                            | "anthropic_models_or_manual"
+                            | "openai_models_or_manual"
+                            | "codex_account_catalog"
                     )
                 ),
                 "template {id} model_discovery"
+            );
+            assert!(
+                matches!(
+                    capabilities["auth_mode"].as_str(),
+                    Some("api_key" | "keychain_oauth" | "none")
+                ),
+                "template {id} auth_mode"
+            );
+            assert!(
+                matches!(
+                    capabilities["credential_source"].as_str(),
+                    Some("api_key" | "keychain_oauth" | "none")
+                ),
+                "template {id} credential_source"
             );
             assert!(
                 matches!(

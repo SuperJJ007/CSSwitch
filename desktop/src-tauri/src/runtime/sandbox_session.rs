@@ -238,6 +238,12 @@ pub(crate) fn one_click_login<R: Runtime>(
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+    let active_profile = cfg
+        .active_profile()
+        .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
+    config::require_template_enabled(&cfg, &active_profile.template_id)?;
+    let active_launch = crate::runtime::provider::resolve_launch_plan(active_profile)?;
+    crate::commands::codex::ensure_provider_auth_ready(&app, &active_launch.adapter)?;
     crate::runtime::settings::validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     let sport = cfg.sandbox_port;
 

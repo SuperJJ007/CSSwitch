@@ -3,12 +3,16 @@ pub struct GatewayConfig {
     pub provider: String,
     pub port: u16,
     pub auth_secret: Option<String>,
-    pub api_key: String,
+    pub api_key: Option<String>,
     pub upstream_url: String,
     pub models_url: Option<String>,
     pub forced_model: Option<String>,
     pub relay_thinking: Option<String>,
     pub shim_mode: String,
+    /// CSSwitch-owned auth state root. Present only for Codex; OAuth secrets
+    /// themselves remain in CSSwitch Keychain records.
+    pub codex_state_root: Option<std::path::PathBuf>,
+    pub(crate) codex_contract: Option<crate::provider_contracts::CodexRuntimeContract>,
     /// Opaque per-spawn identity supplied by the Tauri process manager.
     /// Standalone invocations may leave it empty, but managed launches always set it.
     pub launch_id: String,
@@ -30,6 +34,7 @@ pub const UPSTREAM_UA: &str = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSw
 pub const DEFAULT_UPSTREAM_URL: &str = "https://api.deepseek.com/anthropic/v1/messages";
 pub const DEFAULT_QWEN_UPSTREAM_URL: &str =
     "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions";
+pub const DEFAULT_CODEX_UPSTREAM_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 
 pub const DEEPSEEK_MODELS: &[(&str, &str)] = &[
     ("claude-opus-4-8", "DeepSeek V4 Pro"),
@@ -64,7 +69,7 @@ pub fn canonical_shim_mode(provider: &str, raw: Option<&str>) -> &'static str {
 pub fn provider_supported(provider: &str, shim: &str) -> bool {
     match provider {
         "deepseek" => matches!(shim, "off" | "detect" | "rewrite"),
-        "qwen" | "openai-custom" | "openai-responses" | "relay" => shim == "off",
+        "qwen" | "openai-custom" | "openai-responses" | "relay" | "codex" => shim == "off",
         _ => false,
     }
 }
@@ -160,7 +165,7 @@ impl GatewayConfig {
         );
         if !provider_supported(&provider, shim) {
             return Err(format!(
-                "只支持 deepseek + shim off/detect/rewrite 或 qwen/openai-custom/openai-responses/relay + shim off（provider={provider}, shim={shim}）"
+                "只支持 deepseek + shim off/detect/rewrite 或 qwen/openai-custom/openai-responses/relay/codex + shim off（provider={provider}, shim={shim}）"
             ));
         }
 
@@ -170,11 +175,17 @@ impl GatewayConfig {
             "relay" => "CSSWITCH_RELAY_KEY",
             _ => "DEEPSEEK_API_KEY",
         };
-        let api_key = std::env::var(key_env)
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| format!("缺少 {key_env}"))?;
+        let api_key = if provider == "codex" {
+            None
+        } else {
+            Some(
+                std::env::var(key_env)
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty())
+                    .ok_or_else(|| format!("缺少 {key_env}"))?,
+            )
+        };
         let auth_secret = std::env::var("CSSWITCH_AUTH_TOKEN")
             .ok()
             .filter(|v| !v.is_empty())
@@ -222,6 +233,8 @@ impl GatewayConfig {
             format!("{base}/v1/messages")
         } else if provider == "qwen" {
             DEFAULT_QWEN_UPSTREAM_URL.to_string()
+        } else if provider == "codex" {
+            DEFAULT_CODEX_UPSTREAM_URL.to_string()
         } else {
             DEFAULT_UPSTREAM_URL.to_string()
         };
@@ -234,6 +247,32 @@ impl GatewayConfig {
             .unwrap_or_default()
             .trim()
             .to_string();
+        let codex_state_root = if provider == "codex" {
+            Some(
+                std::env::var_os("HOME")
+                    .map(std::path::PathBuf::from)
+                    .filter(|path| path.is_absolute())
+                    .ok_or("codex provider 需要绝对 HOME")?
+                    .join(".csswitch"),
+            )
+        } else {
+            None
+        };
+        let codex_contract = if provider == "codex" {
+            let contract = crate::provider_contracts::load_codex_runtime_contract()?;
+            crate::provider_contracts::validate_managed_identity(
+                &contract,
+                std::env::var("CSSWITCH_PROVIDER_CONTRACT_ID")
+                    .ok()
+                    .as_deref(),
+                std::env::var("CSSWITCH_PROVIDER_CONTRACT_DIGEST")
+                    .ok()
+                    .as_deref(),
+            )?;
+            Some(contract)
+        } else {
+            None
+        };
         let skill_data_dir = std::env::var_os("CSSWITCH_SKILL_DATA_DIR")
             .map(std::path::PathBuf::from)
             .filter(|path| path.is_absolute());
@@ -272,6 +311,8 @@ impl GatewayConfig {
             forced_model,
             relay_thinking,
             shim_mode: shim.to_string(),
+            codex_state_root,
+            codex_contract,
             launch_id,
             skill_data_dir,
             skill_bridge_dir,
@@ -311,6 +352,7 @@ mod tests {
             "openai-custom",
             "openai-responses",
             "relay",
+            "codex",
             "unknown",
         ] {
             assert_eq!(canonical_shim_mode(provider, Some(" Rewrite ")), "off");
@@ -329,6 +371,8 @@ mod tests {
         assert!(provider_supported("openai-responses", "off"));
         assert!(provider_supported("relay", "off"));
         assert!(!provider_supported("relay", "rewrite"));
+        assert!(provider_supported("codex", "off"));
+        assert!(!provider_supported("codex", "rewrite"));
     }
 
     #[test]
@@ -381,6 +425,14 @@ mod tests {
         assert_eq!(
             upstream_url_for("relay", "http://candidate/v1/messages".to_string(), poison),
             "http://candidate/v1/messages"
+        );
+        assert_eq!(
+            upstream_url_for(
+                "codex",
+                super::DEFAULT_CODEX_UPSTREAM_URL.to_string(),
+                Some("http://127.0.0.1:1/poison".to_string())
+            ),
+            super::DEFAULT_CODEX_UPSTREAM_URL
         );
     }
 }

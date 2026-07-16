@@ -16,7 +16,7 @@
 
 # CSSwitch
 
-CSSwitch is a local configuration converter for Claude Science. It translates Science inference requests and connects them to your own model API, including DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints.
+CSSwitch is a local configuration converter for Claude Science. It translates Science inference requests and connects them to your own model API, including DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints. The current source also contains an off-by-default experimental Codex OAuth path that has not shipped in a stable release.
 
 It is built for more than developers. You need Claude Science, a third-party API key, and the CSSwitch desktop panel: create a profile, make it active, then click "一键开始" (Start).
 
@@ -89,7 +89,7 @@ Before starting, make sure you have:
 
 - [Claude Science (official Claude download page)](https://claude.com/download)
 - A macOS Apple Silicon device
-- A working third-party model API key
+- A working third-party model API key; only the experimental Codex path uses a separate CSSwitch OAuth login
 - No separate Python runtime is required; CSSwitch bundles its Rust inference gateway
 
 1. Download the latest `CSSwitch_*.dmg` from [GitHub Releases](../../releases/latest).
@@ -102,6 +102,8 @@ Before starting, make sure you have:
 8. CSSwitch starts the isolated Science instance and opens it in your browser.
 
 CSSwitch does not choose a Science version for you. Normal startup uses the currently installed Claude Science App. If the App is missing, the panel shows an exact readable cache version and asks whether to use it for this launch only, or to open the official download page. That choice is not persisted, and a later detected App automatically becomes the default again.
+
+The Codex capability in the current source has not shipped in `v0.6.0` and is off by default. When testing from source, explicitly enable it under Advanced Settings, complete the separate CSSwitch login, then create a Codex profile; no API key, `base_url`, or fixed model is entered. After Science starts, choose a dynamic `Codex / …` entry under “More models.” This path neither reuses nor modifies native Codex login state, and real-account/live-provider acceptance is still pending.
 
 To use Science with its official service configuration, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
 
@@ -160,6 +162,7 @@ For exact steps, backup locations, and rollback boundaries, see [Upgrade and rol
 | Custom Anthropic | User-provided compatible endpoint | For private gateways, Claude-compatible relays, or local adapters |
 | Custom OpenAI | User-provided OpenAI Chat Completions base root | The proxy appends `/chat/completions` and `/models` |
 | Custom OpenAI Responses | User-provided OpenAI Responses base root | The proxy appends `/responses` and `/models` |
+| Codex (source experiment, off by default) | Separate CSSwitch OAuth + Responses/SSE | Dynamically reads the current account catalog; never reuses native Codex login; real-account acceptance is pending |
 
 > If your URL is an `/anthropic` endpoint, choose "Custom Anthropic". If you choose "Custom OpenAI", enter an OpenAI-compatible base root such as `https://example.com/v1`, not an Anthropic endpoint.
 
@@ -178,6 +181,7 @@ CSSwitch's core boundary is simple: third-party model mode keeps credentials, da
 - It does not copy, read, or modify real Claude login credentials, OAuth tokens, account state, or user data.
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
+- Experimental Codex credentials are stored only in CSSwitch-owned macOS Keychain items; config contains a fixed opaque reference. CSSwitch does not read, copy, overwrite, or delete native `~/.codex` login state.
 - Keys are not displayed in application logs, and the local gateway listens only on loopback.
 - “Allow isolated Science to use system SSH configuration” is off by default. When enabled, it only makes real `~/.ssh/config` available to system OpenSSH calls made by Science. CSSwitch does not copy or link all of `.ssh`, start `sshd`, change the firewall, or expose a `0.0.0.0` listener. Native OpenSSH `Include`, key, Agent, and command rules still apply, so this is an explicit trust grant.
 - New isolated Science launches prefer the binary from the locally installed official Claude Science app. If the App is unavailable, a readable retained sandbox copy is used only after explicit one-launch authorization; the choice is not persisted. CSSwitch does not download Science and keeps `--no-auto-update`.
@@ -193,6 +197,7 @@ CSSwitch is not an official Claude service, and third-party model mode does not 
 - Third-party models differ in tool use, long context, thinking, image, and streaming compatibility. Native Anthropic endpoints are usually more reliable than OpenAI translation paths.
 - The macOS package is not notarized yet, so the first launch requires manual approval.
 - The inference gateway is a bundled Rust sidecar; no runtime Python fallback is shipped.
+- Codex OAuth currently exists only in experimental source and is off by default. User OAuth, live-provider behavior, signing/notarization, and release artifacts have not been accepted yet.
 
 Please report problems through [GitHub Issues](https://github.com/SuperJJ007/CSSwitch/issues).
 
