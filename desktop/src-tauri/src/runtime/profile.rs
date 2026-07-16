@@ -74,6 +74,20 @@ pub(crate) fn profile_capabilities(p: &config::Profile) -> serde_json::Value {
 /// 组装 get_config 返回体：profiles 的 key 只回掩码，全 key 绝不出后端。
 pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> {
     let cfg = config::load_from(dir).map_err(|e| e.to_string())?;
+    let resolved_codex_network = csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+        .map(|route| {
+            json!({
+                "source": route.source,
+                "proxy_scheme": route.proxy_scheme,
+            })
+        })
+        .unwrap_or_else(|error| {
+            json!({
+                "source": "invalid",
+                "proxy_scheme": null,
+                "error_code": error.code(),
+            })
+        });
     // 一次性迁移提示（#9 甲）：读出后立即清盘，避免每次 get_config 重复提示。
     let notice = cfg.pending_notice.clone();
     if notice.is_some() {
@@ -100,6 +114,8 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
         "templates": build_list_templates(cfg.experimental_codex_enabled), "proxy_port": cfg.proxy_port,
         "sandbox_port": cfg.sandbox_port, "reuse_system_ssh": cfg.reuse_system_ssh,
         "experimental_codex_enabled": cfg.experimental_codex_enabled,
+        "codex_network": cfg.codex_network,
+        "codex_network_resolved": resolved_codex_network,
         "mode": cfg.mode, "pending_notice": notice,
     }))
 }

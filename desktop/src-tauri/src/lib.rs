@@ -11,6 +11,7 @@
 //! 铁律相关：API key 只在内存与 0600 的 config.json，OAuth token 只在 CSSwitch Keychain；回显前端只给掩码/脱敏状态；沙箱端口/目录护栏
 //! 由被调脚本负责（对 8765 与真实目录失败关闭）；关窗只隐藏，显式退出停代理与沙箱。
 
+mod codex_auth_supervisor;
 mod commands;
 mod config;
 mod config_legacy;
@@ -28,6 +29,8 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager};
 
 use runtime::{science::stop_sandbox, system::kill_child};
+
+use codex_auth_supervisor::{CodexAuthSupervisor, SharedCodexAuthSupervisor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LaunchPath {
@@ -195,6 +198,13 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
 }
 
 fn cleanup_for_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    let supervisor = app.state::<SharedCodexAuthSupervisor>().inner().clone();
+    if let Some(pid) = supervisor.cancel_for_exit() {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGTERM);
+        }
+    }
     let state = app.state::<SharedAppState>().inner().clone();
     let lifecycle = app.state::<SharedLifecycle>().inner().clone();
     lifecycle.with_serialized(|| {
@@ -290,10 +300,14 @@ pub fn run() {
         }))
         .manage(Arc::new(Mutex::new(AppState::default())))
         .manage(Arc::new(lifecycle::Lifecycle::new()))
+        .manage(Arc::new(CodexAuthSupervisor::default()))
         .invoke_handler(tauri::generate_handler![
             commands::codex::set_experimental_codex_enabled,
+            commands::codex::set_codex_network,
             commands::codex::codex_auth_status,
-            commands::codex::codex_auth_login,
+            commands::codex::codex_auth_start,
+            commands::codex::codex_auth_cancel,
+            commands::codex::codex_auth_operation_status,
             commands::codex::codex_auth_logout,
             commands::codex::codex_downgrade_preview,
             commands::codex::codex_downgrade_export_all,

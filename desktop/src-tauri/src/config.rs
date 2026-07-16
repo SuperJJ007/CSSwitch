@@ -136,6 +136,9 @@ pub struct Config {
     /// 非官方 Codex → Science 桥接实验开关。默认关闭；关闭不删除 profile 或 Keychain。
     #[serde(default)]
     pub experimental_codex_enabled: bool,
+    /// Codex 专用网络路由。v3 已发布前追加为 serde(default)，旧 v3 文件自动采用 auto。
+    #[serde(default)]
+    pub codex_network: csswitch_codex_network::CodexNetworkSettings,
     /// 代理的 path-secret。**持久化**并跨代理重启/切 profile/重开 app 复用，
     /// 这样已在跑的沙箱（其 ANTHROPIC_BASE_URL 里嵌了该 secret）不会因代理换 secret 而 403。
     /// 首次为空，由后端生成一次后写回。
@@ -159,6 +162,7 @@ impl Default for Config {
             sandbox_port: default_sandbox_port(),
             reuse_system_ssh: false,
             experimental_codex_enabled: false,
+            codex_network: csswitch_codex_network::CodexNetworkSettings::default(),
             secret: String::new(),
             mode: default_mode(),
             pending_notice: None,
@@ -351,6 +355,7 @@ pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config
         sandbox_port: v2.sandbox_port,
         reuse_system_ssh: v2.reuse_system_ssh,
         experimental_codex_enabled: false,
+        codex_network: csswitch_codex_network::CodexNetworkSettings::default(),
         secret: v2.secret,
         mode: v2.mode,
         pending_notice: v2.pending_notice,
@@ -1387,6 +1392,11 @@ mod tests {
         assert_eq!(c.proxy_port, 18991);
         assert!(!c.reuse_system_ssh);
         assert!(!c.experimental_codex_enabled);
+        assert_eq!(
+            c.codex_network.mode,
+            csswitch_codex_network::CodexNetworkMode::Auto
+        );
+        assert!(c.codex_network.proxy_url.is_empty());
         assert_eq!(c.mode, "proxy");
     }
 
@@ -1412,6 +1422,10 @@ mod tests {
         let cfg = load_from(&d).unwrap();
         assert_eq!(cfg.schema_version, CURRENT_SCHEMA_VERSION);
         assert!(!cfg.experimental_codex_enabled);
+        assert_eq!(
+            cfg.codex_network,
+            csswitch_codex_network::CodexNetworkSettings::default()
+        );
     }
 
     #[test]
@@ -2030,6 +2044,10 @@ mod tests {
         assert_eq!(migrated.sandbox_port, 19002);
         assert!(migrated.reuse_system_ssh);
         assert_eq!(migrated.secret, "persistent-secret");
+        assert_eq!(
+            migrated.codex_network,
+            csswitch_codex_network::CodexNetworkSettings::default()
+        );
         let profile = migrated.active_profile().unwrap();
         assert_eq!(profile.api_key, "sk-existing");
         assert_eq!(profile.model, "glm-5.2");
@@ -2114,6 +2132,10 @@ mod tests {
             sandbox_port: 19012,
             reuse_system_ssh: true,
             secret: "keep-secret".into(),
+            codex_network: csswitch_codex_network::CodexNetworkSettings {
+                mode: csswitch_codex_network::CodexNetworkMode::Custom,
+                proxy_url: "socks5h://127.0.0.1:7890".into(),
+            },
             ..Default::default()
         };
         save_to(&d, &cfg).unwrap();
@@ -2133,6 +2155,8 @@ mod tests {
         assert_eq!(v2.sandbox_port, 19012);
         assert!(v2.reuse_system_ssh);
         assert_eq!(v2.secret, "keep-secret");
+        let raw_value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert!(raw_value.get("codex_network").is_none());
 
         let export = fs::read_to_string(export_path).unwrap();
         assert!(export.contains("Codex account"));

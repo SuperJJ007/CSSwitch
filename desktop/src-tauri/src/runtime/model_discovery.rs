@@ -206,6 +206,8 @@ pub(crate) fn fetch_models(
     }
     let resolved = resolve_launch_plan(&candidate)?;
     let scratch_plan = resolved.scratch();
+    let _codex_use =
+        crate::commands::codex::ensure_provider_auth_ready(&app, &scratch_plan.provider)?;
     reject_openai_custom_anthropic_base(&scratch_plan.provider, &scratch_plan.endpoint)?;
     let backend = scratch::backend_for_app(&app, &scratch_plan.provider)?;
     let trace = OperationTrace::start(

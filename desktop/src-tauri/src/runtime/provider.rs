@@ -54,6 +54,8 @@ pub(crate) struct FormalGatewayPlan {
     pub(crate) timeouts: TimeoutPolicy,
     pub(crate) cache: CachePolicy,
     pub(crate) thinking_policy: String,
+    /// 仅 Codex formal launch 设置；不实现 Debug/Serialize，避免代理 URL 被投影。
+    pub(crate) codex_network_route: Option<csswitch_codex_network::ResolvedCodexNetworkRoute>,
 }
 
 pub(crate) enum ScratchCredential {
@@ -112,6 +114,7 @@ impl ResolvedLaunchPlan {
             timeouts: self.timeouts.clone(),
             cache: self.cache.clone(),
             thinking_policy: self.thinking_policy.clone(),
+            codex_network_route: None,
         }
     }
 
@@ -322,7 +325,7 @@ pub(crate) fn proxy_fingerprint_with_runtime(
 ) -> u64 {
     let shim_mode = normalize_shim_mode(&launch.adapter, Some(shim_mode));
     key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
         p.template_id,
         p.api_format,
         launch.adapter,
@@ -338,7 +341,12 @@ pub(crate) fn proxy_fingerprint_with_runtime(
         launch.timeouts.total_ms,
         launch.timeouts.read_idle_ms,
         launch.cache.normal_ttl_seconds,
-        launch.cache.stale_ttl_seconds
+        launch.cache.stale_ttl_seconds,
+        launch
+            .codex_network_route
+            .as_ref()
+            .map(|route| route.fingerprint.as_str())
+            .unwrap_or_default()
     ))
 }
 
@@ -796,6 +804,34 @@ mod tests {
             proxy_fingerprint_with_runtime(&relay_profile, &relay_launch, "rust", " Rewrite "),
             "非 DSML provider 的污染 shim 必须先 canonicalize 为 off"
         );
+    }
+
+    #[test]
+    fn codex_network_fingerprint_changes_formal_gateway_identity() {
+        let profile = crate::config::Profile {
+            id: "codex-profile".into(),
+            template_id: "codex".into(),
+            api_format: "openai_responses".into(),
+            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_ref: Some("csswitch:codex:default".into()),
+            model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
+            ..Default::default()
+        };
+        let mut launch = proxy_args_for(&profile).unwrap().formal();
+        launch.codex_network_route = Some(csswitch_codex_network::direct_route());
+        let direct = proxy_fingerprint_with_runtime(&profile, &launch, "rust", "off");
+        launch.codex_network_route = Some(
+            csswitch_codex_network::resolve(
+                &csswitch_codex_network::CodexNetworkSettings {
+                    mode: csswitch_codex_network::CodexNetworkMode::Custom,
+                    proxy_url: "http://127.0.0.1:7890".into(),
+                },
+                &csswitch_codex_network::EnvironmentSnapshot::default(),
+            )
+            .unwrap(),
+        );
+        let proxied = proxy_fingerprint_with_runtime(&profile, &launch, "rust", "off");
+        assert_ne!(direct, proxied);
     }
 
     #[test]

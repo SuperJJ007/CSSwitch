@@ -1,14 +1,19 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
+use crate::codex_auth_supervisor::{
+    CodexAuthSupervisor, CodexMutationLease, CodexUseLease, OperationErrorView, OperationSnapshot,
+    SharedCodexAuthSupervisor,
+};
 use crate::proc::ChildLiveness;
 use crate::runtime::proxy_lifecycle::gateway_bin_path;
 use crate::runtime::science::{
@@ -17,7 +22,8 @@ use crate::runtime::science::{
 use crate::runtime::system::kill_child;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
 
-const AUTH_SCHEMA_VERSION: u32 = 1;
+const AUTH_SCHEMA_VERSION: u32 = 2;
+const MAX_AUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTH_OUTPUT_BYTES: u64 = 64 * 1024;
 const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(not(feature = "acceptance-keychain"))]
@@ -27,15 +33,23 @@ const EXPECTED_CODEX_KEYCHAIN_SERVICE: &str = "com.csswitch.acceptance.codex.oau
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodexAuthAction {
-    Login,
+    LoginDevice,
+    LoginBrowser,
     Status,
     Logout,
+}
+
+struct ManagedAuthProcess {
+    child: std::process::Child,
+    stdin: Option<std::process::ChildStdin>,
+    stdout: std::process::ChildStdout,
 }
 
 impl CodexAuthAction {
     fn as_str(self) -> &'static str {
         match self {
-            Self::Login => "login",
+            Self::LoginDevice => "login-device",
+            Self::LoginBrowser => "login-browser",
             Self::Status => "status",
             Self::Logout => "logout",
         }
@@ -45,10 +59,15 @@ impl CodexAuthAction {
         match self {
             // Gateway's browser callback budget is five minutes. The outer
             // supervisor allows a small cleanup margin but never waits forever.
-            Self::Login => Duration::from_secs(5 * 60 + 15),
+            Self::LoginDevice => Duration::from_secs(15 * 60 + 15),
+            Self::LoginBrowser => Duration::from_secs(5 * 60 + 15),
             Self::Status => Duration::from_secs(15),
             Self::Logout => Duration::from_secs(60),
         }
+    }
+
+    fn is_login(self) -> bool {
+        matches!(self, Self::LoginDevice | Self::LoginBrowser)
     }
 }
 
@@ -70,6 +89,15 @@ struct SidecarSuccess {
     ok: bool,
     command: String,
     status: AuthStatusView,
+    #[serde(default)]
+    warning: Option<LogoutWarningView>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LogoutWarningView {
+    code: String,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -78,6 +106,16 @@ struct SidecarErrorView {
     code: String,
     message: String,
     retryable: bool,
+    #[serde(default)]
+    stage: Option<String>,
+    #[serde(default)]
+    upstream_status: Option<u16>,
+    #[serde(default)]
+    response_kind: Option<String>,
+    #[serde(default)]
+    challenge_detected: Option<bool>,
+    #[serde(default)]
+    transport_kind: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -94,6 +132,44 @@ struct SidecarError {
 enum SidecarEnvelope {
     Success(SidecarSuccess),
     Error(SidecarError),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginSidecarEvent {
+    schema_version: u32,
+    operation_id: String,
+    kind: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    verification_url: Option<String>,
+    #[serde(default)]
+    user_code: Option<String>,
+    #[serde(default)]
+    expires_at_ms: Option<i64>,
+    #[serde(default)]
+    disposition: Option<String>,
+    #[serde(default)]
+    status: Option<AuthStatusView>,
+    #[serde(default)]
+    error: Option<LoginSidecarError>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoginSidecarError {
+    code: String,
+    stage: String,
+    retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    upstream_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    challenge_detected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transport_kind: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -435,7 +511,14 @@ fn expected_error_exit_code(code: &str) -> Option<i32> {
         | "keychain_unavailable"
         | "auth_storage_error"
         | "unsupported_platform" => Some(6),
-        "oauth_network_error" | "oauth_protocol_error" => Some(7),
+        "oauth_network_error"
+        | "oauth_protocol_error"
+        | "oauth_unexpected_content_type"
+        | "oauth_challenge_response"
+        | "proxy_connect_failed"
+        | "tls_failed"
+        | "device_auth_unavailable"
+        | "auth_cancelled" => Some(7),
         "internal_error" => Some(8),
         _ => None,
     }
@@ -454,10 +537,53 @@ fn safe_error_message(code: &str) -> &'static str {
         "oauth_denied" => "Codex 登录未获授权。",
         "oauth_network_error" => "Codex 认证网络请求失败，请稍后重试。",
         "oauth_protocol_error" => "Codex 认证服务返回了无法识别的响应。",
+        "oauth_unexpected_content_type" => "Codex 认证服务返回了意外的内容类型。",
+        "oauth_challenge_response" => "Codex 认证请求遇到上游安全挑战。",
+        "proxy_connect_failed" => "Codex 认证无法连接所选代理。",
+        "tls_failed" => "Codex 认证 TLS 连接失败。",
+        "device_auth_unavailable" => "当前服务未启用设备码登录，请改用浏览器登录。",
+        "auth_cancelled" => "Codex 登录已取消。",
         "auth_storage_error" => "CSSwitch 无法安全保存 Codex 认证状态。",
         "unsupported_platform" => "当前平台不支持 CSSwitch Codex 钥匙串认证。",
         _ => "Codex 认证 sidecar 发生内部错误。",
     }
+}
+
+fn allowed_stage(stage: &str) -> bool {
+    matches!(
+        stage,
+        "proxy_config"
+            | "device_code_request"
+            | "device_wait"
+            | "browser_open"
+            | "callback_wait"
+            | "token_exchange"
+            | "refresh"
+            | "revoke"
+            | "keychain_commit"
+            | "cancelled"
+    )
+}
+
+fn allowed_response_kind(kind: &str) -> bool {
+    matches!(kind, "json" | "html" | "empty" | "other" | "unknown")
+}
+
+fn allowed_transport_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "timeout" | "dns_connect" | "proxy_connect" | "tls" | "http" | "unknown"
+    )
+}
+
+fn validate_diagnostic_fields(
+    stage: Option<&str>,
+    response_kind: Option<&str>,
+    transport_kind: Option<&str>,
+) -> bool {
+    stage.is_none_or(allowed_stage)
+        && response_kind.is_none_or(allowed_response_kind)
+        && transport_kind.is_none_or(allowed_transport_kind)
 }
 
 fn parse_sidecar_output(
@@ -484,6 +610,13 @@ fn parse_sidecar_output(
                 return Err("Codex 认证 sidecar 成功响应与进程状态不一致。".into());
             }
             validate_status(&success.status)?;
+            if success.warning.as_ref().is_some_and(|warning| {
+                action != CodexAuthAction::Logout
+                    || warning.code != "revoke_skipped"
+                    || warning.reason != "proxy_config_invalid"
+            }) {
+                return Err("Codex logout sidecar warning 非法。".into());
+            }
             serde_json::to_value(success.status)
                 .map(|status| {
                     json!({
@@ -491,6 +624,7 @@ fn parse_sidecar_output(
                         "ok": true,
                         "command": action.as_str(),
                         "status": status,
+                        "warning": success.warning,
                     })
                 })
                 .map_err(|_| "无法编码 Codex 认证状态。".into())
@@ -503,6 +637,11 @@ fn parse_sidecar_output(
                 || exit_code != expected_error_exit_code(&error.error.code)
                 || error.error.message.is_empty()
                 || error.error.message.len() > 512
+                || !validate_diagnostic_fields(
+                    error.error.stage.as_deref(),
+                    error.error.response_kind.as_deref(),
+                    error.error.transport_kind.as_deref(),
+                )
             {
                 return Err("Codex 认证 sidecar 错误响应与进程状态不一致。".into());
             }
@@ -514,6 +653,11 @@ fn parse_sidecar_output(
                     "code": error.error.code,
                     "message": safe_error_message(&error.error.code),
                     "retryable": error.error.retryable,
+                    "stage": error.error.stage,
+                    "upstream_status": error.error.upstream_status,
+                    "response_kind": error.error.response_kind,
+                    "challenge_detected": error.error.challenge_detected,
+                    "transport_kind": error.error.transport_kind,
                 }
             }))
         }
@@ -542,6 +686,7 @@ fn stop_auth_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+#[cfg(test)]
 fn run_codex_auth_sidecar_at(
     binary: &Path,
     home: &Path,
@@ -550,12 +695,25 @@ fn run_codex_auth_sidecar_at(
     run_codex_auth_sidecar_at_with_timeout(binary, home, action, action.timeout())
 }
 
+#[cfg(test)]
 fn run_codex_auth_sidecar_at_with_timeout(
     binary: &Path,
     home: &Path,
     action: CodexAuthAction,
     timeout: Duration,
 ) -> Result<Value, String> {
+    let process = spawn_codex_auth_sidecar_at(binary, home, action, None, None, false)?;
+    wait_for_single_sidecar_response(process, action, timeout)
+}
+
+fn spawn_codex_auth_sidecar_at(
+    binary: &Path,
+    home: &Path,
+    action: CodexAuthAction,
+    route: Option<&csswitch_codex_network::ResolvedCodexNetworkRoute>,
+    operation_id: Option<&str>,
+    skip_revoke: bool,
+) -> Result<ManagedAuthProcess, String> {
     let binary_metadata = std::fs::symlink_metadata(binary).ok();
     if !binary.is_absolute()
         || binary_metadata
@@ -567,7 +725,8 @@ fn run_codex_auth_sidecar_at_with_timeout(
     if !home.is_absolute() {
         return Err("Codex 认证 HOME 必须是绝对路径。".into());
     }
-    let mut child = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("codex-auth")
         .arg(action.as_str())
         .env_clear()
@@ -576,12 +735,41 @@ fn run_codex_auth_sidecar_at_with_timeout(
             "CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE",
             EXPECTED_CODEX_KEYCHAIN_SERVICE,
         )
-        .stdin(Stdio::null())
+        .stdin(if action.is_login() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    if action.is_login() {
+        let operation_id = operation_id
+            .filter(|value| is_lower_hex(value, 32))
+            .ok_or_else(|| "Codex 登录 operation ID 非法。".to_string())?;
+        command.env("CSSWITCH_CODEX_AUTH_OPERATION_ID", operation_id);
+    } else if operation_id.is_some() {
+        return Err("非登录 sidecar 不得携带 operation ID。".into());
+    }
+    if skip_revoke {
+        if action != CodexAuthAction::Logout {
+            return Err("只有 logout sidecar 可以跳过 revoke。".into());
+        }
+        command.env("CSSWITCH_CODEX_LOGOUT_SKIP_REVOKE", "proxy_config_invalid");
+    }
+    if let Some(route) = route {
+        let encoded = csswitch_codex_network::encode_route(route)
+            .map_err(|_| "无法编码 Codex 网络路由。".to_string())?;
+        command.env(csswitch_codex_network::ROUTE_ENV, encoded);
+    }
+    let mut child = command
         .spawn()
         .map_err(|_| "无法启动 Codex 认证 sidecar。".to_string())?;
-    let Some(mut stdout) = child.stdout.take() else {
+    let stdin = child.stdin.take();
+    if action.is_login() && stdin.is_none() {
+        stop_auth_child(&mut child);
+        return Err("无法建立 Codex 认证 sidecar 取消通道。".into());
+    }
+    let Some(stdout) = child.stdout.take() else {
         stop_auth_child(&mut child);
         return Err("无法读取 Codex 认证 sidecar 输出。".into());
     };
@@ -589,6 +777,28 @@ fn run_codex_auth_sidecar_at_with_timeout(
         stop_auth_child(&mut child);
         return Err(error);
     }
+
+    Ok(ManagedAuthProcess {
+        child,
+        stdin,
+        stdout,
+    })
+}
+
+fn wait_for_single_sidecar_response(
+    mut process: ManagedAuthProcess,
+    action: CodexAuthAction,
+    timeout: Duration,
+) -> Result<Value, String> {
+    if action.is_login() || process.stdin.is_some() {
+        stop_auth_child(&mut process.child);
+        return Err("登录 sidecar 必须使用流式协议读取。".into());
+    }
+    let ManagedAuthProcess {
+        ref mut child,
+        stdin: _,
+        ref mut stdout,
+    } = process;
 
     let deadline = Instant::now() + timeout;
     let mut bytes = Vec::new();
@@ -605,14 +815,14 @@ fn run_codex_auth_sidecar_at_with_timeout(
                 Ok(read) => {
                     bytes.extend_from_slice(&chunk[..read]);
                     if bytes.len() as u64 > MAX_AUTH_OUTPUT_BYTES {
-                        stop_auth_child(&mut child);
+                        stop_auth_child(child);
                         return Err("Codex 认证 sidecar 输出读取失败或超过 64 KiB。".into());
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
-                    stop_auth_child(&mut child);
+                    stop_auth_child(child);
                     return Err("Codex 认证 sidecar 输出读取失败或超过 64 KiB。".into());
                 }
             }
@@ -621,7 +831,7 @@ fn run_codex_auth_sidecar_at_with_timeout(
             match child.try_wait() {
                 Ok(status) => exit_status = status,
                 Err(_) => {
-                    stop_auth_child(&mut child);
+                    stop_auth_child(child);
                     return Err("无法确认 Codex 认证 sidecar 退出状态。".into());
                 }
             }
@@ -630,7 +840,7 @@ fn run_codex_auth_sidecar_at_with_timeout(
             break;
         }
         if Instant::now() >= deadline {
-            stop_auth_child(&mut child);
+            stop_auth_child(child);
             return Err("Codex 认证 sidecar 超时，受管进程已结束。".into());
         }
         std::thread::sleep(AUTH_POLL_INTERVAL);
@@ -638,12 +848,351 @@ fn run_codex_auth_sidecar_at_with_timeout(
     parse_sidecar_output(&bytes, action, exit_status.and_then(|status| status.code()))
 }
 
+fn valid_device_user_code(value: &str) -> bool {
+    let Some((left, right)) = value.split_once('-') else {
+        return false;
+    };
+    (4..=8).contains(&left.len())
+        && (4..=8).contains(&right.len())
+        && left
+            .chars()
+            .chain(right.chars())
+            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+}
+
+fn validate_login_sidecar_error(error: &LoginSidecarError) -> bool {
+    allowed_error_code(&error.code)
+        && allowed_stage(&error.stage)
+        && validate_diagnostic_fields(
+            Some(&error.stage),
+            error.response_kind.as_deref(),
+            error.transport_kind.as_deref(),
+        )
+}
+
+fn send_cancel_to_sidecar(
+    stdin: &mut Option<std::process::ChildStdin>,
+    operation_id: &str,
+) -> Result<(), String> {
+    let mut input = stdin
+        .take()
+        .ok_or_else(|| "Codex 认证 sidecar 取消通道不可用。".to_string())?;
+    let line = serde_json::to_vec(&json!({
+        "schema_version": AUTH_SCHEMA_VERSION,
+        "operation_id": operation_id,
+        "command": "cancel",
+    }))
+    .map_err(|_| "无法编码 Codex 认证取消请求。".to_string())?;
+    if line.len() >= MAX_AUTH_LINE_BYTES {
+        return Err("Codex 认证取消请求超过协议上限。".into());
+    }
+    input
+        .write_all(&line)
+        .and_then(|_| input.write_all(b"\n"))
+        .and_then(|_| input.flush())
+        .map_err(|_| "无法向 Codex 认证 sidecar 发送取消请求。".to_string())
+}
+
+fn wait_for_login_sidecar(
+    mut process: ManagedAuthProcess,
+    action: CodexAuthAction,
+    operation_id: &str,
+    cancel: &AtomicBool,
+    mut on_progress: impl FnMut(&LoginSidecarEvent),
+    mut on_cancel_ack: impl FnMut(&str),
+) -> Result<Value, String> {
+    if !action.is_login() || !is_lower_hex(operation_id, 32) {
+        stop_auth_child(&mut process.child);
+        return Err("Codex 登录流式协议参数非法。".into());
+    }
+    let deadline = Instant::now() + action.timeout();
+    let mut pending = Vec::new();
+    let mut total = 0_u64;
+    let mut output_eof = false;
+    let mut exit_status = None;
+    let mut terminal: Option<Value> = None;
+    let mut terminal_error_code: Option<String> = None;
+    let mut cancel_sent = false;
+    let mut accepted_at: Option<Instant> = None;
+    let mut chunk = [0_u8; 8192];
+
+    loop {
+        if cancel.load(Ordering::SeqCst) && !cancel_sent {
+            send_cancel_to_sidecar(&mut process.stdin, operation_id)?;
+            cancel_sent = true;
+        }
+        loop {
+            match process.stdout.read(&mut chunk) {
+                Ok(0) => {
+                    output_eof = true;
+                    break;
+                }
+                Ok(read) => {
+                    total = total.saturating_add(read as u64);
+                    if total > MAX_AUTH_OUTPUT_BYTES {
+                        stop_auth_child(&mut process.child);
+                        return Err("Codex 认证 sidecar 输出超过 64 KiB。".into());
+                    }
+                    pending.extend_from_slice(&chunk[..read]);
+                    while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
+                        let mut line = pending.drain(..=newline).collect::<Vec<_>>();
+                        line.pop();
+                        if line.last() == Some(&b'\r') {
+                            line.pop();
+                        }
+                        if line.is_empty() || line.len() > MAX_AUTH_LINE_BYTES {
+                            stop_auth_child(&mut process.child);
+                            return Err("Codex 认证 sidecar NDJSON 行非法。".into());
+                        }
+                        let event: LoginSidecarEvent = serde_json::from_slice(&line)
+                            .map_err(|_| "Codex 认证 sidecar 返回了非法 NDJSON。".to_string())?;
+                        if event.schema_version != AUTH_SCHEMA_VERSION
+                            || event.operation_id != operation_id
+                        {
+                            stop_auth_child(&mut process.child);
+                            return Err("Codex 认证 sidecar operation 不匹配。".into());
+                        }
+                        match event.kind.as_str() {
+                            "progress" => {
+                                if terminal.is_some()
+                                    || event.status.is_some()
+                                    || event.error.is_some()
+                                    || event.disposition.is_some()
+                                {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 progress 字段非法。".into());
+                                }
+                                let state = event.state.as_deref().unwrap_or_default();
+                                if !matches!(
+                                    state,
+                                    "verification_required"
+                                        | "waiting"
+                                        | "exchanging"
+                                        | "committing"
+                                ) {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 progress 状态非法。".into());
+                                }
+                                if state == "verification_required" {
+                                    if action != CodexAuthAction::LoginDevice
+                                        || event.verification_url.as_deref()
+                                            != Some("https://auth.openai.com/codex/device")
+                                        || event
+                                            .user_code
+                                            .as_deref()
+                                            .is_none_or(|code| !valid_device_user_code(code))
+                                        || event.expires_at_ms.is_none()
+                                    {
+                                        stop_auth_child(&mut process.child);
+                                        return Err("Codex 设备码 progress 字段非法。".into());
+                                    }
+                                } else if event.verification_url.is_some()
+                                    || event.user_code.is_some()
+                                    || event.expires_at_ms.is_some()
+                                {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 progress 携带了多余字段。".into());
+                                }
+                                on_progress(&event);
+                            }
+                            "cancel_ack" => {
+                                if !cancel_sent
+                                    || event.state.is_some()
+                                    || event.status.is_some()
+                                    || event.error.is_some()
+                                    || event.verification_url.is_some()
+                                    || event.user_code.is_some()
+                                    || event.expires_at_ms.is_some()
+                                {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 cancel ack 字段非法。".into());
+                                }
+                                let disposition = event.disposition.as_deref().unwrap_or_default();
+                                if !matches!(
+                                    disposition,
+                                    "accepted" | "commit_in_progress" | "already_terminal"
+                                ) {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 cancel ack 结果非法。".into());
+                                }
+                                if disposition == "accepted" {
+                                    accepted_at = Some(Instant::now());
+                                }
+                                on_cancel_ack(disposition);
+                            }
+                            "terminal" => {
+                                if terminal.is_some()
+                                    || event.disposition.is_some()
+                                    || event.verification_url.is_some()
+                                    || event.user_code.is_some()
+                                    || event.expires_at_ms.is_some()
+                                {
+                                    stop_auth_child(&mut process.child);
+                                    return Err("Codex 认证 terminal 字段非法。".into());
+                                }
+                                let state = event.state.as_deref().unwrap_or_default();
+                                match state {
+                                    "succeeded" => {
+                                        let Some(status) = event.status.as_ref() else {
+                                            stop_auth_child(&mut process.child);
+                                            return Err("Codex 认证成功终态缺少状态。".into());
+                                        };
+                                        if event.error.is_some() {
+                                            stop_auth_child(&mut process.child);
+                                            return Err("Codex 认证成功终态包含错误。".into());
+                                        }
+                                        validate_status(status)?;
+                                        terminal = Some(json!({
+                                            "ok": true,
+                                            "state": "succeeded",
+                                            "status": status,
+                                        }));
+                                    }
+                                    "failed" | "cancelled" => {
+                                        let Some(error) = event.error.as_ref() else {
+                                            stop_auth_child(&mut process.child);
+                                            return Err("Codex 认证失败终态缺少错误。".into());
+                                        };
+                                        if event.status.is_some()
+                                            || !validate_login_sidecar_error(error)
+                                            || (state == "cancelled"
+                                                && error.code != "auth_cancelled")
+                                        {
+                                            stop_auth_child(&mut process.child);
+                                            return Err("Codex 认证失败终态字段非法。".into());
+                                        }
+                                        terminal_error_code = Some(error.code.clone());
+                                        terminal = Some(json!({
+                                            "ok": false,
+                                            "state": state,
+                                            "error": error,
+                                        }));
+                                    }
+                                    _ => {
+                                        stop_auth_child(&mut process.child);
+                                        return Err("Codex 认证 terminal 状态非法。".into());
+                                    }
+                                }
+                            }
+                            _ => {
+                                stop_auth_child(&mut process.child);
+                                return Err("Codex 认证 sidecar 事件类型非法。".into());
+                            }
+                        }
+                    }
+                    if pending.len() > MAX_AUTH_LINE_BYTES {
+                        stop_auth_child(&mut process.child);
+                        return Err("Codex 认证 sidecar NDJSON 行超过 8 KiB。".into());
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => {
+                    stop_auth_child(&mut process.child);
+                    return Err("Codex 认证 sidecar 输出读取失败。".into());
+                }
+            }
+        }
+        if exit_status.is_none() {
+            exit_status = process
+                .child
+                .try_wait()
+                .map_err(|_| "无法确认 Codex 认证 sidecar 退出状态。".to_string())?;
+        }
+        if exit_status.is_some() && output_eof {
+            break;
+        }
+        if accepted_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(2)) {
+            stop_auth_child(&mut process.child);
+            return Ok(json!({
+                "ok": false,
+                "state": "cancelled",
+                "error": {
+                    "code": "auth_cancelled",
+                    "stage": "cancelled",
+                    "retryable": true,
+                }
+            }));
+        }
+        if Instant::now() >= deadline && !cancel_sent {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        std::thread::sleep(AUTH_POLL_INTERVAL);
+    }
+    if !pending.is_empty() || terminal.is_none() {
+        return Err("Codex 认证 sidecar 未返回完整终态。".into());
+    }
+    let exit_code = exit_status.and_then(|status| status.code());
+    if let Some(code) = terminal_error_code {
+        if exit_code != expected_error_exit_code(&code) {
+            return Err("Codex 认证终态与进程退出码不一致。".into());
+        }
+    } else if exit_code != Some(0) {
+        return Err("Codex 认证成功终态与进程退出码不一致。".into());
+    }
+    terminal.ok_or_else(|| "Codex 认证 sidecar 未返回终态。".into())
+}
+
 fn run_codex_auth_sidecar<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     action: CodexAuthAction,
 ) -> Result<Value, String> {
     let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
-    run_codex_auth_sidecar_at(&binary, &production_home()?, action)
+    let route = resolve_codex_network_route()?;
+    let process = spawn_codex_auth_sidecar_at(
+        &binary,
+        &production_home()?,
+        action,
+        Some(&route),
+        None,
+        false,
+    )?;
+    wait_for_single_sidecar_response(process, action, action.timeout())
+}
+
+fn spawn_codex_auth_sidecar<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    action: CodexAuthAction,
+    operation_id: &str,
+    route: &csswitch_codex_network::ResolvedCodexNetworkRoute,
+) -> Result<ManagedAuthProcess, String> {
+    let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
+    spawn_codex_auth_sidecar_at(
+        &binary,
+        &production_home()?,
+        action,
+        Some(route),
+        Some(operation_id),
+        false,
+    )
+}
+
+fn run_codex_logout_sidecar<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Value, String> {
+    let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
+    let (route, skip_revoke) = match resolve_codex_network_route() {
+        Ok(route) => (route, false),
+        Err(_) => (csswitch_codex_network::direct_route(), true),
+    };
+    let process = spawn_codex_auth_sidecar_at(
+        &binary,
+        &production_home()?,
+        CodexAuthAction::Logout,
+        Some(&route),
+        None,
+        skip_revoke,
+    )?;
+    wait_for_single_sidecar_response(
+        process,
+        CodexAuthAction::Logout,
+        CodexAuthAction::Logout.timeout(),
+    )
+}
+
+fn resolve_codex_network_route() -> Result<csswitch_codex_network::ResolvedCodexNetworkRoute, String>
+{
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+        .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())
 }
 
 fn require_authenticated_status(value: &Value) -> Result<(), String> {
@@ -664,13 +1213,16 @@ fn require_authenticated_status(value: &Value) -> Result<(), String> {
 pub(crate) fn ensure_provider_auth_ready<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     adapter: &str,
-) -> Result<(), String> {
+) -> Result<Option<CodexUseLease>, String> {
     if adapter != "codex" {
-        return Ok(());
+        return Ok(None);
     }
+    let supervisor = app.state::<SharedCodexAuthSupervisor>().inner().clone();
+    let lease = CodexAuthSupervisor::acquire_use(&supervisor)?;
     let value = run_codex_auth_sidecar(app, CodexAuthAction::Status)
         .map_err(|error| format!("CODEX_AUTH_UNAVAILABLE：{error}"))?;
-    require_authenticated_status(&value)
+    require_authenticated_status(&value)?;
+    Ok(Some(lease))
 }
 
 /// Doctor-only projection. The raw status contains account and auth-generation
@@ -691,22 +1243,193 @@ pub(crate) async fn codex_auth_status(app: tauri::AppHandle) -> Result<Value, St
 }
 
 #[tauri::command]
-pub(crate) async fn codex_auth_login(
+pub(crate) async fn codex_auth_start(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
+    method: String,
 ) -> Result<Value, String> {
+    let action = match method.as_str() {
+        "device" => CodexAuthAction::LoginDevice,
+        "browser" => CodexAuthAction::LoginBrowser,
+        _ => return Err("Codex 登录 method 必须是 device 或 browser。".into()),
+    };
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || {
+    let supervisor = supervisor.inner().clone();
+    let worker_app = app.clone();
+    let worker_supervisor = supervisor.clone();
+    let method_for_start = method.clone();
+    let (reservation, process) = run_blocking(move || {
         lifecycle.with_serialized(|| {
             let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
             config::require_template_enabled(&cfg, "codex")?;
-            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
-            run_codex_auth_sidecar(&app, CodexAuthAction::Login)
+            let route = csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+                .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?;
+            let reservation = supervisor.begin_login(&method_for_start)?;
+            let operation_id = reservation.operation_id.clone();
+            let process = (|| {
+                prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
+                let process = spawn_codex_auth_sidecar(&app, action, &operation_id, &route)?;
+                supervisor.set_pid(&operation_id, process.child.id())?;
+                Ok(process)
+            })();
+            if process.is_err() {
+                supervisor.abort_login_start(&operation_id);
+            }
+            process.map(|process| (reservation, process))
         })
     })
-    .await
+    .await?;
+    let response = serde_json::to_value(&reservation.snapshot)
+        .map_err(|_| "无法编码 Codex 登录 operation。".to_string())?;
+    let operation_id = reservation.operation_id.clone();
+    let cancel = reservation.cancel.clone();
+    let _worker = tauri::async_runtime::spawn_blocking(move || {
+        complete_login_operation(
+            worker_app,
+            worker_supervisor,
+            operation_id,
+            cancel,
+            process,
+            action,
+        );
+    });
+    Ok(response)
+}
+
+fn operation_error_from_envelope(value: &Value) -> OperationErrorView {
+    let code = value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .filter(|code| allowed_error_code(code))
+        .unwrap_or("internal_error")
+        .to_string();
+    let stage = value
+        .pointer("/error/stage")
+        .and_then(Value::as_str)
+        .filter(|stage| allowed_stage(stage))
+        .unwrap_or("token_exchange");
+    OperationErrorView {
+        code,
+        stage: stage.into(),
+        retryable: value
+            .pointer("/error/retryable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        upstream_status: value
+            .pointer("/error/upstream_status")
+            .and_then(Value::as_u64)
+            .and_then(|status| u16::try_from(status).ok()),
+        response_kind: value
+            .pointer("/error/response_kind")
+            .and_then(Value::as_str)
+            .filter(|kind| allowed_response_kind(kind))
+            .map(str::to_string),
+        challenge_detected: value
+            .pointer("/error/challenge_detected")
+            .and_then(Value::as_bool),
+        transport_kind: value
+            .pointer("/error/transport_kind")
+            .and_then(Value::as_str)
+            .filter(|kind| allowed_transport_kind(kind))
+            .map(str::to_string),
+    }
+}
+
+fn emit_operation_snapshot<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    snapshot: &OperationSnapshot,
+) {
+    let _ = app.emit("codex-auth://operation", snapshot);
+}
+
+fn complete_login_operation<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    supervisor: SharedCodexAuthSupervisor,
+    operation_id: String,
+    cancel: std::sync::Arc<AtomicBool>,
+    process: ManagedAuthProcess,
+    action: CodexAuthAction,
+) {
+    let progress_app = app.clone();
+    let progress_supervisor = supervisor.clone();
+    let progress_operation_id = operation_id.clone();
+    let ack_supervisor = supervisor.clone();
+    let ack_operation_id = operation_id.clone();
+    let outcome = wait_for_login_sidecar(
+        process,
+        action,
+        &operation_id,
+        cancel.as_ref(),
+        move |event| {
+            let Some(state) = event.state.as_deref() else {
+                return;
+            };
+            if let Ok(snapshot) = progress_supervisor.update_progress(
+                &progress_operation_id,
+                state,
+                event.expires_at_ms,
+                event.verification_url.clone(),
+                event.user_code.clone(),
+            ) {
+                emit_operation_snapshot(&progress_app, &snapshot);
+            }
+        },
+        move |disposition| {
+            ack_supervisor.record_cancel_disposition(&ack_operation_id, disposition);
+        },
+    );
+    let snapshot = match outcome {
+        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            supervisor.finish(&operation_id, "succeeded", None)
+        }
+        Ok(value) => {
+            let state = if value.get("state").and_then(Value::as_str) == Some("cancelled") {
+                "cancelled"
+            } else {
+                "failed"
+            };
+            supervisor.finish(
+                &operation_id,
+                state,
+                Some(operation_error_from_envelope(&value)),
+            )
+        }
+        Err(_) => supervisor.finish(
+            &operation_id,
+            "failed",
+            Some(OperationErrorView {
+                code: "internal_error".into(),
+                stage: "token_exchange".into(),
+                retryable: true,
+                upstream_status: None,
+                response_kind: None,
+                challenge_detected: None,
+                transport_kind: Some("unknown".into()),
+            }),
+        ),
+    };
+    if let Ok(snapshot) = snapshot {
+        emit_operation_snapshot(&app, &snapshot);
+    }
+}
+
+#[tauri::command]
+pub(crate) fn codex_auth_operation_status(
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
+) -> Result<Option<OperationSnapshot>, String> {
+    Ok(supervisor.snapshot())
+}
+
+#[tauri::command]
+pub(crate) fn codex_auth_cancel(
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
+    operation_id: String,
+) -> Result<Value, String> {
+    let disposition = supervisor.cancel(&operation_id)?;
+    Ok(json!({ "disposition": disposition }))
 }
 
 #[tauri::command]
@@ -714,14 +1437,23 @@ pub(crate) async fn codex_auth_logout(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
 ) -> Result<Value, String> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || {
+    let supervisor = supervisor.inner().clone();
+    let logout_app = app.clone();
+    let mutation: CodexMutationLease = run_blocking(move || {
         lifecycle.with_serialized(|| {
+            let mutation = CodexAuthSupervisor::begin_mutation(&supervisor)?;
             prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
-            run_codex_auth_sidecar(&app, CodexAuthAction::Logout)
+            Ok(mutation)
         })
+    })
+    .await?;
+    run_blocking(move || {
+        let _mutation = mutation;
+        run_codex_logout_sidecar(&logout_app)
     })
     .await
 }
@@ -731,15 +1463,55 @@ pub(crate) async fn set_experimental_codex_enabled(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
+    let supervisor = supervisor.inner().clone();
     run_blocking(move || {
         lifecycle.with_serialized(|| {
+            let _mutation = if enabled {
+                None
+            } else {
+                Some(CodexAuthSupervisor::begin_mutation(&supervisor)?)
+            };
             set_experimental_codex_enabled_at(&config::default_dir(), enabled, || {
                 prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref()).map(|_| ())
             })
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub(crate) async fn set_codex_network(
+    app: tauri::AppHandle,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    supervisor: State<'_, SharedCodexAuthSupervisor>,
+    settings: csswitch_codex_network::CodexNetworkSettings,
+) -> Result<Value, String> {
+    let resolved = csswitch_codex_network::resolve_from_process(&settings)
+        .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?;
+    let mode = settings.mode;
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    let supervisor = supervisor.inner().clone();
+    run_blocking(move || {
+        lifecycle.with_serialized(|| {
+            let _mutation = CodexAuthSupervisor::begin_mutation(&supervisor)?;
+            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
+            config::update(&config::default_dir(), move |cfg| {
+                cfg.codex_network = settings;
+            })
+            .map_err(|error| error.to_string())?;
+            Ok(json!({
+                "mode": mode,
+                "source": resolved.source,
+                "proxy_scheme": resolved.proxy_scheme,
+                "restarted": false,
+            }))
         })
     })
     .await
@@ -871,7 +1643,7 @@ mod tests {
 
     fn success_json(command: &str) -> String {
         format!(
-            "{{\"schema_version\":1,\"ok\":true,\"command\":\"{command}\",\"status\":{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":7}}}}",
+            "{{\"schema_version\":2,\"ok\":true,\"command\":\"{command}\",\"status\":{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":7}}}}",
             "ab".repeat(16),
             "cd".repeat(16)
         )
@@ -985,9 +1757,9 @@ mod tests {
     fn sidecar_runner_returns_typed_failure_but_discards_untrusted_message_and_stderr() {
         let temp = TempDir::new("failure");
         let script = temp.script(
-            "printf '%s\\n' 'secret-stderr' >&2\nprintf '%s\\n' '{\"schema_version\":1,\"ok\":false,\"command\":\"login\",\"error\":{\"code\":\"oauth_denied\",\"message\":\"attacker supplied secret\",\"retryable\":false}}'\nexit 4",
+            "printf '%s\\n' 'secret-stderr' >&2\nprintf '%s\\n' '{\"schema_version\":2,\"ok\":false,\"command\":\"logout\",\"error\":{\"code\":\"oauth_denied\",\"message\":\"attacker supplied secret\",\"retryable\":false}}'\nexit 4",
         );
-        let value = run_codex_auth_sidecar_at(&script, &temp.0, CodexAuthAction::Login).unwrap();
+        let value = run_codex_auth_sidecar_at(&script, &temp.0, CodexAuthAction::Logout).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "oauth_denied");
         assert!(!value.to_string().contains("attacker supplied secret"));
@@ -1004,22 +1776,22 @@ mod tests {
         )
         .is_err());
         assert!(parse_sidecar_output(
-            success_json("login").as_bytes(),
+            success_json("logout").as_bytes(),
             CodexAuthAction::Status,
             Some(0)
         )
         .is_err());
         let extra = success.replacen(
-            "\"schema_version\":1",
-            "\"schema_version\":1,\"token\":\"must-reject\"",
+            "\"schema_version\":2",
+            "\"schema_version\":2,\"token\":\"must-reject\"",
             1,
         );
         assert!(parse_sidecar_output(extra.as_bytes(), CodexAuthAction::Status, Some(0)).is_err());
 
-        let denied = br#"{"schema_version":1,"ok":false,"command":"login","error":{"code":"oauth_denied","message":"denied","retryable":false}}"#;
-        assert!(parse_sidecar_output(denied, CodexAuthAction::Login, Some(7)).is_err());
-        assert!(parse_sidecar_output(denied, CodexAuthAction::Login, None).is_err());
-        assert!(parse_sidecar_output(denied, CodexAuthAction::Login, Some(4)).is_ok());
+        let denied = br#"{"schema_version":2,"ok":false,"command":"logout","error":{"code":"oauth_denied","message":"denied","retryable":false}}"#;
+        assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, Some(7)).is_err());
+        assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, None).is_err());
+        assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, Some(4)).is_ok());
 
         let temp = TempDir::new("oversize");
         let script = temp.script(
@@ -1057,6 +1829,74 @@ mod tests {
         )
         .is_err());
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn login_sidecar_ndjson_replays_progress_and_one_terminal() {
+        let temp = TempDir::new("login-ndjson");
+        let operation_id = "ab".repeat(16);
+        let script = temp.script(&format!(
+            "[ \"$CSSWITCH_CODEX_AUTH_OPERATION_ID\" = \"{operation_id}\" ]\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"verification_required\",\"verification_url\":\"https://auth.openai.com/codex/device\",\"user_code\":\"ABCD-1234\",\"expires_at_ms\":2000000000000}}'\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"waiting\"}}'\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}}}'",
+            "ab".repeat(16),
+            "cd".repeat(16),
+        ));
+        let process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::LoginDevice,
+            None,
+            Some(&operation_id),
+            false,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut states = Vec::new();
+        let value = wait_for_login_sidecar(
+            process,
+            CodexAuthAction::LoginDevice,
+            &operation_id,
+            &cancel,
+            |event| states.push(event.state.clone().unwrap()),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(states, vec!["verification_required", "waiting"]);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["state"], "succeeded");
+    }
+
+    #[test]
+    fn accepted_cancel_watchdog_reaps_only_after_sidecar_ack() {
+        let temp = TempDir::new("login-cancel-watchdog");
+        let operation_id = "ef".repeat(16);
+        let script = temp.script(&format!(
+            "IFS= read -r cancel\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"cancel_ack\",\"disposition\":\"accepted\"}}'\nexec /bin/sleep 5"
+        ));
+        let process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::LoginBrowser,
+            None,
+            Some(&operation_id),
+            false,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        let mut ack = String::new();
+        let value = wait_for_login_sidecar(
+            process,
+            CodexAuthAction::LoginBrowser,
+            &operation_id,
+            &cancel,
+            |_| {},
+            |value| ack = value.to_string(),
+        )
+        .unwrap();
+        assert_eq!(ack, "accepted");
+        assert_eq!(value["state"], "cancelled");
+        assert!(started.elapsed() >= Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
 
     #[test]

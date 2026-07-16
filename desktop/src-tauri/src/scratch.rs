@@ -162,20 +162,31 @@ pub struct ScratchTarget<'a> {
 pub struct ScratchBackend {
     bin: PathBuf,
     shim_mode: String,
+    codex_network_route: Option<csswitch_codex_network::ResolvedCodexNetworkRoute>,
 }
 
 pub(crate) fn backend_for_app<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     adapter: &str,
 ) -> Result<ScratchBackend, String> {
-    crate::commands::codex::ensure_provider_auth_ready(app, adapter)?;
     let shim_mode = crate::runtime::provider::current_shim_mode_for_adapter(adapter);
     let bin = crate::runtime::proxy_lifecycle::gateway_bin_path(app).ok_or(
         "找不到 csswitch-gateway 二进制；请重新安装完整应用，开发态可设置绝对 CSSWITCH_GATEWAY_BIN。",
     )?;
+    let codex_network_route = if adapter == "codex" {
+        let cfg = crate::config::load_from(&crate::config::default_dir())
+            .map_err(|error| error.to_string())?;
+        Some(
+            csswitch_codex_network::resolve_from_process(&cfg.codex_network)
+                .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?,
+        )
+    } else {
+        None
+    };
     Ok(ScratchBackend {
         bin,
         shim_mode: shim_mode.to_string(),
+        codex_network_route,
     })
 }
 
@@ -261,6 +272,19 @@ pub fn scratch_probe(
         target.relay_thinking,
     ) {
         cmd.env(k, v);
+    }
+    if let Some(route) = &backend.codex_network_route {
+        match csswitch_codex_network::encode_route(route) {
+            Ok(encoded) => {
+                cmd.env(csswitch_codex_network::ROUTE_ENV, encoded);
+            }
+            Err(_) => {
+                return ProbeResult {
+                    status: None,
+                    body: "Codex 网络路由编码失败".into(),
+                };
+            }
+        }
     }
     let child = match cmd.spawn() {
         Ok(c) => c,
@@ -433,6 +457,7 @@ mod tests {
         let backend = ScratchBackend {
             bin,
             shim_mode: "off".into(),
+            codex_network_route: None,
         };
         let result = scratch_probe(
             &backend,

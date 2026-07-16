@@ -243,7 +243,8 @@ pub(crate) fn one_click_login<R: Runtime>(
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
     config::require_template_enabled(&cfg, &active_profile.template_id)?;
     let active_launch = crate::runtime::provider::resolve_launch_plan(active_profile)?;
-    crate::commands::codex::ensure_provider_auth_ready(&app, &active_launch.adapter)?;
+    let _codex_use =
+        crate::commands::codex::ensure_provider_auth_ready(&app, &active_launch.adapter)?;
     crate::runtime::settings::validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     let sport = cfg.sandbox_port;
 

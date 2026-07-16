@@ -18,6 +18,8 @@ pub(crate) fn scratch_validate_candidate(
 ) -> Result<bool, String> {
     let launch = proxy_args_for(candidate)?;
     let scratch_plan = launch.scratch();
+    let _codex_use =
+        crate::commands::codex::ensure_provider_auth_ready(app, &scratch_plan.provider)?;
     let trace = OperationTrace::start(
         OperationKind::ValidateConnection,
         format!(
@@ -79,6 +81,7 @@ pub(crate) fn set_active_profile_txn(
     assert_format_supported(&candidate)?;
     let launch = proxy_args_for(&candidate)?;
     let formal_plan = launch.formal();
+    let _codex_use = crate::commands::codex::ensure_provider_auth_ready(app, &formal_plan.adapter)?;
     reject_openai_custom_anthropic_base(&formal_plan.adapter, &candidate.base_url)?;
     if !formal_plan.credential_configured() {
         return Err(format!(
