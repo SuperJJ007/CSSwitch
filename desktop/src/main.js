@@ -51,6 +51,8 @@ const mockStore = {
   sandbox_port: 8990,
   reuse_system_ssh: false,
   experimental_codex_enabled: PREVIEW_CODEX,
+  codex_network: { mode: "auto", proxy_url: "" },
+  codex_network_resolved: { source: "direct", proxy_scheme: null },
   fail_next_get_config: false,
   mode: "proxy",
   profiles: [
@@ -64,8 +66,9 @@ let mockCodexAuth = {
   auth_epoch: PREVIEW_CODEX ? "fedcba9876543210fedcba9876543210" : null, auth_generation: PREVIEW_CODEX ? 1 : 0,
 };
 function mockCodexAuthEnvelope(command) {
-  return { schema_version: 1, ok: true, command, status: { ...mockCodexAuth } };
+  return { schema_version: 2, ok: true, command, status: { ...mockCodexAuth } };
 }
+let mockCodexOperation = null;
 function mockMask(k) { return k ? "••••" + String(k).slice(-4) : ""; }
 function mockInvoke(cmd, args) {
   args = args || {};
@@ -80,6 +83,8 @@ function mockInvoke(cmd, args) {
         proxy_port: mockStore.proxy_port, sandbox_port: mockStore.sandbox_port,
         reuse_system_ssh: mockStore.reuse_system_ssh,
         experimental_codex_enabled: mockStore.experimental_codex_enabled,
+        codex_network: { ...mockStore.codex_network },
+        codex_network_resolved: { ...mockStore.codex_network_resolved },
         mode: mockStore.mode, templates: MOCK_TEMPLATES.filter((t) => t.id !== "codex" || mockStore.experimental_codex_enabled),
         profiles: mockStore.profiles.map((p) => ({ ...p })),
       });
@@ -152,19 +157,34 @@ function mockInvoke(cmd, args) {
       return Promise.resolve({ experimental_codex_enabled: mockStore.experimental_codex_enabled });
     case "codex_auth_status":
       return Promise.resolve(mockCodexAuthEnvelope("status"));
-    case "codex_auth_login":
-      mockCodexAuth = {
-        authenticated: true, account_hash: "0123456789abcdef0123456789abcdef",
-        expiry_state: "valid", expires_at: 1893456000,
-        auth_epoch: "fedcba9876543210fedcba9876543210", auth_generation: mockCodexAuth.auth_generation + 1,
+    case "codex_auth_start":
+      mockCodexOperation = {
+        schema_version: 2, operation_id: "0123456789abcdef0123456789abcdef", sequence: 1,
+        method: args.method || "device", state: "starting", started_at_ms: Date.now(), updated_at_ms: Date.now(),
       };
-      return Promise.resolve(mockCodexAuthEnvelope("login"));
+      return Promise.resolve({ ...mockCodexOperation });
+    case "codex_auth_operation_status":
+      return Promise.resolve(mockCodexOperation ? { ...mockCodexOperation } : null);
+    case "codex_auth_cancel":
+      if (mockCodexOperation) {
+        mockCodexOperation = { ...mockCodexOperation, sequence: mockCodexOperation.sequence + 1, state: "cancelled", updated_at_ms: Date.now(), error: { code: "auth_cancelled", stage: "cancelled", retryable: true } };
+      }
+      return Promise.resolve({ disposition: "accepted" });
     case "codex_auth_logout":
       mockCodexAuth = {
         authenticated: false, account_hash: null, expiry_state: "missing", expires_at: null,
         auth_epoch: null, auth_generation: mockCodexAuth.auth_generation + 1,
       };
       return Promise.resolve(mockCodexAuthEnvelope("logout"));
+    case "set_codex_network": {
+      mockStore.codex_network = { ...args.settings };
+      const custom = args.settings && args.settings.mode === "custom";
+      mockStore.codex_network_resolved = {
+        source: custom ? "custom" : "direct",
+        proxy_scheme: custom ? String(args.settings.proxy_url || "").split(":", 1)[0] : null,
+      };
+      return Promise.resolve({ mode: args.settings.mode, ...mockStore.codex_network_resolved, restarted: false });
+    }
     case "codex_downgrade_preview": {
       const profiles = mockStore.profiles.filter((p) => p.credential_source === "keychain_oauth");
       return Promise.resolve({ schema_version: 1, action: "export_then_remove_all", profile_count: profiles.length, profiles: profiles.map((p) => ({ id: p.id, name: p.name })), active_will_clear: profiles.some((p) => p.id === mockStore.active_id), keychain_unchanged: true, app_exit_required: true });
@@ -217,8 +237,11 @@ let statusRecoveryMsg = "";
 let runtimeChoiceActiveId = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
-let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false };
+let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
 let codexAuthState = null;          // 仅保存后端脱敏状态；绝不包含 token / email
+let codexAuthOperation = null;      // 仅驻内存；operation ID 不展示、不写日志
+let codexLoginStarting = false;
+let codexNetworkSaving = false;
 let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
 
@@ -504,7 +527,9 @@ function setBusy(on, op) {
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
-    els.codexEnabled, els.codexStatusBtn, els.codexLoginBtn, els.codexLogoutBtn, els.codexDowngradeBtn,
+    els.codexEnabled, els.codexStatusBtn, els.codexDeviceLoginBtn, els.codexBrowserLoginBtn,
+    els.codexCancelBtn, els.codexLogoutBtn, els.codexNetworkMode, els.codexProxyUrl,
+    els.codexNetworkSaveBtn, els.codexDowngradeBtn,
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
     els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
   ].forEach((b) => b && (b.disabled = on));
@@ -587,7 +612,7 @@ function confirmAction(token, promptText, fn) {
 }
 
 function unwrapCodexAuthEnvelope(response, expectedCommand) {
-  if (!response || response.schema_version !== 1 || response.command !== expectedCommand || typeof response.ok !== "boolean") {
+  if (!response || response.schema_version !== 2 || response.command !== expectedCommand || typeof response.ok !== "boolean") {
     throw new Error("CSSwitch Codex 认证响应协议不匹配。");
   }
   if (!response.ok) {
@@ -618,6 +643,10 @@ function unwrapCodexAuthEnvelope(response, expectedCommand) {
 
 function renderCodexAuthState() {
   if (!els.codexAuthStatus) return;
+  if (codexOperationActive()) {
+    renderCodexOperation();
+    return;
+  }
   if (!codexAuthState) {
     els.codexAuthStatus.textContent = "尚未检查 CSSwitch Codex 登录状态。";
   } else if (!codexAuthState.authenticated) {
@@ -631,18 +660,208 @@ function renderCodexAuthState() {
   syncCodexControls();
 }
 
+const CODEX_TERMINAL_STATES = new Set(["succeeded", "failed", "cancelled"]);
+const CODEX_OPERATION_STATES = new Set(["starting", "verification_required", "waiting", "exchanging", "committing", ...CODEX_TERMINAL_STATES]);
+const CODEX_ERROR_STAGES = new Set(["proxy_config", "device_code_request", "device_wait", "browser_open", "callback_wait", "token_exchange", "refresh", "revoke", "keychain_commit", "cancelled"]);
+const CODEX_RESPONSE_KINDS = new Set(["json", "html", "empty", "other", "unknown"]);
+const CODEX_TRANSPORT_KINDS = new Set(["timeout", "dns_connect", "proxy_connect", "tls", "http", "unknown"]);
+let handledCodexTerminal = "";
+
+function parseCodexOperationSnapshot(value) {
+  if (!value || value.schema_version !== 2 || !/^[0-9a-f]{32}$/.test(String(value.operation_id || "")) ||
+      !Number.isSafeInteger(value.sequence) || value.sequence < 1 || !["device", "browser"].includes(value.method) ||
+      !CODEX_OPERATION_STATES.has(value.state) || !Number.isSafeInteger(value.started_at_ms) || !Number.isSafeInteger(value.updated_at_ms)) {
+    throw new Error("CSSwitch Codex 登录 operation 协议不匹配。");
+  }
+  const snap = {
+    schema_version: 2,
+    operation_id: String(value.operation_id),
+    sequence: value.sequence,
+    method: value.method,
+    state: value.state,
+    started_at_ms: value.started_at_ms,
+    updated_at_ms: value.updated_at_ms,
+    expires_at_ms: Number.isSafeInteger(value.expires_at_ms) ? value.expires_at_ms : null,
+    verification_url: typeof value.verification_url === "string" ? value.verification_url : null,
+    user_code: typeof value.user_code === "string" ? value.user_code : null,
+    error: null,
+  };
+  if (snap.verification_url && snap.verification_url !== "https://auth.openai.com/codex/device") {
+    throw new Error("CSSwitch Codex 设备码验证地址不匹配。");
+  }
+  if (snap.user_code && !/^[A-Z0-9]{4,8}-[A-Z0-9]{4,8}$/.test(snap.user_code)) {
+    throw new Error("CSSwitch Codex 设备码格式不匹配。");
+  }
+  if (value.error != null) {
+    const error = value.error;
+    if (!error || typeof error.code !== "string" || !CODEX_ERROR_STAGES.has(error.stage) || typeof error.retryable !== "boolean" ||
+        (error.upstream_status != null && (!Number.isSafeInteger(error.upstream_status) || error.upstream_status < 100 || error.upstream_status > 599)) ||
+        (error.response_kind != null && !CODEX_RESPONSE_KINDS.has(error.response_kind)) ||
+        (error.transport_kind != null && !CODEX_TRANSPORT_KINDS.has(error.transport_kind)) ||
+        (error.challenge_detected != null && typeof error.challenge_detected !== "boolean")) {
+      throw new Error("CSSwitch Codex 登录错误结构不匹配。");
+    }
+    snap.error = {
+      code: error.code, stage: error.stage, retryable: error.retryable,
+      upstream_status: error.upstream_status ?? null,
+      response_kind: error.response_kind ?? null,
+      challenge_detected: error.challenge_detected ?? null,
+      transport_kind: error.transport_kind ?? null,
+    };
+  }
+  return snap;
+}
+
+function codexOperationActive() {
+  return !!(codexAuthOperation && !CODEX_TERMINAL_STATES.has(codexAuthOperation.state));
+}
+
+function codexOperationErrorText(error) {
+  const labels = {
+    device_auth_unavailable: "当前服务未启用设备码登录，请手动改用浏览器登录。",
+    oauth_challenge_response: "认证请求遇到上游安全挑战；请检查当前出口或代理路线。",
+    oauth_unexpected_content_type: "认证端点返回了意外内容（例如 HTML），请检查代理或上游安全挑战。",
+    proxy_connect_failed: "无法连接所选 Codex 代理。",
+    tls_failed: "Codex 认证 TLS 连接失败。",
+    oauth_network_error: "Codex 认证网络请求失败。",
+    callback_timeout: "等待登录超时。",
+    callback_unavailable: "本地登录回调端口 1455/1457 不可用。",
+    browser_open_failed: "无法打开系统浏览器。",
+    oauth_denied: "登录未获授权。",
+    auth_cancelled: "登录已取消。",
+    keychain_unavailable: "无法访问 CSSwitch 专用 Keychain 项。",
+    auth_storage_error: "CSSwitch 无法安全保存 Codex 授权。",
+  };
+  let text = labels[error && error.code] || "Codex 登录未完成。";
+  if (error && error.upstream_status) text += " 上游状态码 " + error.upstream_status + "。";
+  return text;
+}
+
+function renderCodexOperation() {
+  if (!els.codexAuthStatus || !codexAuthOperation) return;
+  const op = codexAuthOperation;
+  const code = op.user_code ? " 一次性代码：" + op.user_code + "。" : "";
+  const labels = {
+    starting: "正在启动 Codex 登录…",
+    verification_required: "请打开 https://auth.openai.com/codex/device 并输入代码。" + code,
+    waiting: op.method === "device" ? "正在等待设备码授权。" + code : "正在等待浏览器授权…",
+    exchanging: "授权已收到，正在交换令牌…",
+    committing: "正在原子写入 CSSwitch 专用 Keychain；此时取消不会中断提交。",
+    succeeded: "Codex 登录成功，正在刷新状态…",
+    failed: codexOperationErrorText(op.error),
+    cancelled: "Codex 登录已取消；凭据与 generation 未变。",
+  };
+  els.codexAuthStatus.textContent = labels[op.state] || "Codex 登录状态未知。";
+  syncCodexControls();
+}
+
+function acceptCodexOperationSnapshot(raw, allowReplacement) {
+  const next = parseCodexOperationSnapshot(raw);
+  if (codexAuthOperation && codexAuthOperation.operation_id !== next.operation_id && !allowReplacement) {
+    if (!CODEX_TERMINAL_STATES.has(codexAuthOperation.state) || next.started_at_ms < codexAuthOperation.started_at_ms) return;
+  }
+  if (codexAuthOperation && codexAuthOperation.operation_id === next.operation_id && next.sequence <= codexAuthOperation.sequence) return;
+  codexAuthOperation = next;
+  codexLoginStarting = false;
+  renderCodexOperation();
+  if (CODEX_TERMINAL_STATES.has(next.state)) {
+    const terminalKey = next.operation_id + ":" + next.sequence;
+    if (handledCodexTerminal === terminalKey) return;
+    handledCodexTerminal = terminalKey;
+    if (next.state === "succeeded") {
+      refreshCodexAuthStatus({ quiet: true }).then(() => {
+        setMsg("CSSwitch Codex 登录完成。授权独立存放，原生 Codex OAuth 未被读取或改动。", "ok");
+      });
+    } else if (next.state === "failed") {
+      setMsg("CSSwitch Codex 登录失败：" + codexOperationErrorText(next.error), "err");
+    } else {
+      setMsg("CSSwitch Codex 登录已取消；未修改 CSSwitch Keychain generation。", "ok");
+    }
+  }
+}
+
+async function registerCodexAuthEvents() {
+  if (!PREVIEW && window.__TAURI__.event) {
+    await window.__TAURI__.event.listen("codex-auth://operation", (event) => {
+      try { acceptCodexOperationSnapshot(event.payload, false); }
+      catch (e) { setMsg("Codex 登录事件被安全拒绝：" + e, "err"); }
+    });
+  }
+  try {
+    const snapshot = await call("codex_auth_operation_status");
+    if (snapshot) acceptCodexOperationSnapshot(snapshot, true);
+  } catch (e) {
+    setMsg("无法恢复 Codex 登录 operation 状态：" + e, "err");
+  }
+}
+
 function syncCodexControls() {
   if (!els.codexEnabled) return;
   const enabled = !!configState.experimental_codex_enabled;
-  const locked = busy || activationInFlight;
+  const authActive = codexOperationActive() || codexLoginStarting;
+  const locked = busy || activationInFlight || codexNetworkSaving;
   els.codexEnabled.checked = enabled;
-  els.codexEnabled.disabled = locked;
-  els.codexStatusBtn.disabled = locked;
-  els.codexLoginBtn.disabled = locked || !enabled;
-  els.codexLogoutBtn.disabled = locked || !(codexAuthState && codexAuthState.authenticated);
+  els.codexEnabled.disabled = locked || authActive;
+  els.codexStatusBtn.disabled = locked || authActive;
+  els.codexDeviceLoginBtn.disabled = locked || authActive || !enabled;
+  els.codexBrowserLoginBtn.disabled = locked || authActive || !enabled;
+  els.codexCancelBtn.disabled = locked || !authActive || !codexAuthOperation;
+  els.codexLogoutBtn.disabled = locked || authActive || !(codexAuthState && codexAuthState.authenticated);
+  if (els.codexNetworkMode) els.codexNetworkMode.disabled = locked || authActive;
+  if (els.codexProxyUrl) els.codexProxyUrl.disabled = locked || authActive || els.codexNetworkMode.value !== "custom";
+  if (els.codexNetworkSaveBtn) els.codexNetworkSaveBtn.disabled = locked || authActive;
   const codexCount = (configState.profiles || []).filter((profile) => isCodexSource(profile)).length;
   els.codexDowngradeBox.hidden = codexCount === 0;
-  els.codexDowngradeBtn.disabled = locked || codexCount === 0;
+  els.codexDowngradeBtn.disabled = locked || authActive || codexCount === 0;
+}
+
+function renderCodexNetwork() {
+  if (!els.codexNetworkMode) return;
+  const settings = configState.codex_network || { mode: "auto", proxy_url: "" };
+  const resolved = configState.codex_network_resolved || { source: "direct", proxy_scheme: null };
+  els.codexNetworkMode.value = settings.mode === "custom" ? "custom" : "auto";
+  els.codexProxyUrl.value = settings.proxy_url || "";
+  const sourceLabels = {
+    direct: "直接 socket，可能由系统 TUN 接管",
+    env_https: "来自 HTTPS_PROXY / https_proxy",
+    env_all: "来自 ALL_PROXY / all_proxy",
+    custom: "CSSwitch 显式代理",
+    invalid: "代理配置非法",
+  };
+  const scheme = resolved.proxy_scheme ? " · " + resolved.proxy_scheme : "";
+  els.codexNetworkResolved.textContent = "当前路线：" + (sourceLabels[resolved.source] || "未知") + scheme + "。";
+  syncCodexControls();
+}
+
+function codexNetworkModeChanged() {
+  if (els.codexNetworkMode.value !== "custom") els.codexProxyUrl.value = "";
+  syncCodexControls();
+}
+
+async function saveCodexNetwork() {
+  if (codexNetworkSaving || codexOperationActive()) return;
+  const settings = {
+    mode: els.codexNetworkMode.value === "custom" ? "custom" : "auto",
+    proxy_url: els.codexNetworkMode.value === "custom" ? els.codexProxyUrl.value.trim() : "",
+  };
+  codexNetworkSaving = true;
+  syncCodexControls();
+  setMsg("正在校验 Codex 网络路线并停止受管 Codex 链路；保存后不会自动重启…");
+  try {
+    const result = await call("set_codex_network", { settings });
+    if (!result || result.mode !== settings.mode || result.restarted !== false) {
+      throw new Error("Codex 网络设置响应不一致。");
+    }
+    configState.codex_network = settings;
+    configState.codex_network_resolved = { source: result.source, proxy_scheme: result.proxy_scheme ?? null };
+    renderCodexNetwork();
+    setMsg("Codex 网络路线已保存；受管 Codex Science 与 Gateway 保持停止，其他 provider 未受影响。", "ok");
+  } catch (e) {
+    setMsg("Codex 网络路线未更改：" + e, "err");
+  } finally {
+    codexNetworkSaving = false;
+    syncCodexControls();
+  }
 }
 
 async function refreshCodexAuthStatus(options) {
@@ -720,21 +939,59 @@ async function toggleCodexFeature() {
   }
 }
 
-async function loginCodex() {
+async function startCodexLogin(method) {
   if (!configState.experimental_codex_enabled) {
     setMsg("请先启用 Codex 实验入口。", "err");
     return;
   }
-  setBusy(true, { kind: "codexAuth" });
-  setMsg("正在浏览器中登录 CSSwitch Codex；最多等待 5 分钟。请完成授权后回到这里…");
+  if (codexOperationActive() || codexLoginStarting) return;
+  codexLoginStarting = true;
+  syncCodexControls();
+  setMsg(method === "device"
+    ? "正在申请 Codex 设备码；拿到代码后会显示在高级设置中。"
+    : "正在打开浏览器备用登录；最多等待 5 分钟。请完成授权后回到这里…");
   try {
-    codexAuthState = unwrapCodexAuthEnvelope(await call("codex_auth_login"), "login");
-    renderCodexAuthState();
-    setMsg("CSSwitch Codex 登录完成。该授权独立存放，原生 Codex OAuth 未被读取或改动。", "ok");
+    const snapshot = await call("codex_auth_start", { method });
+    acceptCodexOperationSnapshot(snapshot, true);
+    if (PREVIEW) previewCodexLogin(method);
   } catch (e) {
+    codexLoginStarting = false;
+    syncCodexControls();
     setMsg("CSSwitch Codex 登录失败：" + e, "err");
+  }
+}
+
+function previewCodexLogin(method) {
+  const base = { ...mockCodexOperation };
+  setTimeout(() => {
+    if (!mockCodexOperation || mockCodexOperation.state === "cancelled") return;
+    mockCodexOperation = { ...base, sequence: 2, state: method === "device" ? "verification_required" : "waiting", updated_at_ms: Date.now(), ...(method === "device" ? { verification_url: "https://auth.openai.com/codex/device", user_code: "ABCD-1234", expires_at_ms: Date.now() + 900000 } : {}) };
+    acceptCodexOperationSnapshot(mockCodexOperation, false);
+  }, 250);
+  setTimeout(() => {
+    if (!mockCodexOperation || mockCodexOperation.state === "cancelled") return;
+    mockCodexAuth = { authenticated: true, account_hash: "0123456789abcdef0123456789abcdef", expiry_state: "valid", expires_at: 1893456000, auth_epoch: "fedcba9876543210fedcba9876543210", auth_generation: mockCodexAuth.auth_generation + 1 };
+    mockCodexOperation = { ...base, sequence: 3, state: "succeeded", updated_at_ms: Date.now() };
+    acceptCodexOperationSnapshot(mockCodexOperation, false);
+  }, 900);
+}
+
+async function cancelCodexLogin() {
+  if (!codexOperationActive() || !codexAuthOperation) return;
+  els.codexCancelBtn.disabled = true;
+  try {
+    const result = await call("codex_auth_cancel", { operationId: codexAuthOperation.operation_id });
+    if (!result || !["accepted", "commit_in_progress", "already_terminal"].includes(result.disposition)) {
+      throw new Error("取消响应协议不匹配。");
+    }
+    setMsg(result.disposition === "commit_in_progress"
+      ? "Keychain 提交已经开始；将由最终成功或失败决定状态。"
+      : result.disposition === "already_terminal" ? "该登录 operation 已结束。" : "取消请求已被 sidecar 接受，正在回收…");
+    if (PREVIEW && mockCodexOperation) acceptCodexOperationSnapshot(mockCodexOperation, false);
+  } catch (e) {
+    setMsg("取消 Codex 登录失败：" + e, "err");
   } finally {
-    setBusy(false);
+    syncCodexControls();
   }
 }
 
@@ -746,9 +1003,13 @@ async function doLogoutCodex() {
   setBusy(true, { kind: "codexAuth" });
   setMsg("正在安全停止 Codex 链路并退出 CSSwitch Codex…");
   try {
-    codexAuthState = unwrapCodexAuthEnvelope(await call("codex_auth_logout"), "logout");
+    const response = await call("codex_auth_logout");
+    codexAuthState = unwrapCodexAuthEnvelope(response, "logout");
     renderCodexAuthState();
-    setMsg("已退出 CSSwitch Codex；原生 Codex 登录未被读取或修改。", "ok");
+    const revokeSkipped = response && response.warning && response.warning.code === "revoke_skipped" && response.warning.reason === "proxy_config_invalid";
+    setMsg(revokeSkipped
+      ? "已清除 CSSwitch Codex 本地凭据；因代理配置非法，远端 revoke 已安全跳过。原生 Codex 登录未受影响。"
+      : "已退出 CSSwitch Codex；原生 Codex 登录未被读取或修改。", "ok");
   } catch (e) {
     setMsg("退出 CSSwitch Codex 失败：" + e, "err");
   } finally {
@@ -829,10 +1090,13 @@ async function loadConfig(options) {
     configState.sandbox_port = cfg.sandbox_port ?? 8990;
     configState.reuse_system_ssh = !!cfg.reuse_system_ssh;
     configState.experimental_codex_enabled = !!cfg.experimental_codex_enabled;
+    configState.codex_network = cfg.codex_network || { mode: "auto", proxy_url: "" };
+    configState.codex_network_resolved = cfg.codex_network_resolved || { source: "direct", proxy_scheme: null };
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
     els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     renderCodexAuthState();
+    renderCodexNetwork();
     applyMode(cfg.mode === "official" ? "official" : "proxy");
     renderList();
     showView("list");
@@ -1703,7 +1967,8 @@ function wire() {
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
     "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
-    "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexLoginBtn", "codexLogoutBtn", "codexDowngradeBox", "codexDowngradeBtn",
+    "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexDeviceLoginBtn", "codexBrowserLoginBtn", "codexCancelBtn", "codexLogoutBtn",
+    "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
     "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBaseGroup", "wizBase", "wizBaseHint",
     "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
@@ -1722,8 +1987,12 @@ function wire() {
   els.reuseSystemSsh.addEventListener("change", persistRuntimeSettings);
   els.codexEnabled.addEventListener("change", toggleCodexFeature);
   els.codexStatusBtn.addEventListener("click", checkCodexAuth);
-  els.codexLoginBtn.addEventListener("click", loginCodex);
+  els.codexDeviceLoginBtn.addEventListener("click", () => startCodexLogin("device"));
+  els.codexBrowserLoginBtn.addEventListener("click", () => startCodexLogin("browser"));
+  els.codexCancelBtn.addEventListener("click", cancelCodexLogin);
   els.codexLogoutBtn.addEventListener("click", logoutCodex);
+  els.codexNetworkMode.addEventListener("change", codexNetworkModeChanged);
+  els.codexNetworkSaveBtn.addEventListener("click", saveCodexNetwork);
   els.codexDowngradeBtn.addEventListener("click", requestCodexDowngrade);
 
   // 列表行内操作（事件委托；忙碌时忽略）。
@@ -1793,6 +2062,7 @@ function wire() {
 
 window.addEventListener("DOMContentLoaded", async () => {
   wire();
+  try { await registerCodexAuthEvents(); } catch (e) { setMsg("无法订阅 Codex 登录状态：" + e, "err"); }
   await loadConfig();
   if (!PREVIEW && window.__TAURI__.event) {
     window.__TAURI__.event.listen("boot://failed", (e) => {

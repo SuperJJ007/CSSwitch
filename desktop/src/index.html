@@ -147,8 +147,31 @@
             <div class="codex-auth-status" id="codexAuthStatus" aria-live="polite">尚未检查 CSSwitch Codex 登录状态。</div>
             <div class="row codex-auth-actions">
               <button class="btn small" id="codexStatusBtn">检查状态</button>
-              <button class="btn small" id="codexLoginBtn">登录 Codex</button>
+              <button class="btn small" id="codexDeviceLoginBtn">设备码登录</button>
+              <button class="btn small" id="codexBrowserLoginBtn">浏览器备用</button>
+              <button class="btn small" id="codexCancelBtn" disabled>取消登录</button>
               <button class="btn small" id="codexLogoutBtn" disabled>退出登录</button>
+            </div>
+          </div>
+          <div class="codex-auth-box">
+            <div class="codex-auth-status">Codex 网络路线</div>
+            <div class="ports codex-network-fields">
+              <div class="fld">
+                <label for="codexNetworkMode">模式</label>
+                <select id="codexNetworkMode">
+                  <option value="auto">自动环境代理</option>
+                  <option value="custom">显式代理 URL</option>
+                </select>
+              </div>
+              <div class="fld">
+                <label for="codexProxyUrl">代理 URL</label>
+                <input id="codexProxyUrl" type="password" autocomplete="off" spellcheck="false" placeholder="socks5h://127.0.0.1:7890" disabled />
+              </div>
+            </div>
+            <div class="hint" id="codexNetworkResolved">当前路线：直接 socket，可能由系统 TUN 接管。</div>
+            <div class="hint">自动模式只读取 HTTPS_PROXY / https_proxy，再读取 ALL_PROXY / all_proxy，并应用 NO_PROXY；显式模式忽略 NO_PROXY。支持 HTTP、HTTPS、SOCKS5、SOCKS5h，不支持代理账号密码、PAC 或自定义 CA。</div>
+            <div class="row codex-auth-actions">
+              <button class="btn small" id="codexNetworkSaveBtn">保存 Codex 网络路线</button>
             </div>
           </div>
           <div class="codex-auth-box" id="codexDowngradeBox" hidden>

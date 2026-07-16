@@ -93,6 +93,23 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
         "关闭"
     });
     text.push_str(&format!("  配置数={codex_profile_count}  {auth_summary}\n"));
+    match csswitch_codex_network::resolve_from_process(&cfg.codex_network) {
+        Ok(route) => {
+            text.push_str("  网络来源=");
+            text.push_str(route.source.as_str());
+            text.push_str("  代理类型=");
+            text.push_str(route.proxy_scheme.as_deref().unwrap_or("none"));
+            if route.source == csswitch_codex_network::RouteSource::Direct {
+                text.push_str("  说明=直接 socket，可能由系统 TUN 接管");
+            }
+            text.push('\n');
+        }
+        Err(error) => {
+            text.push_str("  网络来源=invalid  错误=");
+            text.push_str(error.code());
+            text.push('\n');
+        }
+    }
     Ok(text)
 }
 

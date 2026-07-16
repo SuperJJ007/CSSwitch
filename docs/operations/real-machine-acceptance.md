@@ -142,8 +142,11 @@ bash test/real_machine_guard.sh guard
 | RM-38 | 自动 mock + 用户 OAuth 后 live provider | 工具调用 | tool id / result 严格闭环；真实最小工具成功；断流 / 取消不重复执行由 mock 故障注入证明 |
 | RM-39 | 自动 mock | 刷新与失效 | fake OAuth / Keychain 强制 401 和 CAS；并发刷新单写者；401 只影响下一请求；不破坏真实 token |
 | RM-40 | Acceptance artifact + 用户 OAuth 后 live provider | 退出与重登 | 只删除 Acceptance namespace 项；正式 CSSwitch、原生 Codex 与其他 provider 不变；只用脱敏 status 观测 |
-| RM-41 | 自动 fixture + Acceptance artifact | v3 降级 | 每个 Codex profile 显式处理；API-key profiles、设置与备份完整；Keychain 不变且不读取其内容 |
+| RM-41 | 自动 fixture + Acceptance artifact | v3 降级 | 每个 Codex profile 显式处理；API-key profiles、端口和设置完整；Codex network 字段按合同丢弃；Keychain 不变且不读取其内容 |
 | RM-42 | Acceptance artifact | 隔离打包 | 独立 bundle ID、隔离目录；Gateway / Science 使用动态端口，OAuth callback 仍固定 `1455` / `1457`；`8765` 与已安装 App 不变；收尾无残留进程 |
+| RM-43 | Acceptance artifact | Finder 无代理环境 + 系统 TUN | Finder 启动显示 `direct`，只说明“直接 socket，可能由系统 TUN 接管”；TUN 下设备码登录成功但不声称检测 TUN |
+| RM-44 | Acceptance artifact + 本地 fixture | 显式代理 | HTTP CONNECT 与 SOCKS5h 分别完成设备码、模型目录与最小推理；SOCKS5h 证明域名在代理端解析；production 不注入自定义 CA |
+| RM-45 | Acceptance artifact | 登录取消 | waiting、poll sleep、token exchange 取消在两秒内终态；pre-commit 取消后 generation 与 Acceptance Keychain 状态不变；committing 返回 `commit_in_progress` |
 
 ## 6. Skill 证据词汇
 

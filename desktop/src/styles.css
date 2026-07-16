@@ -103,6 +103,8 @@ code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:10.5px;
 .codex-auth-status{font-size:10.5px;line-height:1.5;color:var(--sub)}
 .codex-auth-actions{margin-top:8px;flex-wrap:wrap}
 .codex-auth-actions .btn{flex:1 1 auto;padding:0 8px}
+.codex-network-fields .fld:first-child{flex:0 0 125px}
+.codex-network-fields .fld:last-child{flex:1 1 auto;min-width:0}
 .codex-catalog{margin-top:8px;border:1px solid var(--line);border-radius:9px;background:var(--field);overflow:hidden}
 .codex-catalog-meta{padding:7px 9px;border-bottom:1px solid var(--line);font-size:10px;color:var(--sub)}
 .codex-catalog-list{max-height:132px;overflow:auto;padding:5px 9px}
