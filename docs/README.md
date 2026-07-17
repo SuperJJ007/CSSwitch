@@ -19,6 +19,7 @@
 
 - [外部 Skill bridge](features/external-skill-bridge.md)
 - [系统 SSH 配置复用](features/system-ssh.md)
+- [v0.7 UI 信息架构](features/ui-information-architecture.md)：模型连接、Codex 设置和扩展能力的页面职责。
 
 ## 证据
 
