@@ -1,4 +1,6 @@
-# 外部 Skill 安装桥（v0.6.0）
+# 外部 Skill 安装桥
+
+公开 GitHub URL 路线自 v0.5.0 起提供，v0.6.0 扩展本地包、bundle 与恢复语义；当前 v0.7.0 继续使用本合同。
 
 CSSwitch 只提供两个窄入口，不启用 Skill Manager：
 

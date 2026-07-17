@@ -1,6 +1,6 @@
 # CSSwitch 文档总入口
 
-当前维护基线为 v0.6.0。公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入；本目录按内容寿命和证据类型分类。
+当前维护基线为 v0.7.0。公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入；本目录按内容寿命和证据类型分类。
 
 ## 架构
 

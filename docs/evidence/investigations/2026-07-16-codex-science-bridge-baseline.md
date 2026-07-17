@@ -4,7 +4,7 @@
 
 ## 目标与环境
 
-- source worktree：`/Users/superjj/ccproj/CSswitch-main`；
+- source worktree：隔离的干净 checkout；
 - commit：`0897e78f201e9e463be6a13e3d11888bde31f3b0`；
 - branch：本地 `main`，当时与 `origin/main` 无已报告差异；
 - 平台：macOS arm64，Asia/Shanghai；
@@ -15,7 +15,7 @@
 ## 命令与结果
 
 ```bash
-cd /Users/superjj/ccproj/CSswitch-main
+cd <clean-worktree>
 bash test/run_all.sh
 ```
 

@@ -4,4 +4,4 @@
 
 See [docs/operations/upgrade-and-rollback.md](operations/upgrade-and-rollback.md).
 
-v0.6.0 继续保留此兼容入口；正文只在新路径维护。
+此路径作为历史链接兼容入口保留；正文只在新路径维护。

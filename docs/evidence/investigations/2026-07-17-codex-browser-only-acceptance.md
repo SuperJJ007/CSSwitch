@@ -1,6 +1,8 @@
 # 2026-07-17 Codex browser-only Acceptance 安装与 live 验收证据
 
 > 本页按时间保留多个 artifact。每组 hash 只证明对应候选，不能外推到最终 v0.7.0 发布附件；下方旧 Keychain 与共享数据根记录均明确标为历史证据。
+>
+> 后续状态：最终 v0.7.0 的 source、DMG identity 与公开分发已单独建立，见 [v0.7.0 发布证据](../releases/v0.7.0.md)；最终 DMG 仍未重跑本页的 live OAuth / 推理。本页的恢复候选和停线步骤均为历史记录，不是当前操作指引。
 
 ## 当前 no-signing 私有文件 Acceptance 与 live 推理
 
@@ -16,7 +18,7 @@
 
 候选 bundle 与已安装 Acceptance 的两个 executable hash 逐项相同。用户在该安装态完成独立浏览器 OAuth；CSSwitch 自动确保 Codex profile，动态模型目录可见，并在 Science 中选择 `Codex / GPT-5.6-Sol`。直接 Gateway 最小请求返回 `pong`，Science UI 最小文本请求返回“端到端成功”。同一当前 Science PID 的日志区间没有 `Invalid content type`、`Claude is temporarily unavailable` 或 `temporarily unavailable`；更早日志中的同类错误属于修复前进程。
 
-该轮最终修复把 Codex inference `User-Agent` 对齐为 `codex_cli_rs`，并在上游成功响应缺少 `Content-Type` 时只做有界 SSE 前缀识别：HTML、JSON、challenge、empty 和 other 仍拒绝，已消费字节会接回 reducer，每个 Science 推理请求仍最多一个上游 POST。定向结果为 Codex transport 6/6、Gateway 228 lib + 1 CLI、fmt/clippy 与 `git diff --check` 通过；GPT-5.6-Sol xhigh 独立审查为 P1 none。
+该轮最终修复把 Codex inference `User-Agent` 对齐为 `codex_cli_rs`，并在上游成功响应缺少 `Content-Type` 时只做有界 SSE 前缀识别：HTML、JSON、challenge、empty 和 other 仍拒绝，已消费字节会接回 reducer，每个 Science 推理请求仍最多一个上游 POST。定向结果为 Codex transport 6/6、Gateway 228 lib + 1 CLI、fmt/clippy 与 `git diff --check` 通过。
 
 验收期间只使用 status、模型名、进程身份、脱敏日志枚举与请求结果判断；未读取、打印或比较 CSSwitch OAuth 文件内容，也未读取原生 `~/.codex`。
 
@@ -41,7 +43,7 @@
 
 编译期根的实际迁移 smoke 在同一个临时 HOME 中同时放置两个 v2 fixture：候选和安装态 Acceptance 启动后，正式 `.csswitch/config.json` 仍为 v2，SHA-256 保持 `97deea942763a3007532c93a03bf7effd84c511ec853d39cc085daaae3e29004`；只有 `.csswitch-acceptance/config.json` 迁移为 v3 并生成自己的 `.v2.bak`。候选与安装态测试进程随后均已停止。
 
-Phase 6 前共享根 artifact 已复制到 `/private/tmp/CSSwitch Acceptance.shared-config-recovery.app`，两个 executable hash 保持旧值；它只作为用户授权后的临时恢复候选，不在 `/Applications` 并存，正式配置验证完成前不得删除。
+Phase 6 前共享根 artifact 当时曾在仓库外保留为临时恢复候选，未在 `/Applications` 并存；该候选不属于当前发布或验收流程。
 
 真实 OAuth、当前账号 live 模型目录、Science 模型选择与实际推理仍未在这个新 artifact 上验收；旧共享根登录不能迁移为该结论，用户应预期重新登录。
 
@@ -80,18 +82,18 @@ Phase 6 前共享根 artifact 已复制到 `/private/tmp/CSSwitch Acceptance.sha
 
 使用全新的 `/private/tmp/csswitch-codex-acceptance-20260717-final` 外层 HOME、独立空默认 Keychain、空 v3 config 和动态端口 `57885/57889`。安装态 Acceptance 从 `/Applications` 启动成功；Codex 实验入口保持默认关闭，随后只停止本轮自有进程。guard 与 `assert-stopped` 通过，测试 Gateway/Science 均停止，真实 Science `8765` 的监听 PID 保持不变。该 smoke 靠显式临时 HOME 隔离，不能证明用户从 Finder 启动时不会读取正式 `$HOME/.csswitch`。
 
-### Phase 6 风险与恢复停线
+### Phase 6 当时的风险与恢复停线
 
 - 当前正式 `/Applications/CSSwitch.app` executable hash 当时未变，只证明 app 文件未替换，不证明真实配置仍是 v2；正式配置状态保持 **unverified**。
-- 不自动读取、修改或降级真实 `$HOME/.csswitch`。必须由用户本人打开正式 0.6.0 验证；若报告版本过新，再取得明确授权后使用已知 v2 backup 或保留的共享根恢复候选。
-- 替换新 Acceptance 前应把本页 artifact 复制到 `/private/tmp/CSSwitch Acceptance.shared-config-recovery.app`，只作临时恢复候选；不得在 `/Applications` 保留第三个 app，正式环境确认前不得删除恢复候选。
+- 当时的停线要求是不自动读取、修改或降级真实 `$HOME/.csswitch`；正式 0.6.0 只能由用户本人打开验证，报告版本过新后才可另行授权恢复。
+- 当时替换新 Acceptance 前保留了一份仓库外恢复候选，并禁止在 `/Applications` 留第三个 app；该步骤已归档，不属于当前 runbook。
 - 新 Phase 6 Acceptance 使用 `$HOME/.csswitch-acceptance`，不会把本页共享根登录视为新 artifact 的登录证据，用户应预期重新登录。
 
-## 当前仍未验收
+## 该候选当时仍未验收
 
 此前用户在 Phase 6 前 Acceptance 上完成浏览器登录并遇到模型校验失败；旧包的 desktop/Gateway hash 与当前安装包不同，因此该操作不算新 artifact 的 live 证据。本轮没有读取、dump 或比较真实 Keychain/OAuth 内容，也没有读取原生 `~/.codex`。
 
-以下项目仍需用户在新安装的 Acceptance 中实际操作后分别记录：
+以下项目在该候选时点仍需用户实际操作后分别记录：
 
 - 浏览器 OAuth 与自动出现 Codex profile；
 - 当前账号 live 目录是否实际返回 Sol/Terra/Luna；

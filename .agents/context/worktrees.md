@@ -1,12 +1,12 @@
-# Worktree 快照
+# Worktree 使用边界
 
-最后复核：2026-07-14。执行任何 Git 写操作前必须重新检查。
+机器上的 worktree 路径、分支、脏状态和数量会持续变化，不适合作为公开主干的固定快照。本文件不记录个人 HOME、临时目录或未提交文件清单。
 
-| 路径 | ref / base | 状态与用途 | 保护边界 |
-|---|---|---|---|
-| `/private/tmp/csswitch-skill-main-merge` | `codex/project-maintenance-docs`，基于 `557a01f` | 本轮 Agent / 文档维护区 | 只允许本轮规则和文档改动 |
-| `/Users/superjj/ccproj/CSswitch` | `codex/rust-gateway-health-identity@512f494` | 15 项 porcelain，开发区 | 不 reset、clean、stage、覆盖或删除 |
-| `/private/tmp/csswitch-v050-acceptance` | `codex/v050-acceptance@356c26a` | 6 项未提交修改，验收跟进 | 不 reset、clean、stage、覆盖或删除 |
-| `/private/tmp/csswitch-skill-install-recovery` | detached `191e9f6` | 大型脏 recovery 实验区 | 未经用户明确确认绝不删除 |
+任何 Git 写操作前都必须实时执行：
 
-状态数量只用于定位，不能代替逐路径清单。分支、remote ref 和 worktree 必须分别报告。
+```bash
+git status --short --branch
+git worktree list --porcelain
+```
+
+报告时分别说明目标 worktree、分支 / detached 状态和未提交修改；不得用本文件、历史 handoff 或其他机器的路径代替实时结果。保护和授权要求见 [Git / worktree 规则](../rules/git-worktrees.md)。

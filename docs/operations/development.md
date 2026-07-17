@@ -1,6 +1,6 @@
 # 开发与维护
 
-本文说明 v0.6.0 源码树的开发入口。安全、Git / worktree 和证据措辞分别以 [`.agents/rules/`](../../.agents/rules/) 为准。
+本文说明 v0.7.0 源码树的开发入口。安全、Git / worktree 和证据措辞分别以 [`.agents/rules/`](../../.agents/rules/) 为准。
 
 ## 环境
 
