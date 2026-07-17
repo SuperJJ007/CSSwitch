@@ -8,11 +8,11 @@ use serde::{Deserialize, Serialize};
 use super::storage::StorageError;
 use super::{
     production_status, run_production_login_async, run_production_logout,
-    run_production_logout_local, AsyncLoginMethod, AuthStatus, LoginControl, LoginProgress,
-    OAuthErrorCode, OAuthFlowError,
+    run_production_logout_local, AuthStatus, LoginControl, LoginProgress, OAuthErrorCode,
+    OAuthFlowError,
 };
 
-const CLI_SCHEMA_VERSION: u32 = 2;
+const CLI_SCHEMA_VERSION: u32 = 3;
 const EXPIRING_WINDOW_SECONDS: i64 = 5 * 60;
 const MAX_NDJSON_LINE_BYTES: usize = 8 * 1024;
 const MAX_NDJSON_TOTAL_BYTES: usize = 64 * 1024;
@@ -50,6 +50,7 @@ impl Command {
 #[derive(Serialize)]
 struct StatusView<'a> {
     authenticated: bool,
+    reason: &'static str,
     account_hash: Option<&'a str>,
     expiry_state: &'static str,
     expires_at: Option<i64>,
@@ -127,7 +128,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         return error_run(
             None,
             "invalid_arguments",
-            "Usage: csswitch-gateway codex-auth login-device|login-browser|status|logout",
+            "Usage: csswitch-gateway codex-auth login-browser|status|logout",
             false,
             2,
         );
@@ -176,7 +177,7 @@ fn production_state_root() -> Result<PathBuf, StorageError> {
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .ok_or_else(|| StorageError::InvalidState("HOME is unavailable or not absolute".into()))?;
-    Ok(home.join(".csswitch"))
+    Ok(super::state_root_from_home(&home))
 }
 
 fn run_cli_with(
@@ -219,6 +220,7 @@ fn success_run(
         command: command.as_str(),
         status: StatusView {
             authenticated: status.authenticated,
+            reason: status.reason.as_str(),
             account_hash: status.account_hash.as_deref(),
             expiry_state,
             expires_at: status.expires_at,
@@ -292,7 +294,7 @@ fn serialize_or_internal(value: &impl Serialize) -> CliRun {
 
 fn internal_serialization_error() -> CliRun {
     CliRun {
-        json: "{\"schema_version\":2,\"ok\":false,\"command\":null,\"error\":{\"code\":\"internal_error\",\"message\":\"Codex auth output could not be encoded\",\"retryable\":false}}".into(),
+        json: "{\"schema_version\":3,\"ok\":false,\"command\":null,\"error\":{\"code\":\"internal_error\",\"message\":\"Codex auth output could not be encoded\",\"retryable\":false}}".into(),
         exit_code: 8,
     }
 }
@@ -304,12 +306,6 @@ struct StreamingEvent<'a> {
     kind: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     state: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    verification_url: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    user_code: Option<&'a str>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expires_at_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     disposition: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -339,6 +335,14 @@ struct CancelInput {
     schema_version: u32,
     operation_id: String,
     command: String,
+}
+
+fn valid_cancel_input(line: &[u8], operation_id: &str) -> bool {
+    serde_json::from_slice::<CancelInput>(line).is_ok_and(|cancel| {
+        cancel.schema_version == CLI_SCHEMA_VERSION
+            && cancel.operation_id == operation_id
+            && cancel.command == "cancel"
+    })
 }
 
 #[derive(Clone)]
@@ -384,12 +388,11 @@ impl NdjsonWriter {
 }
 
 pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
-    let method = match args {
-        [command] if command == "login-device" => AsyncLoginMethod::Device,
-        [command] if command == "login-browser" => AsyncLoginMethod::Browser,
+    match args {
+        [command] if command == "login-browser" => {}
         [command, ..] if command == "login-device" || command == "login-browser" => return Some(2),
         _ => return None,
-    };
+    }
     let operation_id = match std::env::var(OPERATION_ID_ENV) {
         Ok(value) if value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
             value
@@ -398,7 +401,7 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
     };
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (method, operation_id);
+        let _ = operation_id;
         return Some(6);
     }
     #[cfg(target_os = "macos")]
@@ -421,26 +424,9 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
         };
         let result = runtime.block_on(run_production_login_async(
             state_root,
-            method,
             &control,
             move |progress| {
                 let event = match &progress {
-                    LoginProgress::VerificationRequired {
-                        verification_url,
-                        user_code,
-                        expires_at_ms,
-                    } => StreamingEvent {
-                        schema_version: CLI_SCHEMA_VERSION,
-                        operation_id: &progress_operation_id,
-                        kind: "progress",
-                        state: Some("verification_required"),
-                        verification_url: Some(verification_url),
-                        user_code: Some(user_code),
-                        expires_at_ms: Some(*expires_at_ms),
-                        disposition: None,
-                        status: None,
-                        error: None,
-                    },
                     LoginProgress::Waiting => progress_event(&progress_operation_id, "waiting"),
                     LoginProgress::Exchanging => {
                         progress_event(&progress_operation_id, "exchanging")
@@ -477,9 +463,6 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
             operation_id: &operation_id,
             kind: "terminal",
             state: Some(state),
-            verification_url: None,
-            user_code: None,
-            expires_at_ms: None,
             disposition: None,
             status,
             error,
@@ -497,9 +480,6 @@ fn progress_event<'a>(operation_id: &'a str, state: &'a str) -> StreamingEvent<'
         operation_id,
         kind: "progress",
         state: Some(state),
-        verification_url: None,
-        user_code: None,
-        expires_at_ms: None,
         disposition: None,
         status: None,
         error: None,
@@ -533,6 +513,7 @@ fn status_view(now: i64, status: &AuthStatus) -> StatusView<'_> {
     };
     StatusView {
         authenticated: status.authenticated,
+        reason: status.reason.as_str(),
         account_hash: status.account_hash.as_deref(),
         expiry_state,
         expires_at: status.expires_at,
@@ -560,13 +541,7 @@ fn spawn_cancel_reader(operation_id: String, control: LoginControl, writer: Ndjs
         {
             return;
         }
-        let Ok(cancel) = serde_json::from_slice::<CancelInput>(&line) else {
-            return;
-        };
-        if cancel.schema_version != CLI_SCHEMA_VERSION
-            || cancel.operation_id != operation_id
-            || cancel.command != "cancel"
-        {
+        if !valid_cancel_input(&line, &operation_id) {
             return;
         }
         let disposition = control.cancel();
@@ -575,9 +550,6 @@ fn spawn_cancel_reader(operation_id: String, control: LoginControl, writer: Ndjs
             operation_id: &operation_id,
             kind: "cancel_ack",
             state: None,
-            verification_url: None,
-            user_code: None,
-            expires_at_ms: None,
             disposition: Some(disposition.as_str()),
             status: None,
             error: None,
@@ -595,7 +567,6 @@ fn exit_code(code: OAuthErrorCode) -> i32 {
         | OAuthErrorCode::AuthChanged
         | OAuthErrorCode::AuthStateInvalid
         | OAuthErrorCode::CallbackUnavailable
-        | OAuthErrorCode::KeychainUnavailable
         | OAuthErrorCode::Storage
         | OAuthErrorCode::UnsupportedPlatform => 6,
         OAuthErrorCode::OAuthNetwork
@@ -604,15 +575,52 @@ fn exit_code(code: OAuthErrorCode) -> i32 {
         | OAuthErrorCode::OAuthChallengeResponse
         | OAuthErrorCode::ProxyConnectFailed
         | OAuthErrorCode::TlsFailed
-        | OAuthErrorCode::DeviceAuthUnavailable
         | OAuthErrorCode::AuthCancelled => 7,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::AuthStatusReason;
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn legacy_device_login_command_is_rejected_before_any_auth_work() {
+        assert_eq!(run_streaming_cli(&["login-device".into()]), Some(2));
+        assert_eq!(
+            run_streaming_cli(&["login-device".into(), "extra".into()]),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cancel_input_requires_schema_v3_exact_operation_and_fields() {
+        let operation_id = "ab".repeat(16);
+        let v3 = format!(
+            "{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"command\":\"cancel\"}}\n"
+        );
+        assert!(valid_cancel_input(v3.as_bytes(), &operation_id));
+        assert!(!valid_cancel_input(
+            v3.replacen("\"schema_version\":3", "\"schema_version\":2", 1)
+                .as_bytes(),
+            &operation_id,
+        ));
+        assert!(!valid_cancel_input(
+            v3.replacen(&operation_id, &"cd".repeat(16), 1).as_bytes(),
+            &operation_id,
+        ));
+        assert!(!valid_cancel_input(
+            v3.replacen("\"command\":\"cancel\"", "\"command\":\"status\"", 1)
+                .as_bytes(),
+            &operation_id,
+        ));
+        assert!(!valid_cancel_input(
+            v3.replacen("\"command\":", "\"extra\":true,\"command\":", 1)
+                .as_bytes(),
+            &operation_id,
+        ));
+    }
 
     struct FakeCommands {
         result: Result<AuthStatus, OAuthFlowError>,
@@ -631,6 +639,11 @@ mod tests {
     fn status(authenticated: bool, expires_at: Option<i64>) -> AuthStatus {
         AuthStatus {
             authenticated,
+            reason: if authenticated {
+                AuthStatusReason::Ready
+            } else {
+                AuthStatusReason::StateMissing
+            },
             account_hash: authenticated.then(|| "account-hash".into()),
             expires_at,
             auth_epoch: Some("00112233445566778899aabbccddeeff".into()),
@@ -651,9 +664,10 @@ mod tests {
         assert_eq!(run.exit_code, 0);
         assert!(!run.json.contains('\n'));
         let value: Value = serde_json::from_str(&run.json).unwrap();
-        assert_eq!(value["schema_version"], 2);
+        assert_eq!(value["schema_version"], 3);
         assert_eq!(value["ok"], true);
         assert_eq!(value["command"], "status");
+        assert_eq!(value["status"]["reason"], "ready");
         assert_eq!(value["status"]["expiry_state"], "valid");
         assert!(value["status"].get("access_token").is_none());
         assert!(value["status"].get("refresh_token").is_none());

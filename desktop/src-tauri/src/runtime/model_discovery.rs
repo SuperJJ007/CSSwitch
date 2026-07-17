@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -88,6 +89,7 @@ fn build_fetch_models_contract_response(
                 .and_then(|value| value.get("age_seconds"))
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
+            let mut display_names = BTreeMap::new();
             let live: Vec<(String, Option<bool>)> = v
                 .get("data")
                 .and_then(|d| d.as_array())
@@ -95,6 +97,17 @@ fn build_fetch_models_contract_response(
                     arr.iter()
                         .filter_map(|m| {
                             let id = m.get("id")?.as_str()?.to_string();
+                            if let Some(display_name) = m
+                                .get("display_name")
+                                .and_then(Value::as_str)
+                                .filter(|name| {
+                                    !name.is_empty()
+                                        && name.len() <= 512
+                                        && !name.chars().any(char::is_control)
+                                })
+                            {
+                                display_names.insert(id.clone(), display_name.to_string());
+                            }
                             let st = m.get("supports_tools").and_then(|b| b.as_bool());
                             Some((id, st))
                         })
@@ -108,8 +121,17 @@ fn build_fetch_models_contract_response(
                     "stale": false, "age_seconds": 0
                 }));
             }
+            let mut models = merge_and_sort_models(live, builtin);
+            for model in &mut models {
+                let Some(id) = model.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if let Some(display_name) = display_names.get(id) {
+                    model["display_name"] = json!(display_name);
+                }
+            }
             Ok(json!({
-                "models": merge_and_sort_models(live, builtin),
+                "models": models,
                 "source": reported_source,
                 "error_kind": if stale { json!("network") } else { Value::Null },
                 "upstream_status": 200,
@@ -158,11 +180,26 @@ fn live_model_count_from_body(body: &str) -> Result<usize, String> {
         .unwrap_or(0))
 }
 
+pub(crate) fn request_adapter(req: &ModelDiscoveryRequest) -> Result<String, String> {
+    let tid = req.template_id.trim();
+    let tpl = templates::by_id(tid).ok_or_else(|| format!("未知模板：{tid}"))?;
+    let api_format = effective_api_format_from_dir(
+        &config::default_dir(),
+        tpl,
+        req.profile_id.as_deref(),
+        req.api_format.as_deref(),
+    )?;
+    Ok(crate::provider_contracts::contract_for(tid, &api_format)?
+        .adapter
+        .clone())
+}
+
 /// 「获取可用模型」——纯 scratch 探测：只用临时代理探候选 base_url/key 的 /v1/models，
 /// 绝不写 config、不改 AppState、不碰正在服务 Science 的正式代理。
 pub(crate) fn fetch_models(
     app: tauri::AppHandle,
     req: ModelDiscoveryRequest,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<Value, String> {
     let tid = req.template_id.trim();
     let current_cfg =
@@ -199,7 +236,7 @@ pub(crate) fn fetch_models(
             category: tpl.category.to_string(),
             api_format: api_format.clone(),
             credential_source: contract.default_credential_source,
-            credential_ref: (contract.default_credential_source == CredentialSource::KeychainOauth)
+            credential_ref: (contract.default_credential_source == CredentialSource::CsswitchOauth)
                 .then(|| "csswitch:codex:default".to_string()),
             model_policy: contract.default_model_policy,
             ..Default::default()
@@ -213,8 +250,7 @@ pub(crate) fn fetch_models(
     }
     let resolved = resolve_launch_plan(&candidate)?;
     let scratch_plan = resolved.scratch();
-    let _codex_use =
-        crate::commands::codex::ensure_provider_auth_ready(&app, &scratch_plan.provider)?;
+    crate::commands::codex::require_provider_auth_proof(&scratch_plan.provider, auth_proof)?;
     reject_openai_custom_anthropic_base(&scratch_plan.provider, &scratch_plan.endpoint)?;
     let backend = scratch::backend_for_app(&app, &scratch_plan.provider)?;
     let trace = OperationTrace::start(
@@ -235,6 +271,7 @@ pub(crate) fn fetch_models(
         },
         scratch::ProbeKind::Models,
         Some(&trace),
+        auth_proof.map(|proof| proof.exit_cancel_flag()),
     );
     let builtin = tpl.builtin_models;
     let outcome = scratch::classify(res.status);
@@ -362,7 +399,7 @@ mod tests {
         let live = build_fetch_models_contract_response(
             &ProbeOutcome::Ok,
             Some(200),
-            r#"{"data":[{"id":"m-live","supports_tools":true}]}"#,
+            r#"{"data":[{"id":"m-live","display_name":"Codex / GPT-5.6-Sol","supports_tools":true}]}"#,
             &["m-builtin"],
         )
         .unwrap();
@@ -370,7 +407,17 @@ mod tests {
         assert_eq!(live["error_kind"], serde_json::Value::Null);
         assert_eq!(live["upstream_status"], 200);
         assert_eq!(live["models"][0]["id"], "m-live");
+        assert_eq!(live["models"][0]["display_name"], "Codex / GPT-5.6-Sol");
         assert_eq!(live["models"][0]["supports_tools"], true);
+
+        let unsafe_display = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[{"id":"m-live","display_name":"bad\u0001name"}]}"#,
+            &[],
+        )
+        .unwrap();
+        assert!(unsafe_display["models"][0]["display_name"].is_null());
 
         let empty_live = build_fetch_models_contract_response(
             &ProbeOutcome::Ok,
@@ -405,6 +452,46 @@ mod tests {
         assert_eq!(stale["stale"], true);
         assert_eq!(stale["age_seconds"], 301);
         assert_eq!(stale["error_kind"], "network");
+    }
+
+    #[test]
+    fn fetch_models_display_names_match_gateway_safety_bounds() {
+        let ascii_161 = "A".repeat(161);
+        let unicode_510 = "界".repeat(170);
+        let unicode_512 = format!("{}ab", unicode_510);
+        let unicode_513 = "界".repeat(171);
+        let trailing = "Codex / trailing  ";
+        let html_like = "Codex / <b>Sol</b>";
+        let body = serde_json::json!({
+            "data": [
+                {"id": "ascii-161", "display_name": ascii_161},
+                {"id": "unicode-510", "display_name": unicode_510},
+                {"id": "unicode-512", "display_name": unicode_512},
+                {"id": "unicode-513", "display_name": unicode_513},
+                {"id": "trailing", "display_name": trailing},
+                {"id": "c1", "display_name": "bad\u{0085}name"},
+                {"id": "html", "display_name": html_like}
+            ]
+        })
+        .to_string();
+        let response =
+            build_fetch_models_contract_response(&ProbeOutcome::Ok, Some(200), &body, &[]).unwrap();
+        let models = response["models"].as_array().unwrap();
+        let display = |id: &str| {
+            models
+                .iter()
+                .find(|model| model["id"] == id)
+                .and_then(|model| model.get("display_name"))
+                .and_then(serde_json::Value::as_str)
+        };
+
+        assert_eq!(display("ascii-161"), Some(ascii_161.as_str()));
+        assert_eq!(display("unicode-510"), Some(unicode_510.as_str()));
+        assert_eq!(display("unicode-512"), Some(unicode_512.as_str()));
+        assert_eq!(display("unicode-513"), None);
+        assert_eq!(display("trailing"), Some(trailing));
+        assert_eq!(display("c1"), None);
+        assert_eq!(display("html"), Some(html_like));
     }
 
     #[test]

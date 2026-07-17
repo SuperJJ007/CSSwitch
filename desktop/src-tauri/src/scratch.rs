@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::runtime::operation::{self, OperationStage, OperationTrace};
@@ -226,7 +227,15 @@ pub fn scratch_probe(
     target: &ScratchTarget,
     kind: ProbeKind,
     trace: Option<&OperationTrace>,
+    cancel: Option<&AtomicBool>,
 ) -> ProbeResult {
+    let cancelled = || cancel.is_some_and(|flag| flag.load(Ordering::SeqCst));
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
+    }
     let port = match pick_scratch_port() {
         Some(p) => p,
         None => {
@@ -304,6 +313,12 @@ pub fn scratch_probe(
             }
         }
     }
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
+    }
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -318,7 +333,19 @@ pub fn scratch_probe(
     let mut alive = false;
     let mut early_exit = None;
     for _ in 0..(operation::SCRATCH_READY_BUDGET_MS / operation::POLL_INTERVAL_MS) {
+        if cancelled() {
+            return ProbeResult {
+                status: None,
+                body: "临时探测已取消".into(),
+            };
+        }
         std::thread::sleep(Duration::from_millis(operation::POLL_INTERVAL_MS));
+        if cancelled() {
+            return ProbeResult {
+                status: None,
+                body: "临时探测已取消".into(),
+            };
+        }
         match guard.liveness() {
             crate::proc::ChildLiveness::Exited(status) => {
                 early_exit = Some(format!(
@@ -373,6 +400,12 @@ pub fn scratch_probe(
             body: error,
         };
     }
+    if cancelled() {
+        return ProbeResult {
+            status: None,
+            body: "临时探测已取消".into(),
+        };
+    }
     match kind {
         ProbeKind::Models => {
             if let Some(t) = trace {
@@ -383,7 +416,13 @@ pub fn scratch_probe(
             } else {
                 operation::UPSTREAM_PROBE_TIMEOUT_MS
             };
-            match crate::proc::http_get_body(port, Some(&secret), "/v1/models", timeout_ms) {
+            match crate::proc::http_get_body_cancellable(
+                port,
+                Some(&secret),
+                "/v1/models",
+                timeout_ms,
+                cancel,
+            ) {
                 Some((code, body)) => ProbeResult {
                     status: Some(code),
                     body,
@@ -428,6 +467,32 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
+
+    #[test]
+    fn cancelled_probe_never_spawns_the_scratch_gateway() {
+        let cancel = AtomicBool::new(true);
+        let backend = ScratchBackend {
+            bin: PathBuf::from("/definitely/missing/csswitch-gateway"),
+            shim_mode: "off".into(),
+            codex_network_route: None,
+        };
+        let result = scratch_probe(
+            &backend,
+            &ScratchTarget {
+                provider: "codex",
+                key_env: "",
+                base_url: "",
+                key: "",
+                model: None,
+                relay_thinking: "",
+            },
+            ProbeKind::Models,
+            None,
+            Some(&cancel),
+        );
+        assert_eq!(result.status, None);
+        assert_eq!(result.body, "临时探测已取消");
+    }
 
     #[test]
     fn scratch_probe_can_use_rust_backend_for_message_probe() {
@@ -488,6 +553,7 @@ mod tests {
                 relay_thinking: "",
             },
             ProbeKind::Message,
+            None,
             None,
         );
         assert_eq!(result.status, Some(200));

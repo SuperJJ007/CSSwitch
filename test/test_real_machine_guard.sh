@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Offline contract checks for the real-machine guard.  These checks never launch
-# Science, OAuth, or the CSSwitch runtime. On macOS they create only an empty,
-# ephemeral Keychain inside the temporary Acceptance HOME.
+# Science, OAuth, the CSSwitch runtime, or any Keychain operation.
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,6 +19,9 @@ fail() { echo "FAIL: $*" >&2; FAILS=$((FAILS + 1)); }
 mkdir -p "$REAL_HOME/.csswitch"
 printf '%s\n' 'real-config-sentinel' >"$REAL_HOME/.csswitch/config.json"
 REAL_BEFORE="$(shasum -a 256 "$REAL_HOME/.csswitch/config.json" | awk '{print $1}')"
+mkdir -p "$REAL_HOME/.csswitch-acceptance"
+printf '%s\n' 'real-acceptance-sentinel' >"$REAL_HOME/.csswitch-acceptance/config.json"
+REAL_ACCEPTANCE_BEFORE="$(shasum -a 256 "$REAL_HOME/.csswitch-acceptance/config.json" | awk '{print $1}')"
 
 guard() {
   HOME="$REAL_HOME" \
@@ -34,17 +36,10 @@ else
   fail "preflight failed"
 fi
 
-if [ "$(uname -s)" = "Darwin" ]; then
-  ACCEPTANCE_KEYCHAIN="$(cd "$ACCEPTANCE_ROOT/home/Library/Keychains" 2>/dev/null && pwd -P)/login.keychain-db"
-  DEFAULT_KEYCHAIN="$(HOME="$ACCEPTANCE_ROOT/home" security default-keychain -d user 2>/dev/null || true)"
-  DEFAULT_KEYCHAIN="$(printf '%s\n' "$DEFAULT_KEYCHAIN" | \
-    sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
-  if [ -f "$ACCEPTANCE_KEYCHAIN" ] && [ ! -L "$ACCEPTANCE_KEYCHAIN" ] && \
-     [ "$DEFAULT_KEYCHAIN" = "$ACCEPTANCE_KEYCHAIN" ]; then
-    pass "preflight creates and selects an isolated Acceptance Keychain"
-  else
-    fail "preflight did not select the isolated Acceptance Keychain"
-  fi
+if [ ! -e "$ACCEPTANCE_ROOT/home/Library/Keychains" ]; then
+  pass "preflight performs no Keychain setup"
+else
+  fail "preflight unexpectedly created a Keychain directory"
 fi
 
 ENV_OUT="$(guard env 2>/dev/null || true)"
@@ -77,7 +72,7 @@ else
   fail "prepare-codex failed"
 fi
 
-CFG="$ACCEPTANCE_ROOT/home/.csswitch/config.json"
+CFG="$ACCEPTANCE_ROOT/home/.csswitch-acceptance/config.json"
 if jq -e \
   --argjson proxy "$PROXY_PORT" \
   --argjson sandbox "$SANDBOX_PORT" \
@@ -96,7 +91,7 @@ else
 fi
 
 if [ "$(stat -f '%Lp' "$CFG")" = 600 ] && \
-   [ "$(stat -f '%Lp' "$ACCEPTANCE_ROOT/home/.csswitch")" = 700 ]; then
+   [ "$(stat -f '%Lp' "$ACCEPTANCE_ROOT/home/.csswitch-acceptance")" = 700 ]; then
   pass "Codex fixture permissions are 0600/0700"
 else
   fail "Codex fixture permissions are too broad"
@@ -121,20 +116,36 @@ else
   fail "real-HOME sentinel changed"
 fi
 
-if grep -q -- '--features acceptance-keychain' \
-     "$ROOT/docs/operations/real-machine-acceptance.md" && \
-   grep -q '^acceptance-keychain = \[\]$' "$ROOT/desktop/src-tauri/Cargo.toml" && \
-   grep -q '^acceptance-keychain = \[\]$' "$ROOT/desktop/gateway/Cargo.toml" && \
-   grep -q 'CARGO_FEATURE_ACCEPTANCE_KEYCHAIN' "$ROOT/desktop/src-tauri/build.rs" && \
-   grep -q 'Acceptance Keychain build cannot skip Gateway staging' \
-     "$ROOT/desktop/src-tauri/build.rs" && \
-   grep -q 'CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE' \
-     "$ROOT/desktop/gateway/src/main.rs" && \
-   grep -q 'com.csswitch.acceptance.codex.oauth.v1' \
-     "$ROOT/desktop/gateway/src/codex_auth/storage.rs"; then
-  pass "Acceptance build is pinned to a compile-time isolated Keychain namespace"
+REAL_ACCEPTANCE_AFTER="$(shasum -a 256 "$REAL_HOME/.csswitch-acceptance/config.json" | awk '{print $1}')"
+if [ "$REAL_ACCEPTANCE_BEFORE" = "$REAL_ACCEPTANCE_AFTER" ]; then
+  pass "real-HOME Acceptance sentinel was not modified"
 else
-  fail "Acceptance Keychain namespace build contract is incomplete"
+  fail "real-HOME Acceptance sentinel changed"
+fi
+
+if grep -q -- '--features acceptance-build' \
+     "$ROOT/docs/operations/real-machine-acceptance.md" && \
+   grep -q '^acceptance-build = \[\]$' "$ROOT/desktop/src-tauri/Cargo.toml" && \
+   grep -q '^acceptance-build = \[\]$' "$ROOT/desktop/gateway/Cargo.toml" && \
+   grep -q 'CARGO_FEATURE_ACCEPTANCE_BUILD' "$ROOT/desktop/src-tauri/build.rs" && \
+   ! grep -q 'CSSWITCH_SIGNING_TEAM_ID' "$ROOT/desktop/src-tauri/build.rs" && \
+   [ ! -e "$ROOT/desktop/src-tauri/src/code_identity.rs" ] && \
+   [ ! -e "$ROOT/desktop/gateway/src/code_identity.rs" ] && \
+   [ ! -e "$ROOT/scripts/sign-csswitch-macos.sh" ] && \
+   ! grep -q 'signingIdentity.*"-"' "$ROOT/desktop/src-tauri/tauri.conf.json" && \
+   grep -q 'CSSwitch builds cannot skip Gateway staging' \
+     "$ROOT/desktop/src-tauri/build.rs" && \
+   ! grep -q 'CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE' \
+     "$ROOT/desktop/gateway/src/main.rs" && \
+   grep -q 'OAUTH_SECRET_FILE.*codex-oauth.v1.json' \
+     "$ROOT/desktop/gateway/src/codex_auth/storage.rs" && \
+   grep -q 'CONFIG_DIR_NAME: &str = ".csswitch-acceptance"' \
+     "$ROOT/desktop/src-tauri/src/config.rs" && \
+   grep -q 'CODEX_STATE_DIR_NAME: &str = ".csswitch-acceptance"' \
+     "$ROOT/desktop/gateway/src/codex_auth/mod.rs"; then
+  pass "Acceptance build is pinned to an isolated data root and needs no signing or Keychain"
+else
+  fail "Acceptance no-signing file-storage isolation contract is incomplete"
 fi
 
 if HOME="$REAL_HOME" \

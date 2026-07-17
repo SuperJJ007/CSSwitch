@@ -46,7 +46,6 @@ pub enum OAuthErrorCode {
     BrowserOpenFailed,
     CallbackTimeout,
     CallbackUnavailable,
-    KeychainUnavailable,
     NotAuthenticated,
     OAuthDenied,
     OAuthNetwork,
@@ -55,7 +54,6 @@ pub enum OAuthErrorCode {
     OAuthChallengeResponse,
     ProxyConnectFailed,
     TlsFailed,
-    DeviceAuthUnavailable,
     AuthCancelled,
     Storage,
     UnsupportedPlatform,
@@ -70,7 +68,6 @@ impl OAuthErrorCode {
             Self::BrowserOpenFailed => "browser_open_failed",
             Self::CallbackTimeout => "callback_timeout",
             Self::CallbackUnavailable => "callback_unavailable",
-            Self::KeychainUnavailable => "keychain_unavailable",
             Self::NotAuthenticated => "not_authenticated",
             Self::OAuthDenied => "oauth_denied",
             Self::OAuthNetwork => "oauth_network_error",
@@ -79,7 +76,6 @@ impl OAuthErrorCode {
             Self::OAuthChallengeResponse => "oauth_challenge_response",
             Self::ProxyConnectFailed => "proxy_connect_failed",
             Self::TlsFailed => "tls_failed",
-            Self::DeviceAuthUnavailable => "device_auth_unavailable",
             Self::AuthCancelled => "auth_cancelled",
             Self::Storage => "auth_storage_error",
             Self::UnsupportedPlatform => "unsupported_platform",
@@ -140,11 +136,6 @@ impl From<StorageError> for OAuthFlowError {
                 false,
                 "Codex authentication state is invalid",
             ),
-            StorageError::KeychainUnavailable(_) => Self::new(
-                OAuthErrorCode::KeychainUnavailable,
-                false,
-                "The CSSwitch Codex Keychain item is unavailable",
-            ),
             StorageError::NotAuthenticated => Self::new(
                 OAuthErrorCode::NotAuthenticated,
                 false,
@@ -153,11 +144,11 @@ impl From<StorageError> for OAuthFlowError {
             StorageError::UnsupportedPlatform => Self::new(
                 OAuthErrorCode::UnsupportedPlatform,
                 false,
-                "Codex Keychain authentication is supported only on macOS",
+                "Codex authentication storage is unsupported on this platform",
             ),
             StorageError::Unavailable(_) | StorageError::RollbackFailed => Self::new(
                 OAuthErrorCode::Storage,
-                false,
+                true,
                 "Codex credentials could not be stored safely",
             ),
         }
@@ -1684,10 +1675,6 @@ mod tests {
             (
                 StorageError::InvalidState("private detail".into()),
                 OAuthErrorCode::AuthStateInvalid,
-            ),
-            (
-                StorageError::KeychainUnavailable("private detail".into()),
-                OAuthErrorCode::KeychainUnavailable,
             ),
             (
                 StorageError::UnsupportedPlatform,

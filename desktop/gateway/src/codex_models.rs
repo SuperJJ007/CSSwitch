@@ -13,7 +13,7 @@ use reqwest::blocking::{Client, Response};
 use reqwest::header::{
     HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_LENGTH, ETAG, IF_NONE_MATCH, USER_AGENT,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{json, Value};
 use zeroize::Zeroizing;
 
@@ -24,10 +24,10 @@ use crate::provider_contracts::CodexRuntimeContract;
 
 const MODELS_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/models";
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
-const CACHE_FILE: &str = "codex-models-cache.v2.json";
-const CACHE_EPOCH_FILE: &str = "codex-models-cache-epoch.v2.json";
-const CACHE_LOCK_FILE: &str = "codex-models-cache.v2.lock";
-const CACHE_VERSION: u32 = 2;
+const CACHE_FILE: &str = "codex-models-cache.v3.json";
+const CACHE_EPOCH_FILE: &str = "codex-models-cache-epoch.v3.json";
+const CACHE_LOCK_FILE: &str = "codex-models-cache.v3.lock";
+const CACHE_VERSION: u32 = 3;
 #[cfg(test)]
 const NORMAL_TTL_SECONDS: u64 = 5 * 60;
 #[cfg(test)]
@@ -61,6 +61,7 @@ struct CachedModel {
     supported_reasoning_efforts: Vec<String>,
     supports_reasoning_summary: bool,
     supports_parallel_tool_calls: bool,
+    use_responses_lite: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -177,14 +178,14 @@ struct OfficialModel {
     default_reasoning_level: Option<String>,
     #[serde(default)]
     supported_reasoning_levels: Vec<OfficialReasoningLevel>,
-    #[serde(
-        default = "default_true",
-        rename = "supports_reasoning_summaries",
-        alias = "supports_reasoning_summary_parameter"
-    )]
-    supports_reasoning_summaries: bool,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    supports_reasoning_summaries: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_optional_bool")]
+    supports_reasoning_summary_parameter: Option<bool>,
     #[serde(default)]
     supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    use_responses_lite: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -192,8 +193,19 @@ struct OfficialReasoningLevel {
     effort: String,
 }
 
-fn default_true() -> bool {
-    true
+impl OfficialModel {
+    fn supports_reasoning_summary(&self) -> bool {
+        self.supports_reasoning_summaries
+            .or(self.supports_reasoning_summary_parameter)
+            .unwrap_or(true)
+    }
+}
+
+fn deserialize_optional_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    bool::deserialize(deserializer).map(Some)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -264,6 +276,10 @@ impl ResolvedCodexModel<'_> {
 
     pub(crate) fn supports_parallel_tool_calls(&self) -> bool {
         self.model.supports_parallel_tool_calls
+    }
+
+    pub(crate) fn use_responses_lite(&self) -> bool {
+        self.model.use_responses_lite
     }
 }
 
@@ -967,18 +983,22 @@ fn parse_live_response(mut response: Response) -> Result<FetchResult, CodexModel
     let mut models: Vec<CachedModel> = official
         .into_iter()
         .filter(|model| model.visibility == "list")
-        .map(|model| CachedModel {
-            id: model.slug,
-            display_name: model.display_name,
-            priority: model.priority,
-            default_reasoning_effort: model.default_reasoning_level,
-            supported_reasoning_efforts: model
-                .supported_reasoning_levels
-                .into_iter()
-                .map(|level| level.effort)
-                .collect(),
-            supports_reasoning_summary: model.supports_reasoning_summaries,
-            supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+        .map(|model| {
+            let supports_reasoning_summary = model.supports_reasoning_summary();
+            CachedModel {
+                id: model.slug,
+                display_name: model.display_name,
+                priority: model.priority,
+                default_reasoning_effort: model.default_reasoning_level,
+                supported_reasoning_efforts: model
+                    .supported_reasoning_levels
+                    .into_iter()
+                    .map(|level| level.effort)
+                    .collect(),
+                supports_reasoning_summary,
+                supports_parallel_tool_calls: model.supports_parallel_tool_calls,
+                use_responses_lite: model.use_responses_lite,
+            }
         })
         .collect();
     models.sort_by(|left, right| {
@@ -1062,6 +1082,7 @@ fn official_model_schema_error(entry: &Value) -> &'static str {
         "supports_reasoning_summaries",
         "supports_reasoning_summary_parameter",
         "supports_parallel_tool_calls",
+        "use_responses_lite",
     ] {
         if object.get(field).is_some_and(|value| !value.is_boolean()) {
             return "Codex model catalog capability field is invalid";
@@ -1234,8 +1255,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        parse_official_models, CatalogSource, CodexModelCatalog, ModelsCacheFile, CACHE_EPOCH_FILE,
-        CACHE_FILE,
+        parse_official_models, science_model_alias, CatalogSource, CodexModelCatalog,
+        ModelsCacheFile, CACHE_EPOCH_FILE, CACHE_FILE,
     };
     use crate::codex_auth::InferenceSecrets;
 
@@ -1305,6 +1326,7 @@ mod tests {
                     "supported_reasoning_levels": [{"effort": "medium", "description": "default"}],
                     "supports_reasoning_summary_parameter": true,
                     "supports_parallel_tool_calls": true,
+                    "use_responses_lite": false,
                 })
             })
             .collect();
@@ -1348,6 +1370,80 @@ mod tests {
             invalid_levels.detail,
             "Codex model catalog reasoning levels field is invalid"
         );
+
+        for field in [
+            "supports_reasoning_summaries",
+            "supports_reasoning_summary_parameter",
+        ] {
+            for invalid in [Value::Null, json!("true"), json!(1)] {
+                let mut entry = json!({
+                    "slug": "gpt-test",
+                    "display_name": "GPT Test",
+                    "visibility": "list",
+                    "priority": 1
+                });
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .insert(field.to_string(), invalid);
+                let body = serde_json::to_vec(&json!({"models": [entry]})).unwrap();
+                let error = parse_official_models(&body).unwrap_err();
+                assert_eq!(
+                    error.detail,
+                    "Codex model catalog capability field is invalid"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn official_summary_capability_prefers_canonical_then_legacy_then_default() {
+        let entry = |slug: &str, capabilities: Value| {
+            let mut entry = json!({
+                "slug": slug,
+                "display_name": slug,
+                "visibility": "list",
+                "priority": 1
+            });
+            entry.as_object_mut().unwrap().extend(
+                capabilities
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            entry
+        };
+        let body = serde_json::to_vec(&json!({"models": [
+            entry("canonical-only", json!({"supports_reasoning_summaries": false})),
+            entry("legacy-only", json!({"supports_reasoning_summary_parameter": false})),
+            entry("canonical-true", json!({
+                "supports_reasoning_summaries": true,
+                "supports_reasoning_summary_parameter": false
+            })),
+            entry("canonical-false", json!({
+                "supports_reasoning_summaries": false,
+                "supports_reasoning_summary_parameter": true
+            })),
+            entry("missing", json!({}))
+        ]}))
+        .unwrap();
+
+        let models = parse_official_models(&body).unwrap();
+        let normalized: Vec<(&str, bool)> = models
+            .iter()
+            .map(|model| (model.slug.as_str(), model.supports_reasoning_summary()))
+            .collect();
+        assert_eq!(
+            normalized,
+            [
+                ("canonical-only", false),
+                ("legacy-only", false),
+                ("canonical-true", true),
+                ("canonical-false", false),
+                ("missing", true),
+            ]
+        );
     }
 
     type MockModelsServer = (
@@ -1388,7 +1484,7 @@ mod tests {
         let body = serde_json::to_vec(&json!({"models": [
             {"slug":"hidden","display_name":"Hidden","visibility":"hide","supported_in_api":true,"priority":0,"default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"supports_reasoning_summaries":false,"supports_parallel_tool_calls":false},
             {"slug":"chatgpt-only","display_name":"ChatGPT Only","visibility":"list","supported_in_api":false,"priority":1,"default_reasoning_level":"low","supported_reasoning_levels":[{"effort":"low"}],"supports_reasoning_summaries":false,"supports_parallel_tool_calls":false},
-            {"slug":"gpt-b","display_name":"B","visibility":"list","supported_in_api":true,"priority":3,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"medium"},{"effort":"high"}],"supports_reasoning_summaries":true,"supports_parallel_tool_calls":true},
+            {"slug":"gpt-b","display_name":"B","visibility":"list","supported_in_api":true,"priority":3,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"medium"},{"effort":"high"}],"supports_reasoning_summaries":true,"supports_parallel_tool_calls":true,"use_responses_lite":true},
             {"slug":"gpt-a","display_name":"A","visibility":"list","supported_in_api":true,"priority":2,"default_reasoning_level":"medium","supported_reasoning_levels":[{"effort":"medium"}],"supports_reasoning_summaries":true,"supports_parallel_tool_calls":false}
         ]})).unwrap();
         let (endpoint, count, requests, server) =
@@ -1443,6 +1539,7 @@ mod tests {
         assert_eq!(cached_b.supported_reasoning_efforts, ["medium", "high"]);
         assert!(cached_b.supports_reasoning_summary);
         assert!(cached_b.supports_parallel_tool_calls);
+        assert!(cached_b.use_responses_lite);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -1489,6 +1586,92 @@ mod tests {
         assert!(cache.models[0].supports_reasoning_summary);
         assert!(!cache.models[0].supports_parallel_tool_calls);
         server.join().unwrap();
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn gpt_5_6_visible_models_keep_priority_display_alias_and_reverse_mapping() {
+        let body = serde_json::to_vec(&json!({"models": [
+            {
+                "slug": "gpt-5.6-luna",
+                "display_name": "GPT-5.6-Luna",
+                "visibility": "list",
+                "priority": 3,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": true
+            },
+            {
+                "slug": "gpt-5.6-hidden",
+                "display_name": "GPT-5.6-Hidden",
+                "visibility": "hide",
+                "priority": 0,
+                "supports_reasoning_summaries": true
+            },
+            {
+                "slug": "gpt-5.6-sol",
+                "display_name": "GPT-5.6-Sol",
+                "visibility": "list",
+                "priority": 1,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": true
+            },
+            {
+                "slug": "gpt-5.6-terra",
+                "display_name": "GPT-5.6-Terra",
+                "visibility": "list",
+                "priority": 2,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": true
+            }
+        ]}))
+        .unwrap();
+        let (endpoint, _count, _requests, server) =
+            serve_responses(vec![response("200 OK", &body, "")]);
+        let root = private_root();
+        let snapshot = CodexModelCatalog::for_test(endpoint, root.clone())
+            .unwrap()
+            .list_at(&secrets(), 10_000)
+            .unwrap();
+        server.join().unwrap();
+
+        let response = snapshot.response_body();
+        let data = response["data"].as_array().unwrap();
+        let ids: Vec<&str> = data
+            .iter()
+            .map(|model| model["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "claude-csswitch-codex-gpt-5.6-sol",
+                "claude-csswitch-codex-gpt-5.6-terra",
+                "claude-csswitch-codex-gpt-5.6-luna",
+            ]
+        );
+        assert_eq!(data[0]["display_name"], "Codex / GPT-5.6-Sol");
+        assert_eq!(data[1]["display_name"], "Codex / GPT-5.6-Terra");
+        assert_eq!(data[2]["display_name"], "Codex / GPT-5.6-Luna");
+        for raw_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
+            let alias = science_model_alias(raw_id);
+            assert_eq!(
+                snapshot.resolve_science_model(&alias).unwrap().raw_id(),
+                raw_id
+            );
+            assert!(snapshot
+                .resolve_science_model(&alias)
+                .unwrap()
+                .use_responses_lite());
+        }
+        assert!(snapshot
+            .resolve_science_model("claude-csswitch-codex-gpt-5.6-hidden")
+            .is_none());
+        assert!(snapshot
+            .resolve_science_model("claude-csswitch-codex-gpt-5.6-absent")
+            .is_none());
+        assert!(snapshot
+            .resolve_science_model("claude-csswitch-codex-gpt-5.6-terra")
+            .is_some_and(|model| model.supports_reasoning_summary()));
+
         let _ = fs::remove_dir_all(root);
     }
 

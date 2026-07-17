@@ -3,137 +3,83 @@ mod login_async;
 mod oauth;
 mod storage;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use cli::{run_cli, run_streaming_cli, CliRun};
-pub use login_async::{AsyncLoginMethod, CancelDisposition, LoginControl, LoginProgress};
+pub use login_async::{CancelDisposition, LoginControl, LoginProgress};
 pub use oauth::{OAuthErrorCode, OAuthFlowError};
-pub use storage::AuthStatus;
 pub(crate) use storage::InferenceSecrets;
+pub use storage::{AuthStatus, AuthStatusReason};
 
-pub const OAUTH_KEYCHAIN_SERVICE: &str = storage::OAUTH_KEYCHAIN_SERVICE;
+#[cfg(not(feature = "acceptance-build"))]
+pub(crate) const CODEX_STATE_DIR_NAME: &str = ".csswitch";
+#[cfg(feature = "acceptance-build")]
+pub(crate) const CODEX_STATE_DIR_NAME: &str = ".csswitch-acceptance";
 
-pub fn expected_keychain_service_matches(expected: Option<&str>) -> bool {
-    expected.is_none_or(|value| value == OAUTH_KEYCHAIN_SERVICE)
+pub(crate) fn state_root_from_home(home: &Path) -> PathBuf {
+    home.join(CODEX_STATE_DIR_NAME)
 }
 
 pub(crate) fn production_inference_snapshot(
     state_root: PathBuf,
 ) -> Result<InferenceSecrets, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        storage::AuthRepository::production(state_root)
-            .inference_snapshot()
-            .map_err(OAuthFlowError::from)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    storage::AuthRepository::production(state_root)
+        .inference_snapshot()
+        .map_err(OAuthFlowError::from)
 }
 
 pub fn run_production_login(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        let repository = storage::AuthRepository::production(state_root);
-        let transport = oauth::HttpOAuthTransport::production()?;
-        oauth::run_login_flow(
-            &repository,
-            &oauth::SystemBrowser,
-            &transport,
-            &oauth::LoginOptions::production(),
-        )
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    let repository = storage::AuthRepository::production(state_root);
+    let transport = oauth::HttpOAuthTransport::production()?;
+    oauth::run_login_flow(
+        &repository,
+        &oauth::SystemBrowser,
+        &transport,
+        &oauth::LoginOptions::production(),
+    )
 }
 
 pub async fn run_production_login_async<F>(
     state_root: PathBuf,
-    method: AsyncLoginMethod,
     control: &LoginControl,
     progress: F,
 ) -> Result<AuthStatus, OAuthFlowError>
 where
     F: Fn(LoginProgress),
 {
-    #[cfg(target_os = "macos")]
-    {
-        let repository = storage::AuthRepository::production(state_root);
-        login_async::run_production_login(&repository, method, control, progress).await
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (state_root, method, control, progress);
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    let repository = storage::AuthRepository::production(state_root);
+    login_async::run_production_login(&repository, control, progress).await
 }
 
 pub fn production_status(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        storage::AuthRepository::production(state_root)
-            .status()
-            .map_err(OAuthFlowError::from)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    storage::AuthRepository::production(state_root)
+        .status()
+        .map_err(OAuthFlowError::from)
 }
 
 pub fn refresh_production_for_generation(
     state_root: PathBuf,
     expected_generation: u64,
 ) -> Result<AuthStatus, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        let repository = storage::AuthRepository::production(state_root);
-        let transport = oauth::HttpOAuthTransport::production()?;
-        refresh_for_generation(&repository, &transport, expected_generation)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (state_root, expected_generation);
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    let repository = storage::AuthRepository::production(state_root);
+    let transport = oauth::HttpOAuthTransport::production()?;
+    refresh_for_generation(&repository, &transport, expected_generation)
 }
 
 pub fn run_production_logout(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        let repository = storage::AuthRepository::production(state_root);
-        let transport = oauth::HttpOAuthTransport::production().ok();
-        run_logout(
-            &repository,
-            transport
-                .as_ref()
-                .map(|transport| transport as &dyn oauth::RevokeTransport),
-        )
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    let repository = storage::AuthRepository::production(state_root);
+    let transport = oauth::HttpOAuthTransport::production().ok();
+    run_logout(
+        &repository,
+        transport
+            .as_ref()
+            .map(|transport| transport as &dyn oauth::RevokeTransport),
+    )
 }
 
 pub fn run_production_logout_local(state_root: PathBuf) -> Result<AuthStatus, OAuthFlowError> {
-    #[cfg(target_os = "macos")]
-    {
-        let repository = storage::AuthRepository::production(state_root);
-        run_logout(&repository, None)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = state_root;
-        Err(storage::StorageError::UnsupportedPlatform.into())
-    }
+    let repository = storage::AuthRepository::production(state_root);
+    run_logout(&repository, None)
 }
 
 fn refresh_for_generation<S, T, R>(
@@ -395,47 +341,17 @@ mod lifecycle_tests {
     }
 }
 
-#[cfg(all(test, not(target_os = "macos")))]
-mod non_macos_tests {
-    use super::*;
-
-    #[test]
-    fn production_facades_fail_before_touching_state() {
-        let root = std::env::temp_dir().join("csswitch-codex-non-macos-must-not-exist");
-        assert!(!root.exists());
-        assert_eq!(
-            run_production_login(root.clone()).unwrap_err().code,
-            OAuthErrorCode::UnsupportedPlatform
-        );
-        assert_eq!(
-            production_status(root.clone()).unwrap_err().code,
-            OAuthErrorCode::UnsupportedPlatform
-        );
-        assert_eq!(
-            refresh_production_for_generation(root.clone(), 1)
-                .unwrap_err()
-                .code,
-            OAuthErrorCode::UnsupportedPlatform
-        );
-        assert_eq!(
-            run_production_logout(root.clone()).unwrap_err().code,
-            OAuthErrorCode::UnsupportedPlatform
-        );
-        assert!(!root.exists());
-    }
-}
-
 #[cfg(test)]
 mod handshake_tests {
     use super::*;
 
     #[test]
-    fn managed_keychain_service_handshake_is_checked_before_auth_dispatch() {
-        assert!(expected_keychain_service_matches(None));
-        assert!(expected_keychain_service_matches(Some(
-            OAUTH_KEYCHAIN_SERVICE
-        )));
-        assert!(!expected_keychain_service_matches(Some("wrong.service")));
-        assert!(!expected_keychain_service_matches(Some("")));
+    fn auth_state_root_is_compile_time_isolated_by_build_variant() {
+        let home = Path::new("/tmp/csswitch-home-contract");
+        let got = state_root_from_home(home);
+        #[cfg(feature = "acceptance-build")]
+        assert_eq!(got, home.join(".csswitch-acceptance"));
+        #[cfg(not(feature = "acceptance-build"))]
+        assert_eq!(got, home.join(".csswitch"));
     }
 }

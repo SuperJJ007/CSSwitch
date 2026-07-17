@@ -3,7 +3,8 @@
 
 use std::io::{Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildLiveness {
@@ -267,17 +268,32 @@ pub fn http_post_status(
 /// 向本地回环代理 GET 一段路径（`GET /<secret><path>`），返回 (状态码, 响应体)。
 /// 连不上 / 无响应返回 None。用于经代理回源拉中转站 `/v1/models`——代理有 TLS（urllib），
 /// 这里只打回环明文，无需在 Rust 侧引 TLS。timeout_ms 要给足（代理要转发上游），建议 ~15000。
-pub fn http_get_body(
+#[cfg(test)]
+fn http_get_body(
     port: u16,
     secret: Option<&str>,
     path_suffix: &str,
     timeout_ms: u64,
 ) -> Option<(u16, String)> {
+    http_get_body_cancellable(port, secret, path_suffix, timeout_ms, None)
+}
+
+pub fn http_get_body_cancellable(
+    port: u16,
+    secret: Option<&str>,
+    path_suffix: &str,
+    timeout_ms: u64,
+    cancel: Option<&AtomicBool>,
+) -> Option<(u16, String)> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return None;
+    }
     let addr = ("127.0.0.1", port).to_socket_addrs().ok()?.next()?;
     let dur = Duration::from_millis(timeout_ms);
     let mut stream = TcpStream::connect_timeout(&addr, dur).ok()?;
-    let _ = stream.set_read_timeout(Some(dur));
-    let _ = stream.set_write_timeout(Some(dur));
+    let poll = Duration::from_millis(250);
+    let _ = stream.set_read_timeout(Some(poll.min(dur)));
+    let _ = stream.set_write_timeout(Some(poll.min(dur)));
     let path = match secret {
         Some(s) if !s.is_empty() => format!("/{s}{path_suffix}"),
         _ => path_suffix.to_string(),
@@ -287,13 +303,27 @@ pub fn http_get_body(
     // 读完整响应（状态行 + 头 + 体）。上限防呆：模型列表通常 < 数十 KB，给 1 MiB。
     let mut buf = Vec::new();
     let mut chunk = [0u8; 4096];
+    let deadline = Instant::now() + dur;
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            return None;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = stream.set_read_timeout(Some(poll.min(remaining)));
         if buf.len() > 1_048_576 {
             break;
         }
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
             Err(_) => break,
         }
     }
@@ -351,6 +381,8 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use std::process::Command;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn loopback_port_occupancy_probe_detects_listener_without_http() {
@@ -420,6 +452,29 @@ mod tests {
     fn health_false_when_nothing_listening() {
         // 一个几乎肯定没人监听的高端口。
         assert!(!http_health(59999, None, 300));
+    }
+
+    #[test]
+    fn cancellable_get_interrupts_a_stalled_local_response() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 256];
+            let _ = stream.read(&mut request);
+            thread::sleep(Duration::from_millis(600));
+        });
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let started = Instant::now();
+        assert!(http_get_body_cancellable(port, None, "/slow", 10_000, Some(&cancel)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
     }
 
     #[test]

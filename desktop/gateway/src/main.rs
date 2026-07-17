@@ -1,17 +1,6 @@
 fn main() {
     let args_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if args_os.get(1).and_then(|arg| arg.to_str()) == Some("codex-auth") {
-        let expected_service = std::env::var("CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE").ok();
-        if !csswitch_gateway::codex_auth::expected_keychain_service_matches(
-            expected_service.as_deref(),
-        ) {
-            use std::io::Write as _;
-            let _ = writeln!(
-                std::io::stdout().lock(),
-                "{{\"schema_version\":2,\"ok\":false,\"command\":null,\"error\":{{\"code\":\"internal_error\",\"message\":\"Codex auth sidecar build identity mismatch.\",\"retryable\":false}}}}"
-            );
-            std::process::exit(8);
-        }
         let codex_args = args_os[2..]
             .iter()
             .map(|arg| arg.to_str().map(str::to_string))

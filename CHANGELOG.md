@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.7.0] — 2026-07-17
+
+### Added
+
+- Added an off-by-default Codex → Claude Science bridge with a separate CSSwitch browser OAuth flow, automatic canonical Codex profile creation, and dynamic account model discovery.
+- Added Responses/SSE translation for text, reasoning, tools, parallel tool calls, encrypted reasoning continuation, streaming, and non-streaming Science requests.
+- Added one Codex network resolver shared by login, refresh, model discovery, scratch/formal gateways, and inference, with direct, environment, HTTP(S), SOCKS5, and SOCKS5h routes.
+- Added cancellable login operations, exclusive authentication preflight, structured status/error reasons, safe logout, v3 config migration, and isolated Acceptance data roots.
+- Replaced the app icon with the selected orange rounded-square switch design, including transparent corners and regenerated macOS/Windows icon assets.
+
+### Fixed
+
+- Accept bounded Codex SSE responses whose upstream omits `Content-Type`, while continuing to reject HTML, JSON errors, challenge pages, empty bodies, and unrelated payloads without resending inference requests.
+- Prevent repeated authentication sidecars, stuck lifecycle locks, orphaned scratch processes, stale model-catalog reuse across auth generations, and configuration changes racing a successful preflight.
+- Keep ad-hoc builds independent of macOS Keychain and Apple signing identities by storing only CSSwitch-owned Codex records in hardened private files.
+
+### Safety and upgrade notes
+
+- CSSwitch never reads, reuses, modifies, or deletes native `~/.codex` login state. Codex credentials are single-account, CSSwitch-owned records with `0700/0600` permissions, no symlinks, atomic commits, and generation/CAS checks.
+- Version 0.7.0 migrates v1/v2 config to v3 with non-overwriting backups. Before rolling back to 0.6.0, use 0.7.0's “Export and downgrade to v2” flow or restore the migration-created v2 backup after all CSSwitch processes stop; deleting profiles alone does not change the schema. OAuth files are not exported or modified by downgrade.
+- Codex remains experimental and off by default. Browser login is supported; device-code login, multi-account, proxy authentication, PAC, custom CAs, system-proxy discovery, and TUN detection are not.
+- The release remains macOS Apple Silicon only, ad-hoc signed, and not notarized. Apple Development or Developer ID signing is not required for Codex login.
+
 ## [0.6.0] — 2026-07-16
 
 ### Added

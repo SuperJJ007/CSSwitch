@@ -160,7 +160,8 @@ impl ScienceVersionCache {
     }
 }
 
-/// 沙箱可写工作目录（独立 HOME）：`~/.csswitch/sandbox/home`。
+/// 沙箱可写工作目录（独立 HOME）：由构建变体配置根派生；正式构建为
+/// `~/.csswitch/sandbox/home`，Acceptance 为 `~/.csswitch-acceptance/sandbox/home`。
 pub(crate) fn sandbox_home() -> PathBuf {
     config::default_dir().join("sandbox").join("home")
 }

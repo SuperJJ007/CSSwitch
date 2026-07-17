@@ -188,7 +188,7 @@ pub(crate) fn create_profile_inner(
         model: model.unwrap_or("").to_string(),
         credential_source: contract.default_credential_source,
         credential_ref: (contract.default_credential_source
-            == crate::provider_contracts::CredentialSource::KeychainOauth)
+            == crate::provider_contracts::CredentialSource::CsswitchOauth)
             .then(|| "csswitch:codex:default".to_string()),
         model_policy: contract.default_model_policy,
         website_url: Some(tpl.website_url.to_string()),
@@ -213,6 +213,81 @@ pub(crate) fn create_profile_inner(
     }
     config::update(dir, |c| c.profiles.push(p)).map_err(|e| e.to_string())?;
     Ok(id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EnsureCodexProfileDisposition {
+    Created,
+    Existing,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnsureCodexProfileResult {
+    pub(crate) disposition: EnsureCodexProfileDisposition,
+    pub(crate) profile_id: String,
+}
+
+fn is_canonical_codex_profile(profile: &config::Profile) -> bool {
+    profile.template_id == "codex"
+        && profile.credential_source == crate::provider_contracts::CredentialSource::CsswitchOauth
+        && crate::provider_contracts::contract_for(&profile.template_id, &profile.api_format)
+            .is_ok_and(|contract| {
+                contract.default_credential_source
+                    == crate::provider_contracts::CredentialSource::CsswitchOauth
+            })
+}
+
+/// Atomically ensure that login onboarding has one usable Codex profile to
+/// hand to the UI. This helper intentionally owns no lifecycle/supervisor lock
+/// and never changes `active_id`; callers establish the higher-level lock order.
+pub(crate) fn ensure_codex_profile_inner(dir: &Path) -> Result<EnsureCodexProfileResult, String> {
+    let template = templates::by_id("codex").ok_or("Codex 模板不可用。")?;
+    let contract = crate::provider_contracts::contract_for(template.id, template.api_format)?;
+    if contract.default_credential_source
+        != crate::provider_contracts::CredentialSource::CsswitchOauth
+    {
+        return Err("Codex provider contract 不是 CSSwitch OAuth。".into());
+    }
+    let profile_id = config::new_id();
+    let candidate = config::Profile {
+        id: profile_id.clone(),
+        name: template.name.to_string(),
+        template_id: template.id.to_string(),
+        category: template.category.to_string(),
+        api_format: template.api_format.to_string(),
+        base_url: template.base_url.to_string(),
+        api_key: String::new(),
+        model: String::new(),
+        credential_source: contract.default_credential_source,
+        credential_ref: Some("csswitch:codex:default".to_string()),
+        model_policy: contract.default_model_policy,
+        website_url: Some(template.website_url.to_string()),
+        icon: Some(template.icon.to_string()),
+        icon_color: Some(template.icon_color.to_string()),
+        sort_index: Some(config::now_ms()),
+        created_at: Some(config::now_ms()),
+        notes: None,
+    };
+    config::update_result(dir, |cfg| {
+        config::require_template_enabled(cfg, "codex")?;
+        if let Some(existing) = cfg.profiles.iter().find(|p| is_canonical_codex_profile(p)) {
+            return Ok((
+                EnsureCodexProfileResult {
+                    disposition: EnsureCodexProfileDisposition::Existing,
+                    profile_id: existing.id.clone(),
+                },
+                false,
+            ));
+        }
+        cfg.profiles.push(candidate);
+        Ok((
+            EnsureCodexProfileResult {
+                disposition: EnsureCodexProfileDisposition::Created,
+                profile_id,
+            },
+            true,
+        ))
+    })
 }
 
 pub(crate) fn update_profile_metadata_inner(
@@ -439,9 +514,11 @@ pub(crate) fn probe_kind_for_model(model: &str) -> scratch::ProbeKind {
 mod tests {
     use super::{
         build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
-        delete_profile_inner, is_main_list_model, merge_and_sort_models, nonactive_probe_verdict,
-        probe_kind_for, probe_kind_for_model, profile_capabilities, template_capabilities,
+        delete_profile_inner, ensure_codex_profile_inner, is_canonical_codex_profile,
+        is_main_list_model, merge_and_sort_models, nonactive_probe_verdict, probe_kind_for,
+        probe_kind_for_model, profile_capabilities, template_capabilities,
         update_profile_connection_inner, update_profile_metadata_inner, ConnectionEdit,
+        EnsureCodexProfileDisposition,
     };
     use crate::config;
 
@@ -553,7 +630,7 @@ mod tests {
         assert_eq!(profile.api_format, "openai_responses");
         assert_eq!(
             profile.credential_source,
-            crate::provider_contracts::CredentialSource::KeychainOauth
+            crate::provider_contracts::CredentialSource::CsswitchOauth
         );
         assert_eq!(
             profile.credential_ref.as_deref(),
@@ -561,6 +638,112 @@ mod tests {
         );
         assert!(profile.api_key.is_empty());
         assert!(profile.model.is_empty());
+    }
+
+    #[test]
+    fn ensure_codex_profile_is_atomic_idempotent_and_never_changes_active() {
+        let d = tmpdir_profile();
+        let active =
+            create_profile_inner(&d, "glm", "当前 GLM", Some("gk"), None, Some("glm-5.2")).unwrap();
+        config::update(&d, |cfg| {
+            cfg.active_id = active.clone();
+            cfg.experimental_codex_enabled = true;
+        })
+        .unwrap();
+
+        let created = ensure_codex_profile_inner(&d).unwrap();
+        assert_eq!(created.disposition, EnsureCodexProfileDisposition::Created);
+        let inode_before =
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(d.join("config.json")).unwrap());
+        let existing = ensure_codex_profile_inner(&d).unwrap();
+        let inode_after =
+            std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(d.join("config.json")).unwrap());
+        assert_eq!(
+            existing.disposition,
+            EnsureCodexProfileDisposition::Existing
+        );
+        assert_eq!(
+            inode_after, inode_before,
+            "existing ensure must not rewrite config"
+        );
+        assert_eq!(existing.profile_id, created.profile_id);
+
+        let cfg = config::load_from(&d).unwrap();
+        assert_eq!(cfg.active_id, active);
+        assert_eq!(
+            cfg.profiles
+                .iter()
+                .filter(|profile| is_canonical_codex_profile(profile))
+                .count(),
+            1
+        );
+        let codex = cfg.profile_by_id(&created.profile_id).unwrap();
+        assert_eq!(codex.name, "Codex（实验）");
+        assert_eq!(
+            codex.credential_ref.as_deref(),
+            Some("csswitch:codex:default")
+        );
+        assert!(codex.api_key.is_empty());
+    }
+
+    #[test]
+    fn ensure_codex_profile_requires_enabled_feature_and_preserves_existing_profiles() {
+        let d = tmpdir_profile();
+        assert!(ensure_codex_profile_inner(&d).is_err());
+        assert!(
+            !d.join("config.json").exists(),
+            "disabled ensure must not write"
+        );
+        assert!(config::load_from(&d).unwrap().profiles.is_empty());
+
+        config::update(&d, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let first = create_profile_inner(&d, "codex", "用户命名 A", None, None, None).unwrap();
+        let second = create_profile_inner(&d, "codex", "用户命名 B", None, None, None).unwrap();
+        let ensured = ensure_codex_profile_inner(&d).unwrap();
+        assert_eq!(ensured.disposition, EnsureCodexProfileDisposition::Existing);
+        assert_eq!(ensured.profile_id, first);
+        let cfg = config::load_from(&d).unwrap();
+        assert_eq!(cfg.profiles.len(), 2);
+        assert_eq!(cfg.profile_by_id(&first).unwrap().name, "用户命名 A");
+        assert_eq!(cfg.profile_by_id(&second).unwrap().name, "用户命名 B");
+    }
+
+    #[test]
+    fn concurrent_codex_profile_ensure_creates_at_most_one_profile() {
+        let d = tmpdir_profile();
+        config::update(&d, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let d = d.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                ensure_codex_profile_inner(&d).unwrap()
+            }));
+        }
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| { result.disposition == EnsureCodexProfileDisposition::Created })
+                .count(),
+            1
+        );
+        assert!(results
+            .iter()
+            .all(|result| result.profile_id == results[0].profile_id));
+        let cfg = config::load_from(&d).unwrap();
+        assert_eq!(
+            cfg.profiles
+                .iter()
+                .filter(|profile| is_canonical_codex_profile(profile))
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -771,7 +954,7 @@ mod tests {
         let enabled = build_list_templates(true);
         assert_eq!(enabled.len(), 12);
         let codex = enabled.iter().find(|t| t["id"] == "codex").unwrap();
-        assert_eq!(codex["capabilities"]["auth_mode"], "keychain_oauth");
+        assert_eq!(codex["capabilities"]["auth_mode"], "csswitch_oauth");
         assert_eq!(
             codex["capabilities"]["model_discovery"],
             "codex_account_catalog"
@@ -881,14 +1064,14 @@ mod tests {
             assert!(
                 matches!(
                     capabilities["auth_mode"].as_str(),
-                    Some("api_key" | "keychain_oauth" | "none")
+                    Some("api_key" | "csswitch_oauth" | "none")
                 ),
                 "template {id} auth_mode"
             );
             assert!(
                 matches!(
                     capabilities["credential_source"].as_str(),
-                    Some("api_key" | "keychain_oauth" | "none")
+                    Some("api_key" | "csswitch_oauth" | "none")
                 ),
                 "template {id} credential_source"
             );

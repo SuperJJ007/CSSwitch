@@ -23,7 +23,9 @@ use crate::runtime::science::{
 };
 use crate::runtime::settings::{system_ssh_config_path, validate_runtime_ports};
 use crate::runtime::system::open_in_browser;
-use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
+use crate::{
+    config, lock, proc, run_blocking, run_blocking_typed, AppState, SharedAppState, SharedLifecycle,
+};
 
 fn config_last_error_json(error: &dyn std::fmt::Display) -> serde_json::Value {
     json!({
@@ -75,7 +77,10 @@ fn status_runtime_identity(
     (gateway_kind, runtime_shim_mode, current_shim_mode)
 }
 
-pub(crate) fn stop_sandbox_state(app: &tauri::AppHandle, st: &mut AppState) -> Result<(), String> {
+pub(crate) fn stop_sandbox_state<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    st: &mut AppState,
+) -> Result<(), String> {
     let runtime = st.science_runtime.clone();
     let result = stop_sandbox(app, &mut st.sandbox, &mut st.sandbox_url, runtime.as_ref());
     if result.is_ok() {
@@ -221,23 +226,42 @@ pub(crate) async fn start_proxy(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || start_proxy_inner_cmd(app, state, lifecycle)).await
+    run_blocking_typed(move || start_proxy_inner_cmd(app, state, lifecycle)).await
 }
 
 fn start_proxy_inner_cmd<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
     state: SharedAppState,
     lifecycle: SharedLifecycle,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    let active = cfg
+        .active_profile()
+        .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
+    let adapter = resolve_launch_plan(active)?.adapter;
+    let prepared = crate::commands::codex::prepare_provider_auth(
+        &app,
+        &adapter,
+        crate::commands::codex::CodexPreflightTarget::ActiveProfile,
+    )?;
     // 经串行器：与切换/连接编辑/清 key/删/停等 ensure_proxy 竞争串行化，防陈旧读起旧配置代理
     // 又写回运行态（修 P1-a，比照 spec §8.1「ensure_proxy 都经一把 app 级 mutex」）。
     lifecycle.with_serialized(|| {
+        if let Some(prepared) = prepared.as_ref() {
+            prepared.verify_unchanged()?;
+        }
         let trace = OperationTrace::start(OperationKind::StartProxy, "command=start_proxy");
-        let (port, _secret, _action) =
-            ensure_proxy(&app, &state, lifecycle.as_ref(), None, Some(&trace))?;
+        let (port, _secret, _action) = ensure_proxy(
+            &app,
+            &state,
+            lifecycle.as_ref(),
+            None,
+            Some(&trace),
+            prepared.as_ref().map(|prepared| prepared.proof()),
+        )?;
         trace.finish(format!("ok port={port}"));
         Ok(json!({ "port": port }))
     })
@@ -266,20 +290,40 @@ pub(crate) struct FetchModelsReq {
 #[tauri::command]
 pub(crate) async fn fetch_models(
     app: tauri::AppHandle,
+    lifecycle: State<'_, SharedLifecycle>,
     req: FetchModelsReq,
-) -> Result<serde_json::Value, String> {
-    run_blocking(move || {
-        crate::runtime::model_discovery::fetch_models(
-            app,
-            crate::runtime::model_discovery::ModelDiscoveryRequest {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking_typed(
+        move || -> Result<_, crate::commands::codex::RuntimeCommandError> {
+            let request = crate::runtime::model_discovery::ModelDiscoveryRequest {
                 template_id: req.template_id,
                 api_format: req.api_format,
                 base_url: req.base_url,
                 key: req.key,
                 profile_id: req.profile_id,
-            },
-        )
-    })
+            };
+            let adapter = crate::runtime::model_discovery::request_adapter(&request)?;
+            let target = request.profile_id.as_ref().map_or(
+                crate::commands::codex::CodexPreflightTarget::NoProfile,
+                |id| crate::commands::codex::CodexPreflightTarget::Profile(id.clone()),
+            );
+            let prepared = crate::commands::codex::prepare_provider_auth(&app, &adapter, target)?;
+            lifecycle
+                .with_serialized(|| -> Result<(), String> {
+                    if let Some(prepared) = prepared.as_ref() {
+                        prepared.verify_unchanged()?;
+                    }
+                    Ok(())
+                })
+                .map_err(crate::commands::codex::RuntimeCommandError::from)?;
+            Ok(crate::runtime::model_discovery::fetch_models(
+                app,
+                request,
+                prepared.as_ref().map(|prepared| prepared.proof()),
+            )?)
+        },
+    )
     .await
 }
 
@@ -314,10 +358,10 @@ pub(crate) async fn one_click_login(
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
     runtime_choice: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || one_click_login_cmd(app, state, lifecycle, runtime_choice)).await
+    run_blocking_typed(move || one_click_login_cmd(app, state, lifecycle, runtime_choice)).await
 }
 
 pub(crate) fn one_click_login_cmd(
@@ -325,15 +369,31 @@ pub(crate) fn one_click_login_cmd(
     state: SharedAppState,
     lifecycle: SharedLifecycle,
     runtime_choice: Option<String>,
-) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| {
-        crate::runtime::sandbox_session::one_click_login(
-            app,
-            state,
-            lifecycle.as_ref(),
-            runtime_choice.as_deref(),
-        )
-    })
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    let active = cfg
+        .active_profile()
+        .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
+    let adapter = resolve_launch_plan(active)?.adapter;
+    let prepared = crate::commands::codex::prepare_provider_auth(
+        &app,
+        &adapter,
+        crate::commands::codex::CodexPreflightTarget::ActiveProfile,
+    )?;
+    lifecycle
+        .with_serialized(|| -> Result<_, String> {
+            if let Some(prepared) = prepared.as_ref() {
+                prepared.verify_unchanged()?;
+            }
+            crate::runtime::sandbox_session::one_click_login(
+                app,
+                state,
+                lifecycle.as_ref(),
+                runtime_choice.as_deref(),
+                prepared.as_ref().map(|prepared| prepared.proof()),
+            )
+        })
+        .map_err(crate::commands::codex::RuntimeCommandError::from)
 }
 
 #[tauri::command]
@@ -879,6 +939,7 @@ esac
             state.clone(),
             lifecycle.as_ref(),
             None,
+            None,
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
@@ -888,7 +949,7 @@ esac
         );
         wait_http_health(sandbox_port);
         let fake_state_dir = home
-            .join(".csswitch")
+            .join(config::CONFIG_DIR_NAME)
             .join("sandbox")
             .join("home")
             .join(".claude-science")
@@ -907,6 +968,7 @@ esac
             handle.clone(),
             state.clone(),
             lifecycle.as_ref(),
+            None,
             None,
         )
         .expect("second one-click should reuse running sandbox");
@@ -956,6 +1018,7 @@ esac
                 state.clone(),
                 lifecycle.as_ref(),
                 None,
+                None,
             )
             .expect("normal cold start should not re-probe or reconfigure");
             cold_start_ms.push(started_at.elapsed().as_millis());
@@ -1000,6 +1063,7 @@ esac
             handle.clone(),
             state.clone(),
             lifecycle.as_ref(),
+            None,
             None,
         )
         .expect("binary replacement should re-probe and reconcile once");
@@ -1143,6 +1207,7 @@ esac
             state.clone(),
             lifecycle.as_ref(),
             None,
+            None,
         )
         .expect("first one-click should start proxy and sandbox");
         assert_eq!(first["action"], "started");
@@ -1153,7 +1218,7 @@ esac
         wait_http_health(proxy_port);
         wait_http_health(sandbox_port);
         let fake_state_dir = home
-            .join(".csswitch")
+            .join(config::CONFIG_DIR_NAME)
             .join("sandbox")
             .join("home")
             .join(".claude-science")
@@ -1194,6 +1259,7 @@ esac
             handle.clone(),
             state.clone(),
             lifecycle.as_ref(),
+            None,
             None,
         )
         .expect("one-click should manually recover a dead proxy");

@@ -301,6 +301,7 @@ pub struct RequestContext<'a> {
     pub reasoning_effort: Option<&'a str>,
     pub supports_reasoning_summary: bool,
     pub supports_parallel_tool_calls: bool,
+    pub use_responses_lite: bool,
 }
 
 pub fn validate_request_body_size(length: usize) -> Result<(), ProtocolError> {
@@ -352,11 +353,12 @@ pub fn translate_anthropic_request(
     let has_tools = !tools.is_empty();
     let tool_choice = translate_tool_choice(object.get("tool_choice"), &tools)?;
     let instructions = translate_system(object.get("system"), &mut text_bytes)?;
-    let reasoning_disabled = object
-        .get("thinking")
-        .and_then(|value| value.get("type"))
-        .and_then(Value::as_str)
-        == Some("disabled");
+    let reasoning_disabled = !context.use_responses_lite
+        && object
+            .get("thinking")
+            .and_then(|value| value.get("type"))
+            .and_then(Value::as_str)
+            == Some("disabled");
     let reasoning = if reasoning_disabled {
         Some(Value::Null)
     } else {
@@ -369,20 +371,47 @@ pub fn translate_anthropic_request(
         }
         (!policy.is_empty()).then_some(Value::Object(policy))
     };
-    let parallel_tool_calls =
-        context.supports_parallel_tool_calls && tool_choice.allow_parallel && has_tools;
+    let parallel_tool_calls = !context.use_responses_lite
+        && context.supports_parallel_tool_calls
+        && tool_choice.allow_parallel
+        && has_tools;
+    if context.use_responses_lite {
+        let mut prefix = vec![json!({
+            "type": "additional_tools",
+            "role": "developer",
+            "tools": tools.clone(),
+        })];
+        if !instructions.is_empty() {
+            prefix.push(json!({
+                "type": "message",
+                "role": "developer",
+                "content": [{"type": "input_text", "text": instructions.clone()}],
+            }));
+        }
+        prefix.append(&mut input);
+        input = prefix;
+    }
     let mut translated = json!({
         "model": context.target_model,
         "instructions": instructions,
         "input": input,
-        "tools": Value::Array(tools),
-        "tool_choice": tool_choice.value,
+        "tools": Value::Array(tools.clone()),
+        "tool_choice": if context.use_responses_lite { Value::String("auto".into()) } else { tool_choice.value },
         "parallel_tool_calls": parallel_tool_calls,
         "store": false,
         "stream": true,
         "include": ["reasoning.encrypted_content"],
     });
-    if !has_tools {
+    if context.use_responses_lite {
+        translated
+            .as_object_mut()
+            .expect("translated request is an object")
+            .remove("tools");
+        translated
+            .as_object_mut()
+            .expect("translated request is an object")
+            .remove("instructions");
+    } else if !has_tools {
         translated
             .as_object_mut()
             .expect("translated request is an object")
@@ -393,12 +422,23 @@ pub fn translate_anthropic_request(
             .remove("parallel_tool_calls");
     }
     if let Some(reasoning) = reasoning {
+        let reasoning = if context.use_responses_lite {
+            match reasoning {
+                Value::Object(mut policy) => {
+                    policy.insert("context".into(), Value::String("all_turns".into()));
+                    Value::Object(policy)
+                }
+                other => other,
+            }
+        } else {
+            reasoning
+        };
         translated
             .as_object_mut()
             .expect("translated request is an object")
             .insert("reasoning".into(), reasoning);
     }
-    if instructions.is_empty() {
+    if !context.use_responses_lite && instructions.is_empty() {
         translated
             .as_object_mut()
             .expect("translated request is an object")
@@ -700,6 +740,7 @@ fn translate_tools(
                 "name": name,
                 "description": description,
                 "parameters": parameters,
+                "strict": false,
             }))
         })
         .collect()
@@ -1930,6 +1971,7 @@ mod tests {
             reasoning_effort: Some("high"),
             supports_reasoning_summary: true,
             supports_parallel_tool_calls: true,
+            use_responses_lite: false,
         }
     }
 
@@ -2060,6 +2102,42 @@ mod tests {
             translate_anthropic_request(&request, &no_summary_or_parallel, &signer()).unwrap();
         assert_eq!(translated["parallel_tool_calls"], false);
         assert_eq!(translated["reasoning"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn translator_uses_responses_lite_contract_for_lite_models() {
+        let request = json!({
+            "system": "be precise",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{
+                "name": "read",
+                "description": "read a file",
+                "input_schema": {"type": "object"}
+            }],
+            "tool_choice": {"type": "tool", "name": "read"},
+            "thinking": {"type": "disabled"}
+        });
+        let lite = RequestContext {
+            target_model: "gpt-5.6-sol",
+            use_responses_lite: true,
+            ..context()
+        };
+        let translated = translate_anthropic_request(&request, &lite, &signer()).unwrap();
+
+        assert_eq!(translated["model"], "gpt-5.6-sol");
+        assert!(translated.get("instructions").is_none());
+        assert!(translated.get("tools").is_none());
+        assert_eq!(translated["tool_choice"], "auto");
+        assert_eq!(translated["parallel_tool_calls"], false);
+        assert_eq!(translated["input"][0]["type"], "additional_tools");
+        assert_eq!(translated["input"][0]["role"], "developer");
+        assert_eq!(translated["input"][0]["tools"][0]["name"], "read");
+        assert_eq!(translated["input"][1]["role"], "developer");
+        assert_eq!(translated["input"][1]["content"][0]["text"], "be precise");
+        assert_eq!(translated["input"][2]["role"], "user");
+        assert_eq!(translated["reasoning"]["effort"], "high");
+        assert_eq!(translated["reasoning"]["summary"], "auto");
+        assert_eq!(translated["reasoning"]["context"], "all_turns");
     }
 
     #[test]

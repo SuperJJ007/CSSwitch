@@ -11,7 +11,8 @@ const STATIC_PROVIDER_CONTRACTS_JSON: &str =
 pub(crate) enum CredentialSource {
     #[default]
     ApiKey,
-    KeychainOauth,
+    #[serde(alias = "keychain_oauth")]
+    CsswitchOauth,
     None,
 }
 
@@ -28,7 +29,8 @@ pub(crate) enum ModelPolicy {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AuthMode {
     ApiKey,
-    KeychainOauth,
+    #[serde(alias = "keychain_oauth")]
+    CsswitchOauth,
     None,
 }
 
@@ -244,7 +246,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
                     contract.id
                 ));
             }
-            AuthMode::KeychainOauth | AuthMode::None if contract.api_key_env.is_some() => {
+            AuthMode::CsswitchOauth | AuthMode::None if contract.api_key_env.is_some() => {
                 return Err(format!(
                     "非 API-key contract 不得声明 api_key_env：{}",
                     contract.id
@@ -254,7 +256,7 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
         }
         let expected_source = match contract.auth_mode {
             AuthMode::ApiKey => CredentialSource::ApiKey,
-            AuthMode::KeychainOauth => CredentialSource::KeychainOauth,
+            AuthMode::CsswitchOauth => CredentialSource::CsswitchOauth,
             AuthMode::None => CredentialSource::None,
         };
         if contract.default_credential_source != expected_source
@@ -290,11 +292,11 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
             ));
         }
         let has_codex_characteristic = contract.adapter == "codex"
-            || contract.auth_mode == AuthMode::KeychainOauth
+            || contract.auth_mode == AuthMode::CsswitchOauth
             || contract
                 .credential_sources
-                .contains(&CredentialSource::KeychainOauth)
-            || contract.default_credential_source == CredentialSource::KeychainOauth
+                .contains(&CredentialSource::CsswitchOauth)
+            || contract.default_credential_source == CredentialSource::CsswitchOauth
             || contract.model_discovery == ModelDiscovery::CodexAccountCatalog
             || contract.transport == Transport::CodexResponsesSse
             || contract.scratch_policy == ScratchPolicy::GatewayOwnedAuth
@@ -306,9 +308,9 @@ pub(crate) fn validate_provider_contracts(catalog: &ProviderContractCatalog) -> 
             let exact_codex_contract = contract.template_ids == ["codex"]
                 && contract.api_formats == ["openai_responses"]
                 && contract.adapter == "codex"
-                && contract.auth_mode == AuthMode::KeychainOauth
-                && contract.credential_sources == [CredentialSource::KeychainOauth]
-                && contract.default_credential_source == CredentialSource::KeychainOauth
+                && contract.auth_mode == AuthMode::CsswitchOauth
+                && contract.credential_sources == [CredentialSource::CsswitchOauth]
+                && contract.default_credential_source == CredentialSource::CsswitchOauth
                 && contract.model_policies == [ModelPolicy::DynamicCatalog]
                 && contract.default_model_policy == ModelPolicy::DynamicCatalog
                 && contract.model_discovery == ModelDiscovery::CodexAccountCatalog
@@ -541,7 +543,7 @@ mod tests {
             contract_for("codex", "openai_responses")
                 .unwrap()
                 .default_credential_source,
-            CredentialSource::KeychainOauth
+            CredentialSource::CsswitchOauth
         );
     }
 
@@ -616,5 +618,18 @@ mod tests {
         mutated["contracts"][0]["model_policies"] =
             serde_json::json!(["optional_fixed", "optional_fixed"]);
         assert!(validate_value(mutated).is_err());
+    }
+
+    #[test]
+    fn legacy_keychain_oauth_value_reads_but_serializes_as_csswitch_oauth() {
+        let source: CredentialSource = serde_json::from_str("\"keychain_oauth\"").unwrap();
+        let mode: AuthMode = serde_json::from_str("\"keychain_oauth\"").unwrap();
+        assert_eq!(source, CredentialSource::CsswitchOauth);
+        assert_eq!(mode, AuthMode::CsswitchOauth);
+        assert_eq!(
+            serde_json::to_string(&source).unwrap(),
+            "\"csswitch_oauth\""
+        );
+        assert_eq!(serde_json::to_string(&mode).unwrap(), "\"csswitch_oauth\"");
     }
 }

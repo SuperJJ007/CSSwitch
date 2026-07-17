@@ -10,10 +10,15 @@ use zeroize::Zeroizing;
 
 use crate::codex_auth::InferenceSecrets;
 use crate::codex_network::CodexHttpClientFactory;
-use crate::config::{DEFAULT_CODEX_UPSTREAM_URL, UPSTREAM_UA};
+use crate::config::DEFAULT_CODEX_UPSTREAM_URL;
 use crate::provider_contracts::CodexRuntimeContract;
 
 const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+// ChatGPT's Codex edge rejects some product/custom User-Agent values as
+// automated traffic. Keep inference aligned with the first-party Codex
+// originator; OAuth and the other provider transports retain CSSwitch's UA.
+const CODEX_INFERENCE_UA: &str = "codex_cli_rs";
+const RESPONSES_LITE_HEADER: &str = "x-openai-internal-codex-responses-lite";
 #[cfg(test)]
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
@@ -116,6 +121,80 @@ pub(crate) struct CodexTransportError {
     pub cancelled: bool,
 }
 
+fn challenge_detected(response: &Response) -> bool {
+    response
+        .headers()
+        .get("cf-mitigated")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("challenge"))
+}
+
+fn response_media_type(response: &Response) -> Option<&str> {
+    response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn unexpected_response_detail(response: &Response) -> &'static str {
+    if challenge_detected(response) {
+        return "Codex upstream returned a Cloudflare challenge response";
+    }
+
+    match response_media_type(response) {
+        Some(value) if value.eq_ignore_ascii_case("application/json") => {
+            "Codex upstream returned JSON instead of an event stream"
+        }
+        Some(value) if value.eq_ignore_ascii_case("text/html") => {
+            "Codex upstream returned HTML instead of an event stream"
+        }
+        None => "Codex upstream returned no response content type",
+        Some(_) => "Codex upstream returned an unsupported response content type",
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponsePrefixKind {
+    Sse,
+    Html,
+    Json,
+    NeedMore,
+    Other,
+}
+
+fn classify_response_prefix(prefix: &[u8]) -> ResponsePrefixKind {
+    let prefix = prefix.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(prefix);
+    let prefix = prefix
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .map(|start| &prefix[start..])
+        .unwrap_or_default();
+    if prefix.is_empty() {
+        return ResponsePrefixKind::NeedMore;
+    }
+    const SSE_PREFIXES: [&[u8]; 5] = [b"data:", b"event:", b"id:", b"retry:", b":"];
+    if SSE_PREFIXES
+        .iter()
+        .any(|candidate| prefix.starts_with(candidate))
+    {
+        return ResponsePrefixKind::Sse;
+    }
+    if SSE_PREFIXES
+        .iter()
+        .any(|candidate| candidate.starts_with(prefix))
+    {
+        return ResponsePrefixKind::NeedMore;
+    }
+    match prefix[0] {
+        b'<' => ResponsePrefixKind::Html,
+        b'{' | b'[' => ResponsePrefixKind::Json,
+        _ => ResponsePrefixKind::Other,
+    }
+}
+
 impl fmt::Display for CodexTransportError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.detail)
@@ -193,6 +272,7 @@ impl CodexTransport {
         &self,
         secrets: &InferenceSecrets,
         body: Vec<u8>,
+        use_responses_lite: bool,
         cancellation: CodexCancellation,
     ) -> Result<CodexUpstream, CodexTransportError> {
         let authorization = Zeroizing::new(format!("Bearer {}", secrets.access_token()));
@@ -212,16 +292,19 @@ impl CodexTransport {
                 cancelled: false,
             })?;
         account_header.set_sensitive(true);
-        let request = self
+        let mut request = self
             .client
             .post(&self.endpoint)
             .header(CONTENT_TYPE, "application/json")
             .header(ACCEPT, "text/event-stream")
-            .header(USER_AGENT, UPSTREAM_UA)
+            .header(USER_AGENT, CODEX_INFERENCE_UA)
             .header("originator", CODEX_ORIGINATOR)
             .header("ChatGPT-Account-ID", account_header)
             .header(AUTHORIZATION, authorization_header)
             .body(body);
+        if use_responses_lite {
+            request = request.header(RESPONSES_LITE_HEADER, "true");
+        }
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
@@ -232,7 +315,7 @@ impl CodexTransport {
                 detail: "Codex transport runtime failed",
                 cancelled: false,
             })?;
-        let response = runtime.block_on(async {
+        let mut response = runtime.block_on(async {
             tokio::select! {
                 _ = wait_for_cancel(cancellation.clone()) => Err(CodexTransportError {
                     status: 499,
@@ -269,28 +352,111 @@ impl CodexTransport {
                 cancelled: false,
             });
         }
-        let content_type = response
-            .headers()
-            .get(CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .unwrap_or("");
-        if !content_type
-            .split(';')
-            .next()
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("text/event-stream"))
-        {
-            return Err(CodexTransportError {
-                status: 502,
-                upstream_status: Some(status),
-                detail: "Codex upstream returned an invalid content type",
-                cancelled: false,
-            });
+        let mut pending = Vec::new();
+        let is_event_stream = response_media_type(&response)
+            .is_some_and(|value| value.eq_ignore_ascii_case("text/event-stream"));
+        if !is_event_stream {
+            if challenge_detected(&response) || response_media_type(&response).is_some() {
+                return Err(CodexTransportError {
+                    status: 502,
+                    upstream_status: Some(status),
+                    detail: unexpected_response_detail(&response),
+                    cancelled: false,
+                });
+            }
+
+            // Some Codex edges omit Content-Type on an otherwise valid SSE
+            // response. Sniff only a bounded prefix and accept it solely when
+            // it has a valid SSE field prefix. This consumes no second POST and
+            // never exposes the upstream body in diagnostics.
+            let cancellation_for_sniff = cancellation.clone();
+            let sniffed = runtime.block_on(async {
+                tokio::time::timeout(self.request_timeout, async {
+                    let mut prefix = Vec::with_capacity(512);
+                    let mut consumed = Vec::new();
+                    loop {
+                        let next = tokio::select! {
+                            _ = wait_for_cancel(cancellation_for_sniff.clone()) => {
+                                return Err(CodexTransportError {
+                                    status: 499,
+                                    upstream_status: Some(status),
+                                    detail: "Codex request was cancelled",
+                                    cancelled: true,
+                                });
+                            }
+                            result = response.chunk() => result.map_err(|_| CodexTransportError {
+                                status: 502,
+                                upstream_status: Some(status),
+                                detail: "Codex upstream read failed",
+                                cancelled: false,
+                            })?,
+                        };
+                        let Some(chunk) = next else {
+                            return Err(CodexTransportError {
+                                status: 502,
+                                upstream_status: Some(status),
+                                detail: "Codex upstream returned an empty response",
+                                cancelled: false,
+                            });
+                        };
+                        consumed.extend_from_slice(&chunk);
+                        let remaining = 512_usize.saturating_sub(prefix.len());
+                        prefix.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+                        match classify_response_prefix(&prefix) {
+                            ResponsePrefixKind::Sse => return Ok(consumed),
+                            ResponsePrefixKind::Html => {
+                                return Err(CodexTransportError {
+                                    status: 502,
+                                    upstream_status: Some(status),
+                                    detail:
+                                        "Codex upstream returned HTML instead of an event stream",
+                                    cancelled: false,
+                                });
+                            }
+                            ResponsePrefixKind::Json => {
+                                return Err(CodexTransportError {
+                                    status: 502,
+                                    upstream_status: Some(status),
+                                    detail:
+                                        "Codex upstream returned JSON instead of an event stream",
+                                    cancelled: false,
+                                });
+                            }
+                            ResponsePrefixKind::Other => {
+                                return Err(CodexTransportError {
+                                    status: 502,
+                                    upstream_status: Some(status),
+                                    detail: "Codex upstream returned an unsupported response body",
+                                    cancelled: false,
+                                });
+                            }
+                            ResponsePrefixKind::NeedMore if prefix.len() < 512 => {}
+                            ResponsePrefixKind::NeedMore => {
+                                return Err(CodexTransportError {
+                                    status: 502,
+                                    upstream_status: Some(status),
+                                    detail: "Codex upstream returned an unsupported response body",
+                                    cancelled: false,
+                                });
+                            }
+                        }
+                    }
+                })
+                .await
+                .map_err(|_| CodexTransportError {
+                    status: 504,
+                    upstream_status: Some(status),
+                    detail: "Codex upstream response body timed out",
+                    cancelled: false,
+                })?
+            })?;
+            pending = sniffed;
         }
         Ok(CodexUpstream {
             response,
             runtime,
             cancellation,
-            pending: Vec::new(),
+            pending,
             pending_offset: 0,
             read_idle_timeout: self.read_idle_timeout,
         })
@@ -387,7 +553,12 @@ mod tests {
         let (endpoint, request_rx, handle) = mock_server(response);
         let transport = CodexTransport::for_test(endpoint).unwrap();
         let mut upstream = transport
-            .open_responses(&secrets(), body.clone(), CodexCancellation::default())
+            .open_responses(
+                &secrets(),
+                body.clone(),
+                false,
+                CodexCancellation::default(),
+            )
             .unwrap();
         let mut received_body = Vec::new();
         upstream.read_to_end(&mut received_body).unwrap();
@@ -403,8 +574,36 @@ mod tests {
         assert!(head.contains("authorization: bearer access-secret"));
         assert!(head.contains("chatgpt-account-id: account-secret"));
         assert!(head.contains("originator: codex_cli_rs"));
+        assert!(head.contains("user-agent: codex_cli_rs"));
         assert!(head.contains("accept: text/event-stream"));
         assert_eq!(&request[head_end + 4..], body);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn responses_lite_request_sets_lite_header() {
+        let event = b"data: {\"type\":\"response.created\"}\n\n";
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            event.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(event);
+        let (endpoint, request_rx, handle) = mock_server(response);
+        let transport = CodexTransport::for_test(endpoint).unwrap();
+        let mut upstream = transport
+            .open_responses(
+                &secrets(),
+                b"{}".to_vec(),
+                true,
+                CodexCancellation::default(),
+            )
+            .unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).unwrap();
+        assert_eq!(received, event);
+        let request = String::from_utf8_lossy(&request_rx.recv().unwrap()).to_ascii_lowercase();
+        assert!(request.contains("x-openai-internal-codex-responses-lite: true"));
         handle.join().unwrap();
     }
 
@@ -420,6 +619,7 @@ mod tests {
                 .open_responses(
                     &secrets(),
                     b"{}".to_vec(),
+                    false,
                     CodexCancellation::default(),
                 )
                 .err()
@@ -433,6 +633,80 @@ mod tests {
             }
             handle.join().unwrap();
         }
+    }
+
+    #[test]
+    fn unexpected_content_type_is_classified_without_exposing_the_body() {
+        for (headers, body, expected) in [
+            (
+                "content-type: text/html\r\n",
+                "private-html-body",
+                "Codex upstream returned HTML instead of an event stream",
+            ),
+            (
+                "content-type: application/json\r\n",
+                "private-json-body",
+                "Codex upstream returned JSON instead of an event stream",
+            ),
+            (
+                "content-type: text/html\r\ncf-mitigated: challenge\r\n",
+                "private-challenge-body",
+                "Codex upstream returned a Cloudflare challenge response",
+            ),
+            (
+                "",
+                "private-missing-content-type-body",
+                "Codex upstream returned an unsupported response body",
+            ),
+        ] {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes();
+            let (endpoint, request_rx, handle) = mock_server(response);
+            let transport = CodexTransport::for_test(endpoint).unwrap();
+            let error = transport
+                .open_responses(
+                    &secrets(),
+                    b"{}".to_vec(),
+                    false,
+                    CodexCancellation::default(),
+                )
+                .err()
+                .unwrap();
+            assert_eq!(error.detail, expected);
+            assert!(!error.detail.contains(body));
+            let _ = request_rx.recv().unwrap();
+            handle.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_content_type_accepts_a_bounded_sse_prefix_without_reposting() {
+        let event = b"data: {\"type\":\"response.created\"}\n\n";
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            event.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(event);
+        let (endpoint, request_rx, handle) = mock_server(response);
+        let transport = CodexTransport::for_test(endpoint).unwrap();
+        let mut upstream = transport
+            .open_responses(
+                &secrets(),
+                b"{}".to_vec(),
+                false,
+                CodexCancellation::default(),
+            )
+            .unwrap();
+        let mut received = Vec::new();
+        upstream.read_to_end(&mut received).unwrap();
+        assert_eq!(received, event);
+        let request = request_rx.recv().unwrap();
+        assert!(request.starts_with(b"POST "));
+        handle.join().unwrap();
     }
 
     #[test]
@@ -465,7 +739,7 @@ mod tests {
 
         let started = Instant::now();
         let error = transport
-            .open_responses(&secrets(), b"{}".to_vec(), cancellation)
+            .open_responses(&secrets(), b"{}".to_vec(), false, cancellation)
             .err()
             .unwrap();
         assert!(error.cancelled);

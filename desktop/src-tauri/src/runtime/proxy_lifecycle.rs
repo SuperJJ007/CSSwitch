@@ -356,13 +356,22 @@ pub(crate) fn ensure_proxy<R: Runtime>(
     lifecycle: &lifecycle::Lifecycle,
     science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<(u16, String, ProxyAction), String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
     let profile = cfg
         .active_profile()
         .cloned()
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
-    start_proxy_for(app, state, lifecycle, &profile, science_runtime, trace)
+    start_proxy_for(
+        app,
+        state,
+        lifecycle,
+        &profile,
+        science_runtime,
+        trace,
+        auth_proof,
+    )
 }
 
 /// Start or reuse a proxy for a specific profile, without reading the active profile.
@@ -375,6 +384,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
     profile: &config::Profile,
     science_runtime: Option<&crate::runtime::science::ScienceRuntimeIdentity>,
     trace: Option<&OperationTrace>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<(u16, String, ProxyAction), String> {
     assert_format_supported(profile)?;
     let resolved = proxy_args_for(profile)?;
@@ -388,7 +398,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?,
         );
     }
-    let _codex_use = crate::commands::codex::ensure_provider_auth_ready(app, &launch.adapter)?;
+    crate::commands::codex::require_provider_auth_proof(&launch.adapter, auth_proof)?;
     if !launch.credential_configured() {
         return Err(format!(
             "「{}」还没配置凭据，请先在面板填写或登录。",

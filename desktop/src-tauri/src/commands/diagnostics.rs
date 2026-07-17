@@ -40,7 +40,7 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
                 .map(|plan| plan.public());
             let auth_mode = match public.as_ref().map(|view| view.auth_mode) {
                 Some(AuthMode::ApiKey) => "api_key",
-                Some(AuthMode::KeychainOauth) => "keychain_oauth",
+                Some(AuthMode::CsswitchOauth) => "csswitch_oauth",
                 Some(AuthMode::None) => "none",
                 None => "",
             };
@@ -135,7 +135,7 @@ pub(crate) fn report_bug() -> Result<(), String> {
     open_in_browser("https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml")
 }
 
-/// 在访达里打开日志目录 `~/.csswitch/logs`，方便用户附到 bug 反馈里（先自查有无密钥）。
+/// 在访达里打开构建变体自己的日志目录，方便用户附到 bug 反馈里（先自查有无密钥）。
 #[tauri::command]
 pub(crate) fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");

@@ -11,8 +11,8 @@ use tauri::{Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::codex_auth_supervisor::{
-    CodexAuthSupervisor, CodexMutationLease, CodexUseLease, OperationErrorView, OperationSnapshot,
-    SharedCodexAuthSupervisor,
+    AuthPreflightReservation, CodexAuthReadyProof, CodexAuthSupervisor, CodexMutationLease,
+    OperationErrorView, OperationSnapshot, SharedCodexAuthSupervisor,
 };
 use crate::proc::ChildLiveness;
 use crate::runtime::proxy_lifecycle::gateway_bin_path;
@@ -22,19 +22,96 @@ use crate::runtime::science::{
 use crate::runtime::system::kill_child;
 use crate::{config, lock, proc, run_blocking, AppState, SharedAppState, SharedLifecycle};
 
-const AUTH_SCHEMA_VERSION: u32 = 2;
+const AUTH_SCHEMA_VERSION: u32 = 3;
 const MAX_AUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTH_OUTPUT_BYTES: u64 = 64 * 1024;
 const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPTED_CANCEL_WATCHDOG: Duration = Duration::from_secs(2);
-#[cfg(not(feature = "acceptance-keychain"))]
-const EXPECTED_CODEX_KEYCHAIN_SERVICE: &str = "com.csswitch.codex.oauth.v1";
-#[cfg(feature = "acceptance-keychain")]
-const EXPECTED_CODEX_KEYCHAIN_SERVICE: &str = "com.csswitch.acceptance.codex.oauth.v1";
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub(crate) struct CodexAuthCommandError {
+    code: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cause: Option<&'static str>,
+    retryable: bool,
+}
+
+impl CodexAuthCommandError {
+    fn login_required(reason: &str) -> Self {
+        Self {
+            code: "codex_login_required",
+            reason: Some(reason.to_string()),
+            cause: None,
+            retryable: false,
+        }
+    }
+
+    fn unavailable(cause: &'static str) -> Self {
+        Self {
+            code: "codex_auth_unavailable",
+            reason: None,
+            cause: Some(cause),
+            retryable: matches!(
+                cause,
+                "keychain_unavailable"
+                    | "interaction_timeout"
+                    | "storage_unavailable"
+                    | "auth_state_changed"
+            ),
+        }
+    }
+
+    fn busy() -> Self {
+        Self {
+            code: "codex_auth_busy",
+            reason: None,
+            cause: None,
+            retryable: true,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub(crate) enum RuntimeCommandError {
+    Auth(CodexAuthCommandError),
+    Message(String),
+}
+
+impl From<CodexAuthCommandError> for RuntimeCommandError {
+    fn from(error: CodexAuthCommandError) -> Self {
+        Self::Auth(error)
+    }
+}
+
+impl From<String> for RuntimeCommandError {
+    fn from(error: String) -> Self {
+        Self::Message(error)
+    }
+}
+
+impl From<&str> for RuntimeCommandError {
+    fn from(error: &str) -> Self {
+        Self::Message(error.to_string())
+    }
+}
+
+impl std::fmt::Display for RuntimeCommandError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Message(message) => formatter.write_str(message),
+            Self::Auth(error) => formatter.write_str(match error.code {
+                "codex_login_required" => "Codex 尚未登录或本地认证记录不完整。",
+                "codex_auth_busy" => "另一项 Codex 认证或启动操作正在进行。",
+                _ => "Codex 认证状态暂不可用。",
+            }),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodexAuthAction {
-    LoginDevice,
     LoginBrowser,
     Status,
     Logout,
@@ -46,10 +123,38 @@ struct ManagedAuthProcess {
     stdout: std::process::ChildStdout,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SidecarWaitFailure {
+    Cancelled,
+    Timeout,
+    Protocol,
+}
+
+fn auth_error_from_sidecar_wait(error: SidecarWaitFailure) -> CodexAuthCommandError {
+    match error {
+        SidecarWaitFailure::Cancelled | SidecarWaitFailure::Timeout => {
+            CodexAuthCommandError::unavailable("interaction_timeout")
+        }
+        SidecarWaitFailure::Protocol => {
+            CodexAuthCommandError::unavailable("sidecar_protocol_error")
+        }
+    }
+}
+
+impl SidecarWaitFailure {
+    #[cfg(test)]
+    fn safe_message(self) -> &'static str {
+        match self {
+            Self::Cancelled => "Codex 认证检查已取消。",
+            Self::Timeout => "Codex 认证 sidecar 超时，受管进程已结束。",
+            Self::Protocol => "Codex 认证 sidecar 协议或进程状态无效。",
+        }
+    }
+}
+
 impl CodexAuthAction {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LoginDevice => "login-device",
             Self::LoginBrowser => "login-browser",
             Self::Status => "status",
             Self::Logout => "logout",
@@ -60,15 +165,14 @@ impl CodexAuthAction {
         match self {
             // Gateway's browser callback budget is five minutes. The outer
             // supervisor allows a small cleanup margin but never waits forever.
-            Self::LoginDevice => Duration::from_secs(15 * 60 + 15),
             Self::LoginBrowser => Duration::from_secs(5 * 60 + 15),
-            Self::Status => Duration::from_secs(15),
+            Self::Status => Duration::from_secs(120),
             Self::Logout => Duration::from_secs(60),
         }
     }
 
     fn is_login(self) -> bool {
-        matches!(self, Self::LoginDevice | Self::LoginBrowser)
+        self == Self::LoginBrowser
     }
 }
 
@@ -76,11 +180,119 @@ impl CodexAuthAction {
 #[serde(deny_unknown_fields)]
 struct AuthStatusView {
     authenticated: bool,
+    reason: String,
     account_hash: Option<String>,
     expiry_state: String,
     expires_at: Option<i64>,
     auth_epoch: Option<String>,
     auth_generation: u64,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) enum CodexPreflightTarget {
+    ActiveProfile,
+    Profile(String),
+    NoProfile,
+}
+
+#[derive(PartialEq, Eq)]
+struct SensitiveConfigSecret(String);
+
+#[derive(PartialEq, Eq)]
+struct CodexProfileLaunchSnapshot {
+    id: String,
+    template_id: String,
+    api_format: String,
+    base_url: String,
+    model: String,
+    credential_source: crate::provider_contracts::CredentialSource,
+    credential_ref: Option<String>,
+    model_policy: crate::provider_contracts::ModelPolicy,
+}
+
+#[derive(PartialEq, Eq)]
+struct CodexLaunchSnapshot {
+    active_id: String,
+    profile: Option<CodexProfileLaunchSnapshot>,
+    experimental_codex_enabled: bool,
+    codex_network: csswitch_codex_network::CodexNetworkSettings,
+    proxy_port: u16,
+    sandbox_port: u16,
+    reuse_system_ssh: bool,
+    mode: String,
+    secret: SensitiveConfigSecret,
+}
+
+pub(crate) struct PreparedCodexAuth {
+    target: CodexPreflightTarget,
+    snapshot: CodexLaunchSnapshot,
+    proof: CodexAuthReadyProof,
+}
+
+impl CodexLaunchSnapshot {
+    fn capture(target: &CodexPreflightTarget) -> Result<Self, String> {
+        Self::capture_from(&config::default_dir(), target)
+    }
+
+    fn capture_from(dir: &Path, target: &CodexPreflightTarget) -> Result<Self, String> {
+        let cfg = config::load_from(dir).map_err(|error| error.to_string())?;
+        Ok(Self::from_config(&cfg, target))
+    }
+
+    fn from_config(cfg: &config::Config, target: &CodexPreflightTarget) -> Self {
+        let profile = match target {
+            CodexPreflightTarget::ActiveProfile => cfg.active_profile(),
+            CodexPreflightTarget::Profile(id) => cfg.profile_by_id(id),
+            CodexPreflightTarget::NoProfile => None,
+        }
+        .map(|profile| CodexProfileLaunchSnapshot {
+            id: profile.id.clone(),
+            template_id: profile.template_id.clone(),
+            api_format: profile.api_format.clone(),
+            base_url: profile.base_url.clone(),
+            model: profile.model.clone(),
+            credential_source: profile.credential_source,
+            credential_ref: profile.credential_ref.clone(),
+            model_policy: profile.model_policy,
+        });
+        Self {
+            active_id: cfg.active_id.clone(),
+            profile,
+            experimental_codex_enabled: cfg.experimental_codex_enabled,
+            codex_network: cfg.codex_network.clone(),
+            proxy_port: cfg.proxy_port,
+            sandbox_port: cfg.sandbox_port,
+            reuse_system_ssh: cfg.reuse_system_ssh,
+            mode: cfg.mode.clone(),
+            secret: SensitiveConfigSecret(cfg.secret.clone()),
+        }
+    }
+}
+
+impl PreparedCodexAuth {
+    pub(crate) fn proof(&self) -> &CodexAuthReadyProof {
+        &self.proof
+    }
+
+    pub(crate) fn verify_unchanged(&self) -> Result<(), String> {
+        self.verify_unchanged_from(&config::default_dir())
+    }
+
+    fn verify_unchanged_from(&self, dir: &Path) -> Result<(), String> {
+        verify_launch_snapshot_unchanged(dir, &self.target, &self.snapshot)
+    }
+}
+
+fn verify_launch_snapshot_unchanged(
+    dir: &Path,
+    target: &CodexPreflightTarget,
+    expected: &CodexLaunchSnapshot,
+) -> Result<(), String> {
+    if CodexLaunchSnapshot::capture_from(dir, target)? == *expected {
+        Ok(())
+    } else {
+        Err("config_changed_retry：Codex 启动配置在认证检查期间发生变化，请重试。".into())
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,12 +355,6 @@ struct LoginSidecarEvent {
     kind: String,
     #[serde(default)]
     state: Option<String>,
-    #[serde(default)]
-    verification_url: Option<String>,
-    #[serde(default)]
-    user_code: Option<String>,
-    #[serde(default)]
-    expires_at_ms: Option<i64>,
     #[serde(default)]
     disposition: Option<String>,
     #[serde(default)]
@@ -269,8 +475,8 @@ fn tracked_proxy_state(st: &mut AppState) -> TrackedProxyState {
 /// Prepare for a CSSwitch-owned Codex credential mutation. Only a runtime whose
 /// in-memory launch identity is exactly `codex` is stopped. Other known providers
 /// remain untouched; an alive but unidentified managed child fails closed.
-fn prepare_codex_auth_mutation(
-    app: &tauri::AppHandle,
+fn prepare_codex_auth_mutation<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &SharedAppState,
     lifecycle: &crate::lifecycle::Lifecycle,
 ) -> Result<AuthRuntimeAction, String> {
@@ -355,7 +561,7 @@ fn codex_downgrade_preview_for(cfg: &config::Config) -> Value {
         .profiles
         .iter()
         .filter(|profile| {
-            profile.credential_source == crate::provider_contracts::CredentialSource::KeychainOauth
+            profile.credential_source == crate::provider_contracts::CredentialSource::CsswitchOauth
         })
         .map(|profile| json!({ "id": profile.id, "name": profile.name }))
         .collect();
@@ -368,7 +574,7 @@ fn codex_downgrade_preview_for(cfg: &config::Config) -> Value {
         "profile_count": profiles.len(),
         "profiles": profiles,
         "active_will_clear": active_will_clear,
-        "keychain_unchanged": true,
+        "credentials_unchanged": true,
         "app_exit_required": true,
     })
 }
@@ -381,7 +587,7 @@ fn downgrade_actions_for_expected(
         .profiles
         .iter()
         .filter(|profile| {
-            profile.credential_source == crate::provider_contracts::CredentialSource::KeychainOauth
+            profile.credential_source == crate::provider_contracts::CredentialSource::CsswitchOauth
         })
         .map(|profile| profile.id.clone())
         .collect();
@@ -407,7 +613,7 @@ fn stop_all_before_downgrade(
     let sandbox_result = super::runtime::stop_sandbox_state(app, &mut app_state);
     app_state.stop_proxy();
     sandbox_result.map_err(|error| {
-        format!("降级前无法安全停止受管 Science；配置、导出和 Keychain 均未修改：{error}")
+        format!("降级前无法安全停止受管 Science；配置、导出和本地认证文件均未修改：{error}")
     })
 }
 
@@ -426,6 +632,18 @@ fn is_lower_hex(value: &str, len: usize) -> bool {
 }
 
 fn validate_status(status: &AuthStatusView) -> Result<(), String> {
+    let valid_reason = matches!(
+        status.reason.as_str(),
+        "ready"
+            | "state_missing"
+            | "state_uncommitted"
+            | "oauth_missing"
+            | "thinking_missing"
+            | "record_mismatch"
+    );
+    if !valid_reason {
+        return Err("Codex 认证 sidecar 返回了未知的状态原因。".into());
+    }
     if !matches!(
         status.expiry_state.as_str(),
         "missing" | "unknown" | "expired" | "expiring" | "valid"
@@ -447,57 +665,39 @@ fn validate_status(status: &AuthStatusView) -> Result<(), String> {
         return Err("Codex 认证 sidecar 返回了非法认证代次。".into());
     }
     if status.authenticated {
-        if status.account_hash.is_none()
+        if status.reason != "ready"
+            || status.account_hash.is_none()
             || status.auth_epoch.is_none()
+            || status.auth_generation == 0
             || status.expiry_state == "missing"
+            || !matches!(
+                (status.expiry_state.as_str(), status.expires_at),
+                ("unknown", None) | ("expired" | "expiring" | "valid", Some(_))
+            )
         {
             return Err("Codex 认证 sidecar 返回了不一致的已登录状态。".into());
         }
-    } else if status.account_hash.is_some() || status.expiry_state != "missing" {
+    } else if status.reason == "ready"
+        || status.account_hash.is_some()
+        || status.expires_at.is_some()
+        || status.expiry_state != "missing"
+    {
         return Err("Codex 认证 sidecar 返回了不一致的未登录状态。".into());
+    }
+    if !status.authenticated {
+        match status.reason.as_str() {
+            "state_missing" if status.auth_epoch.is_none() && status.auth_generation == 0 => {}
+            "state_uncommitted" if status.auth_epoch.is_some() => {}
+            "oauth_missing" | "thinking_missing" | "record_mismatch"
+                if status.auth_epoch.is_some() && status.auth_generation > 0 => {}
+            _ => return Err("Codex 认证 sidecar 返回了不一致的状态原因。".into()),
+        }
     }
     Ok(())
 }
 
 fn allowed_error_code(code: &str) -> bool {
     expected_error_exit_code(code).is_some()
-}
-
-fn summarize_auth_for_diagnostics(value: &Value) -> String {
-    match value.get("ok").and_then(Value::as_bool) {
-        Some(true) => {
-            let Some(status) = value.get("status") else {
-                return "auth=protocol_error".into();
-            };
-            let authenticated = status
-                .get("authenticated")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            let expiry = status
-                .get("expiry_state")
-                .and_then(Value::as_str)
-                .filter(|state| {
-                    matches!(
-                        *state,
-                        "missing" | "unknown" | "expired" | "expiring" | "valid"
-                    )
-                });
-            match (authenticated, expiry) {
-                (true, Some(state)) if state != "missing" => {
-                    format!("auth=authenticated expiry={state}")
-                }
-                (false, Some("missing")) => "auth=unauthenticated expiry=missing".into(),
-                _ => "auth=protocol_error".into(),
-            }
-        }
-        Some(false) => value
-            .pointer("/error/code")
-            .and_then(Value::as_str)
-            .filter(|code| allowed_error_code(code))
-            .map(|code| format!("auth=error code={code}"))
-            .unwrap_or_else(|| "auth=protocol_error".into()),
-        None => "auth=protocol_error".into(),
-    }
 }
 
 fn expected_error_exit_code(code: &str) -> Option<i32> {
@@ -518,9 +718,8 @@ fn expected_error_exit_code(code: &str) -> Option<i32> {
         | "oauth_challenge_response"
         | "proxy_connect_failed"
         | "tls_failed"
-        | "device_auth_unavailable"
         | "auth_cancelled" => Some(7),
-        "internal_error" => Some(8),
+        "identity_mismatch" | "internal_error" => Some(8),
         _ => None,
     }
 }
@@ -533,7 +732,7 @@ fn safe_error_message(code: &str) -> &'static str {
         "browser_open_failed" => "无法打开系统浏览器完成 Codex 登录。",
         "callback_timeout" => "等待 Codex 登录回调超时，请重试。",
         "callback_unavailable" => "Codex 登录回调端口不可用，请关闭占用后重试。",
-        "keychain_unavailable" => "无法访问 CSSwitch 专用的 macOS 钥匙串项目。",
+        "keychain_unavailable" => "旧版 CSSwitch 本地认证存储不可用。",
         "not_authenticated" => "CSSwitch 尚未登录 Codex。",
         "oauth_denied" => "Codex 登录未获授权。",
         "oauth_network_error" => "Codex 认证网络请求失败，请稍后重试。",
@@ -542,10 +741,10 @@ fn safe_error_message(code: &str) -> &'static str {
         "oauth_challenge_response" => "Codex 认证请求遇到上游安全挑战。",
         "proxy_connect_failed" => "Codex 认证无法连接所选代理。",
         "tls_failed" => "Codex 认证 TLS 连接失败。",
-        "device_auth_unavailable" => "当前服务未启用设备码登录，请改用浏览器登录。",
         "auth_cancelled" => "Codex 登录已取消。",
         "auth_storage_error" => "CSSwitch 无法安全保存 Codex 认证状态。",
-        "unsupported_platform" => "当前平台不支持 CSSwitch Codex 钥匙串认证。",
+        "unsupported_platform" => "当前平台不支持 CSSwitch Codex 本地认证存储。",
+        "identity_mismatch" => "安装包内 Gateway 与 Desktop 不匹配。",
         _ => "Codex 认证 sidecar 发生内部错误。",
     }
 }
@@ -553,15 +752,14 @@ fn safe_error_message(code: &str) -> &'static str {
 fn allowed_stage(stage: &str) -> bool {
     matches!(
         stage,
-        "proxy_config"
-            | "device_code_request"
-            | "device_wait"
+        "identity_check"
+            | "proxy_config"
             | "browser_open"
             | "callback_wait"
             | "token_exchange"
             | "refresh"
             | "revoke"
-            | "keychain_commit"
+            | "credential_commit"
             | "cancelled"
     )
 }
@@ -732,10 +930,6 @@ fn spawn_codex_auth_sidecar_at(
         .arg(action.as_str())
         .env_clear()
         .env("HOME", home)
-        .env(
-            "CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE",
-            EXPECTED_CODEX_KEYCHAIN_SERVICE,
-        )
         .stdin(if action.is_login() {
             Stdio::piped()
         } else {
@@ -786,14 +980,25 @@ fn spawn_codex_auth_sidecar_at(
     })
 }
 
+#[cfg(test)]
 fn wait_for_single_sidecar_response(
-    mut process: ManagedAuthProcess,
+    process: ManagedAuthProcess,
     action: CodexAuthAction,
     timeout: Duration,
 ) -> Result<Value, String> {
+    wait_for_single_sidecar_response_controlled(process, action, timeout, None)
+        .map_err(|error| error.safe_message().to_string())
+}
+
+fn wait_for_single_sidecar_response_controlled(
+    mut process: ManagedAuthProcess,
+    action: CodexAuthAction,
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+) -> Result<Value, SidecarWaitFailure> {
     if action.is_login() || process.stdin.is_some() {
         stop_auth_child(&mut process.child);
-        return Err("登录 sidecar 必须使用流式协议读取。".into());
+        return Err(SidecarWaitFailure::Protocol);
     }
     let ManagedAuthProcess {
         ref mut child,
@@ -807,6 +1012,10 @@ fn wait_for_single_sidecar_response(
     let mut exit_status = None;
     let mut chunk = [0_u8; 8192];
     loop {
+        if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+            stop_auth_child(child);
+            return Err(SidecarWaitFailure::Cancelled);
+        }
         loop {
             match stdout.read(&mut chunk) {
                 Ok(0) => {
@@ -817,14 +1026,14 @@ fn wait_for_single_sidecar_response(
                     bytes.extend_from_slice(&chunk[..read]);
                     if bytes.len() as u64 > MAX_AUTH_OUTPUT_BYTES {
                         stop_auth_child(child);
-                        return Err("Codex 认证 sidecar 输出读取失败或超过 64 KiB。".into());
+                        return Err(SidecarWaitFailure::Protocol);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
                     stop_auth_child(child);
-                    return Err("Codex 认证 sidecar 输出读取失败或超过 64 KiB。".into());
+                    return Err(SidecarWaitFailure::Protocol);
                 }
             }
         }
@@ -833,7 +1042,7 @@ fn wait_for_single_sidecar_response(
                 Ok(status) => exit_status = status,
                 Err(_) => {
                     stop_auth_child(child);
-                    return Err("无法确认 Codex 认证 sidecar 退出状态。".into());
+                    return Err(SidecarWaitFailure::Protocol);
                 }
             }
         }
@@ -842,23 +1051,12 @@ fn wait_for_single_sidecar_response(
         }
         if Instant::now() >= deadline {
             stop_auth_child(child);
-            return Err("Codex 认证 sidecar 超时，受管进程已结束。".into());
+            return Err(SidecarWaitFailure::Timeout);
         }
         std::thread::sleep(AUTH_POLL_INTERVAL);
     }
     parse_sidecar_output(&bytes, action, exit_status.and_then(|status| status.code()))
-}
-
-fn valid_device_user_code(value: &str) -> bool {
-    let Some((left, right)) = value.split_once('-') else {
-        return false;
-    };
-    (4..=8).contains(&left.len())
-        && (4..=8).contains(&right.len())
-        && left
-            .chars()
-            .chain(right.chars())
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+        .map_err(|_| SidecarWaitFailure::Protocol)
 }
 
 fn validate_login_sidecar_error(error: &LoginSidecarError) -> bool {
@@ -964,35 +1162,9 @@ fn wait_for_login_sidecar(
                                     return Err("Codex 认证 progress 字段非法。".into());
                                 }
                                 let state = event.state.as_deref().unwrap_or_default();
-                                if !matches!(
-                                    state,
-                                    "verification_required"
-                                        | "waiting"
-                                        | "exchanging"
-                                        | "committing"
-                                ) {
+                                if !matches!(state, "waiting" | "exchanging" | "committing") {
                                     stop_auth_child(&mut process.child);
                                     return Err("Codex 认证 progress 状态非法。".into());
-                                }
-                                if state == "verification_required" {
-                                    if action != CodexAuthAction::LoginDevice
-                                        || event.verification_url.as_deref()
-                                            != Some("https://auth.openai.com/codex/device")
-                                        || event
-                                            .user_code
-                                            .as_deref()
-                                            .is_none_or(|code| !valid_device_user_code(code))
-                                        || event.expires_at_ms.is_none()
-                                    {
-                                        stop_auth_child(&mut process.child);
-                                        return Err("Codex 设备码 progress 字段非法。".into());
-                                    }
-                                } else if event.verification_url.is_some()
-                                    || event.user_code.is_some()
-                                    || event.expires_at_ms.is_some()
-                                {
-                                    stop_auth_child(&mut process.child);
-                                    return Err("Codex 认证 progress 携带了多余字段。".into());
                                 }
                                 on_progress(&event);
                             }
@@ -1001,9 +1173,6 @@ fn wait_for_login_sidecar(
                                     || event.state.is_some()
                                     || event.status.is_some()
                                     || event.error.is_some()
-                                    || event.verification_url.is_some()
-                                    || event.user_code.is_some()
-                                    || event.expires_at_ms.is_some()
                                 {
                                     stop_auth_child(&mut process.child);
                                     return Err("Codex 认证 cancel ack 字段非法。".into());
@@ -1022,12 +1191,7 @@ fn wait_for_login_sidecar(
                                 on_cancel_ack(disposition);
                             }
                             "terminal" => {
-                                if terminal.is_some()
-                                    || event.disposition.is_some()
-                                    || event.verification_url.is_some()
-                                    || event.user_code.is_some()
-                                    || event.expires_at_ms.is_some()
-                                {
+                                if terminal.is_some() || event.disposition.is_some() {
                                     stop_auth_child(&mut process.child);
                                     return Err("Codex 认证 terminal 字段非法。".into());
                                 }
@@ -1043,6 +1207,12 @@ fn wait_for_login_sidecar(
                                             return Err("Codex 认证成功终态包含错误。".into());
                                         }
                                         validate_status(status)?;
+                                        if !status.authenticated {
+                                            stop_auth_child(&mut process.child);
+                                            return Err(
+                                                "Codex 认证成功终态必须包含已登录状态。".into()
+                                            );
+                                        }
                                         terminal = Some(json!({
                                             "ok": true,
                                             "state": "succeeded",
@@ -1134,21 +1304,42 @@ fn wait_for_login_sidecar(
     terminal.ok_or_else(|| "Codex 认证 sidecar 未返回终态。".into())
 }
 
-fn run_codex_auth_sidecar<R: tauri::Runtime>(
+fn run_codex_auth_preflight_sidecar<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
-    action: CodexAuthAction,
-) -> Result<Value, String> {
-    let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
-    let route = resolve_codex_network_route()?;
-    let process = spawn_codex_auth_sidecar_at(
+    reservation: &AuthPreflightReservation,
+    route: &csswitch_codex_network::ResolvedCodexNetworkRoute,
+) -> Result<Value, CodexAuthCommandError> {
+    let binary = codex_gateway_bin(app)?;
+    let mut process = spawn_codex_auth_sidecar_at(
         &binary,
-        &production_home()?,
-        action,
-        Some(&route),
+        &production_home()
+            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
+        CodexAuthAction::Status,
+        Some(route),
         None,
         false,
-    )?;
-    wait_for_single_sidecar_response(process, action, action.timeout())
+    )
+    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    if reservation.set_pid(process.child.id()).is_err() {
+        stop_auth_child(&mut process.child);
+        return Err(CodexAuthCommandError::busy());
+    }
+    let result = wait_for_single_sidecar_response_controlled(
+        process,
+        CodexAuthAction::Status,
+        CodexAuthAction::Status.timeout(),
+        Some(reservation.cancel_flag()),
+    );
+    reservation.clear_pid();
+    result.map_err(auth_error_from_sidecar_wait)
+}
+
+fn codex_gateway_bin<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+) -> Result<PathBuf, CodexAuthCommandError> {
+    let binary = gateway_bin_path(app)
+        .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    Ok(binary)
 }
 
 fn spawn_codex_auth_sidecar<R: tauri::Runtime>(
@@ -1156,37 +1347,66 @@ fn spawn_codex_auth_sidecar<R: tauri::Runtime>(
     action: CodexAuthAction,
     operation_id: &str,
     route: &csswitch_codex_network::ResolvedCodexNetworkRoute,
-) -> Result<ManagedAuthProcess, String> {
-    let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
+) -> Result<ManagedAuthProcess, CodexAuthCommandError> {
+    let binary = codex_gateway_bin(app)?;
     spawn_codex_auth_sidecar_at(
         &binary,
-        &production_home()?,
+        &production_home()
+            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
         action,
         Some(route),
         Some(operation_id),
         false,
     )
+    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
 }
 
-fn run_codex_logout_sidecar<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Value, String> {
-    let binary = gateway_bin_path(app).ok_or("找不到受管 csswitch-gateway sidecar。")?;
+fn register_login_process(
+    supervisor: &CodexAuthSupervisor,
+    operation_id: &str,
+    mut process: ManagedAuthProcess,
+) -> Result<ManagedAuthProcess, RuntimeCommandError> {
+    if supervisor
+        .set_pid(operation_id, process.child.id())
+        .is_err()
+    {
+        stop_auth_child(&mut process.child);
+        return Err(RuntimeCommandError::from(CodexAuthCommandError::busy()));
+    }
+    Ok(process)
+}
+
+fn run_codex_logout_sidecar<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    mutation: &CodexMutationLease,
+) -> Result<Value, CodexAuthCommandError> {
+    let binary = codex_gateway_bin(app)?;
     let (route, skip_revoke) = match resolve_codex_network_route() {
         Ok(route) => (route, false),
         Err(_) => (csswitch_codex_network::direct_route(), true),
     };
-    let process = spawn_codex_auth_sidecar_at(
+    let mut process = spawn_codex_auth_sidecar_at(
         &binary,
-        &production_home()?,
+        &production_home()
+            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
         CodexAuthAction::Logout,
         Some(&route),
         None,
         skip_revoke,
-    )?;
-    wait_for_single_sidecar_response(
+    )
+    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    if mutation.set_pid(process.child.id()).is_err() {
+        stop_auth_child(&mut process.child);
+        return Err(CodexAuthCommandError::unavailable("auth_state_changed"));
+    }
+    let result = wait_for_single_sidecar_response_controlled(
         process,
         CodexAuthAction::Logout,
         CodexAuthAction::Logout.timeout(),
-    )
+        None,
+    );
+    mutation.clear_pid();
+    result.map_err(auth_error_from_sidecar_wait)
 }
 
 fn resolve_codex_network_route() -> Result<csswitch_codex_network::ResolvedCodexNetworkRoute, String>
@@ -1196,85 +1416,222 @@ fn resolve_codex_network_route() -> Result<csswitch_codex_network::ResolvedCodex
         .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())
 }
 
-fn require_authenticated_status(value: &Value) -> Result<(), String> {
-    if value
-        .pointer("/status/authenticated")
-        .and_then(Value::as_bool)
-        == Some(true)
-    {
-        Ok(())
-    } else {
-        Err("CODEX_LOGIN_REQUIRED：请先在 CSSwitch 中登录 Codex，再启动或验证该连接。".into())
+fn require_authenticated_status_typed(value: &Value) -> Result<(), CodexAuthCommandError> {
+    match value.get("ok").and_then(Value::as_bool) {
+        Some(false) => {
+            let code = value
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            Err(match code {
+                "auth_busy" => CodexAuthCommandError::busy(),
+                "keychain_unavailable" => {
+                    CodexAuthCommandError::unavailable("keychain_unavailable")
+                }
+                "auth_state_invalid" => CodexAuthCommandError::unavailable("auth_state_invalid"),
+                "auth_storage_error" => CodexAuthCommandError::unavailable("storage_unavailable"),
+                "unsupported_platform" => {
+                    CodexAuthCommandError::unavailable("unsupported_platform")
+                }
+                "auth_changed" => CodexAuthCommandError::unavailable("auth_state_changed"),
+                "identity_mismatch" => CodexAuthCommandError::unavailable("identity_mismatch"),
+                _ => CodexAuthCommandError::unavailable("sidecar_protocol_error"),
+            })
+        }
+        Some(true) => {
+            let authenticated = value
+                .pointer("/status/authenticated")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_protocol_error"))?;
+            if authenticated {
+                Ok(())
+            } else {
+                let reason = value
+                    .pointer("/status/reason")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_protocol_error"))?;
+                Err(CodexAuthCommandError::login_required(reason))
+            }
+        }
+        None => Err(CodexAuthCommandError::unavailable("sidecar_protocol_error")),
     }
 }
 
-/// Backend authorization boundary shared by formal proxy, scratch/model discovery,
-/// and Science auto-boot. It checks only CSSwitch-owned Keychain state through the
-/// managed sidecar and never reads or mutates native Codex CLI credentials.
-pub(crate) fn ensure_provider_auth_ready<R: tauri::Runtime>(
+fn record_last_auth_status(supervisor: &CodexAuthSupervisor, value: &Value) {
+    if value.get("ok").and_then(Value::as_bool) == Some(true) {
+        let authenticated = value
+            .pointer("/status/authenticated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let reason = value.pointer("/status/reason").and_then(Value::as_str);
+        supervisor.record_auth_status(
+            if authenticated {
+                "ready"
+            } else {
+                "not_authenticated"
+            },
+            reason,
+            None,
+        );
+        return;
+    }
+    let error = require_authenticated_status_typed(value).unwrap_err();
+    supervisor.record_auth_status("unavailable", None, error.cause);
+}
+
+fn record_login_terminal_auth_status(
+    supervisor: &CodexAuthSupervisor,
+    outcome: &Result<Value, String>,
+) {
+    match outcome {
+        Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
+            record_last_auth_status(supervisor, value);
+        }
+        Ok(value) => {
+            let cause = (value.pointer("/error/code").and_then(Value::as_str)
+                == Some("identity_mismatch"))
+            .then_some("identity_mismatch");
+            supervisor.record_auth_status("unavailable", None, cause);
+        }
+        Err(_) => {
+            supervisor.record_auth_status("unavailable", None, Some("sidecar_protocol_error"))
+        }
+    }
+}
+
+/// Runs the only interactive status sidecar for a top-level Codex user action.
+/// The returned proof owns the Codex use lease and is borrowed by nested scratch,
+/// formal Gateway, and Science startup paths without repeating auth preflight.
+pub(crate) fn prepare_provider_auth<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     adapter: &str,
-) -> Result<Option<CodexUseLease>, String> {
+    target: CodexPreflightTarget,
+) -> Result<Option<PreparedCodexAuth>, RuntimeCommandError> {
     if adapter != "codex" {
         return Ok(None);
     }
+    let snapshot = CodexLaunchSnapshot::capture(&target).map_err(RuntimeCommandError::from)?;
+    let route = resolve_codex_network_route().map_err(RuntimeCommandError::from)?;
     let supervisor = app.state::<SharedCodexAuthSupervisor>().inner().clone();
-    let lease = CodexAuthSupervisor::acquire_use(&supervisor)?;
-    let value = run_codex_auth_sidecar(app, CodexAuthAction::Status)
-        .map_err(|error| format!("CODEX_AUTH_UNAVAILABLE：{error}"))?;
-    require_authenticated_status(&value)?;
-    Ok(Some(lease))
+    let reservation = CodexAuthSupervisor::begin_auth_preflight(&supervisor)
+        .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
+    let value = match run_codex_auth_preflight_sidecar(app, &reservation, &route) {
+        Ok(value) => value,
+        Err(error) => {
+            supervisor.record_auth_status("unavailable", None, error.cause);
+            return Err(RuntimeCommandError::from(error));
+        }
+    };
+    record_last_auth_status(&supervisor, &value);
+    require_authenticated_status_typed(&value).map_err(RuntimeCommandError::from)?;
+    let proof = reservation
+        .promote_to_ready_proof()
+        .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
+    Ok(Some(PreparedCodexAuth {
+        target,
+        snapshot,
+        proof,
+    }))
 }
 
-/// Doctor-only projection. The raw status contains account and auth-generation
-/// identifiers needed by the UI contract; diagnostics deliberately discard all
-/// of them, as well as sidecar messages and local paths.
+pub(crate) fn require_provider_auth_proof(
+    adapter: &str,
+    proof: Option<&CodexAuthReadyProof>,
+) -> Result<(), String> {
+    if adapter != "codex" {
+        return Ok(());
+    }
+    let proof = proof
+        .ok_or_else(|| "CODEX_AUTH_UNAVAILABLE：缺少本次 Codex 操作的认证 proof。".to_string())?;
+    proof.ensure_active()
+}
+
+/// Doctor reports only the last user-initiated in-memory observation. It never
+/// starts an interactive status sidecar and never treats stale data as current.
 pub(crate) fn codex_auth_diagnostic_summary<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> String {
-    match run_codex_auth_sidecar(app, CodexAuthAction::Status) {
-        Ok(value) => summarize_auth_for_diagnostics(&value),
-        Err(_) => "auth=unavailable".into(),
+    let supervisor = app.state::<SharedCodexAuthSupervisor>();
+    let Some(snapshot) = supervisor.last_auth_status() else {
+        return "auth=not_checked".into();
+    };
+    let age_seconds = crate::config::now_ms()
+        .saturating_sub(snapshot.checked_at_ms)
+        .max(0)
+        / 1_000;
+    let mut fields = vec![
+        format!("auth=last_known_{}", snapshot.status),
+        format!("age_seconds={age_seconds}"),
+    ];
+    if let Some(reason) = snapshot.reason {
+        fields.push(format!("reason={reason}"));
     }
+    if let Some(cause) = snapshot.cause {
+        fields.push(format!("cause={cause}"));
+    }
+    fields.join(" ")
 }
 
 #[tauri::command]
-pub(crate) async fn codex_auth_status(app: tauri::AppHandle) -> Result<Value, String> {
-    run_blocking(move || run_codex_auth_sidecar(&app, CodexAuthAction::Status)).await
+pub(crate) async fn codex_auth_status(app: tauri::AppHandle) -> Result<Value, RuntimeCommandError> {
+    crate::run_blocking_typed(move || {
+        let route = resolve_codex_network_route().map_err(RuntimeCommandError::from)?;
+        let supervisor = app.state::<SharedCodexAuthSupervisor>().inner().clone();
+        let reservation = CodexAuthSupervisor::begin_auth_preflight(&supervisor)
+            .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
+        let value = match run_codex_auth_preflight_sidecar(&app, &reservation, &route) {
+            Ok(value) => value,
+            Err(error) => {
+                supervisor.record_auth_status("unavailable", None, error.cause);
+                return Err(RuntimeCommandError::from(error));
+            }
+        };
+        record_last_auth_status(&supervisor, &value);
+        if value.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(RuntimeCommandError::from(
+                require_authenticated_status_typed(&value).unwrap_err(),
+            ));
+        }
+        Ok(value)
+    })
+    .await
 }
 
 #[tauri::command]
-pub(crate) async fn codex_auth_start(
-    app: tauri::AppHandle,
+pub(crate) async fn codex_auth_start<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
     supervisor: State<'_, SharedCodexAuthSupervisor>,
-    method: String,
-) -> Result<Value, String> {
-    let action = match method.as_str() {
-        "device" => CodexAuthAction::LoginDevice,
-        "browser" => CodexAuthAction::LoginBrowser,
-        _ => return Err("Codex 登录 method 必须是 device 或 browser。".into()),
-    };
+    method: Option<String>,
+) -> Result<Value, RuntimeCommandError> {
+    reject_legacy_login_method(method.as_deref()).map_err(RuntimeCommandError::from)?;
+    let action = CodexAuthAction::LoginBrowser;
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
     let supervisor = supervisor.inner().clone();
     let worker_app = app.clone();
+    let worker_lifecycle = lifecycle.clone();
     let worker_supervisor = supervisor.clone();
-    let method_for_start = method.clone();
-    let (reservation, process) = run_blocking(move || {
-        lifecycle.with_serialized(|| {
-            let cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
-            config::require_template_enabled(&cfg, "codex")?;
-            let route = csswitch_codex_network::resolve_from_process(&cfg.codex_network)
-                .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?;
-            let reservation = supervisor.begin_login(&method_for_start)?;
+    let (reservation, process) = crate::run_blocking_typed(move || {
+        lifecycle.with_serialized(|| -> Result<_, RuntimeCommandError> {
+            let cfg = config::load_from(&config::default_dir())
+                .map_err(|error| RuntimeCommandError::from(error.to_string()))?;
+            config::require_template_enabled(&cfg, "codex").map_err(RuntimeCommandError::from)?;
+            let route =
+                csswitch_codex_network::resolve_from_process(&cfg.codex_network).map_err(|_| {
+                    RuntimeCommandError::from("proxy_config_invalid：Codex 网络代理配置非法。")
+                })?;
+            let reservation = supervisor
+                .begin_login()
+                .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
             let operation_id = reservation.operation_id.clone();
-            let process = (|| {
-                prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
-                let process = spawn_codex_auth_sidecar(&app, action, &operation_id, &route)?;
-                supervisor.set_pid(&operation_id, process.child.id())?;
-                Ok(process)
+            let process = (|| -> Result<_, RuntimeCommandError> {
+                prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())
+                    .map_err(RuntimeCommandError::from)?;
+                let process = spawn_codex_auth_sidecar(&app, action, &operation_id, &route)
+                    .map_err(RuntimeCommandError::from)?;
+                register_login_process(&supervisor, &operation_id, process)
             })();
             if process.is_err() {
                 supervisor.abort_login_start(&operation_id);
@@ -1284,12 +1641,13 @@ pub(crate) async fn codex_auth_start(
     })
     .await?;
     let response = serde_json::to_value(&reservation.snapshot)
-        .map_err(|_| "无法编码 Codex 登录 operation。".to_string())?;
+        .map_err(|_| RuntimeCommandError::from("无法编码 Codex 登录 operation。"))?;
     let operation_id = reservation.operation_id.clone();
     let cancel = reservation.cancel.clone();
     let _worker = tauri::async_runtime::spawn_blocking(move || {
         complete_login_operation(
             worker_app,
+            worker_lifecycle,
             worker_supervisor,
             operation_id,
             cancel,
@@ -1298,6 +1656,15 @@ pub(crate) async fn codex_auth_start(
         );
     });
     Ok(response)
+}
+
+fn reject_legacy_login_method(method: Option<&str>) -> Result<(), String> {
+    if method.is_some() {
+        return Err(
+            "login_method_removed：Codex 只支持浏览器登录，请更新调用方并移除 method 参数。".into(),
+        );
+    }
+    Ok(())
 }
 
 fn operation_error_from_envelope(value: &Value) -> OperationErrorView {
@@ -1348,6 +1715,7 @@ fn emit_operation_snapshot<R: tauri::Runtime>(
 
 fn complete_login_operation<R: tauri::Runtime>(
     app: tauri::AppHandle<R>,
+    lifecycle: SharedLifecycle,
     supervisor: SharedCodexAuthSupervisor,
     operation_id: String,
     cancel: std::sync::Arc<AtomicBool>,
@@ -1368,13 +1736,8 @@ fn complete_login_operation<R: tauri::Runtime>(
             let Some(state) = event.state.as_deref() else {
                 return;
             };
-            if let Ok(snapshot) = progress_supervisor.update_progress(
-                &progress_operation_id,
-                state,
-                event.expires_at_ms,
-                event.verification_url.clone(),
-                event.user_code.clone(),
-            ) {
+            if let Ok(snapshot) = progress_supervisor.update_progress(&progress_operation_id, state)
+            {
                 emit_operation_snapshot(&progress_app, &snapshot);
             }
         },
@@ -1382,9 +1745,41 @@ fn complete_login_operation<R: tauri::Runtime>(
             ack_supervisor.record_cancel_disposition(&ack_operation_id, disposition);
         },
     );
-    let snapshot = match outcome {
+    record_login_terminal_auth_status(&supervisor, &outcome);
+    let snapshot =
+        finalize_login_operation(&supervisor, &lifecycle, &operation_id, outcome, || {
+            crate::runtime::profile::ensure_codex_profile_inner(&config::default_dir())
+        });
+    if let Ok(snapshot) = snapshot {
+        emit_operation_snapshot(&app, &snapshot);
+    }
+}
+
+fn finalize_login_operation(
+    supervisor: &SharedCodexAuthSupervisor,
+    lifecycle: &SharedLifecycle,
+    operation_id: &str,
+    outcome: Result<Value, String>,
+    ensure_profile: impl FnOnce() -> Result<crate::runtime::profile::EnsureCodexProfileResult, String>,
+) -> Result<OperationSnapshot, String> {
+    match outcome {
         Ok(value) if value.get("ok").and_then(Value::as_bool) == Some(true) => {
-            supervisor.finish(&operation_id, "succeeded", None)
+            match lifecycle.with_serialized(ensure_profile) {
+                Ok(_) => supervisor.finish(operation_id, "succeeded", None),
+                Err(_) => supervisor.finish(
+                    operation_id,
+                    "failed",
+                    Some(OperationErrorView {
+                        code: "profile_ensure_failed".into(),
+                        stage: "profile_ensure".into(),
+                        retryable: true,
+                        upstream_status: None,
+                        response_kind: None,
+                        challenge_detected: None,
+                        transport_kind: None,
+                    }),
+                ),
+            }
         }
         Ok(value) => {
             let state = if value.get("state").and_then(Value::as_str) == Some("cancelled") {
@@ -1393,13 +1788,13 @@ fn complete_login_operation<R: tauri::Runtime>(
                 "failed"
             };
             supervisor.finish(
-                &operation_id,
+                operation_id,
                 state,
                 Some(operation_error_from_envelope(&value)),
             )
         }
         Err(_) => supervisor.finish(
-            &operation_id,
+            operation_id,
             "failed",
             Some(OperationErrorView {
                 code: "internal_error".into(),
@@ -1411,9 +1806,6 @@ fn complete_login_operation<R: tauri::Runtime>(
                 transport_kind: Some("unknown".into()),
             }),
         ),
-    };
-    if let Ok(snapshot) = snapshot {
-        emit_operation_snapshot(&app, &snapshot);
     }
 }
 
@@ -1434,27 +1826,77 @@ pub(crate) fn codex_auth_cancel(
 }
 
 #[tauri::command]
+pub(crate) async fn codex_ensure_profile<R: tauri::Runtime>(
+    app: tauri::AppHandle<R>,
+    lifecycle: State<'_, SharedLifecycle>,
+    _supervisor: State<'_, SharedCodexAuthSupervisor>,
+) -> Result<Value, RuntimeCommandError> {
+    let lifecycle = lifecycle.inner().clone();
+    crate::run_blocking_typed(move || {
+        let prepared = prepare_provider_auth(&app, "codex", CodexPreflightTarget::NoProfile)?
+            .ok_or_else(|| RuntimeCommandError::from("Codex preflight 未建立。"))?;
+        lifecycle
+            .with_serialized(|| -> Result<_, String> {
+                prepared.verify_unchanged()?;
+                ensure_codex_profile_authenticated(&config::default_dir())
+            })
+            .map_err(RuntimeCommandError::from)
+    })
+    .await
+}
+
+fn ensure_codex_profile_authenticated(dir: &Path) -> Result<Value, String> {
+    let result = crate::runtime::profile::ensure_codex_profile_inner(dir).map_err(|_| {
+        "profile_ensure_failed：授权已保存，但无法创建 Codex 配置；请重试。".to_string()
+    })?;
+    let disposition = match result.disposition {
+        crate::runtime::profile::EnsureCodexProfileDisposition::Created => "created",
+        crate::runtime::profile::EnsureCodexProfileDisposition::Existing => "existing",
+    };
+    Ok(json!({
+        "disposition": disposition,
+        "profile_id": result.profile_id,
+    }))
+}
+
+#[tauri::command]
 pub(crate) async fn codex_auth_logout(
     app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
     supervisor: State<'_, SharedCodexAuthSupervisor>,
-) -> Result<Value, String> {
+) -> Result<Value, RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
     let supervisor = supervisor.inner().clone();
+    let logout_supervisor = supervisor.clone();
     let logout_app = app.clone();
-    let mutation: CodexMutationLease = run_blocking(move || {
-        lifecycle.with_serialized(|| {
-            let mutation = CodexAuthSupervisor::begin_mutation(&supervisor)?;
-            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
+    let mutation: CodexMutationLease = crate::run_blocking_typed(move || {
+        lifecycle.with_serialized(|| -> Result<_, RuntimeCommandError> {
+            let mutation = CodexAuthSupervisor::begin_mutation(&supervisor)
+                .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
+            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())
+                .map_err(RuntimeCommandError::from)?;
             Ok(mutation)
         })
     })
     .await?;
-    run_blocking(move || {
-        let _mutation = mutation;
-        run_codex_logout_sidecar(&logout_app)
+    crate::run_blocking_typed(move || {
+        let mutation = mutation;
+        let value = match run_codex_logout_sidecar(&logout_app, &mutation) {
+            Ok(value) => value,
+            Err(error) => {
+                logout_supervisor.record_auth_status("unavailable", None, error.cause);
+                return Err(RuntimeCommandError::from(error));
+            }
+        };
+        record_last_auth_status(&logout_supervisor, &value);
+        if value.get("ok").and_then(Value::as_bool) == Some(false) {
+            return Err(RuntimeCommandError::from(
+                require_authenticated_status_typed(&value).unwrap_err(),
+            ));
+        }
+        Ok(value)
     })
     .await
 }
@@ -1466,20 +1908,24 @@ pub(crate) async fn set_experimental_codex_enabled(
     lifecycle: State<'_, SharedLifecycle>,
     supervisor: State<'_, SharedCodexAuthSupervisor>,
     enabled: bool,
-) -> Result<Value, String> {
+) -> Result<Value, RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
     let supervisor = supervisor.inner().clone();
-    run_blocking(move || {
-        lifecycle.with_serialized(|| {
+    crate::run_blocking_typed(move || {
+        lifecycle.with_serialized(|| -> Result<_, RuntimeCommandError> {
             let _mutation = if enabled {
                 None
             } else {
-                Some(CodexAuthSupervisor::begin_mutation(&supervisor)?)
+                Some(
+                    CodexAuthSupervisor::begin_mutation(&supervisor)
+                        .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?,
+                )
             };
             set_experimental_codex_enabled_at(&config::default_dir(), enabled, || {
                 prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref()).map(|_| ())
             })
+            .map_err(RuntimeCommandError::from)
         })
     })
     .await
@@ -1492,21 +1938,23 @@ pub(crate) async fn set_codex_network(
     lifecycle: State<'_, SharedLifecycle>,
     supervisor: State<'_, SharedCodexAuthSupervisor>,
     settings: csswitch_codex_network::CodexNetworkSettings,
-) -> Result<Value, String> {
+) -> Result<Value, RuntimeCommandError> {
     let resolved = csswitch_codex_network::resolve_from_process(&settings)
-        .map_err(|_| "proxy_config_invalid：Codex 网络代理配置非法。".to_string())?;
+        .map_err(|_| RuntimeCommandError::from("proxy_config_invalid：Codex 网络代理配置非法。"))?;
     let mode = settings.mode;
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
     let supervisor = supervisor.inner().clone();
-    run_blocking(move || {
-        lifecycle.with_serialized(|| {
-            let _mutation = CodexAuthSupervisor::begin_mutation(&supervisor)?;
-            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())?;
+    crate::run_blocking_typed(move || {
+        lifecycle.with_serialized(|| -> Result<_, RuntimeCommandError> {
+            let _mutation = CodexAuthSupervisor::begin_mutation(&supervisor)
+                .map_err(|_| RuntimeCommandError::from(CodexAuthCommandError::busy()))?;
+            prepare_codex_auth_mutation(&app, &state, lifecycle.as_ref())
+                .map_err(RuntimeCommandError::from)?;
             config::update(&config::default_dir(), move |cfg| {
                 cfg.codex_network = settings;
             })
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| RuntimeCommandError::from(error.to_string()))?;
             Ok(json!({
                 "mode": mode,
                 "source": resolved.source,
@@ -1551,7 +1999,7 @@ pub(crate) async fn codex_downgrade_export_all(
         return Ok(json!({
             "schema_version": 1,
             "status": "CANCELLED",
-            "keychain_unchanged": true,
+            "credentials_unchanged": true,
         }));
     };
     let destination = selected
@@ -1571,7 +2019,7 @@ pub(crate) async fn codex_downgrade_export_all(
                     "status": "DOWNGRADED_EXIT_REQUIRED",
                     "profile_count": actions.len(),
                     "exported": true,
-                    "keychain_unchanged": true,
+                    "credentials_unchanged": true,
                     "app_exit_required": true,
                 })),
                 Err(error) if error.exit_required => {
@@ -1610,6 +2058,7 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
     use std::os::unix::fs::PermissionsExt;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TempDir(PathBuf);
@@ -1644,10 +2093,59 @@ mod tests {
 
     fn success_json(command: &str) -> String {
         format!(
-            "{{\"schema_version\":2,\"ok\":true,\"command\":\"{command}\",\"status\":{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":7}}}}",
+            "{{\"schema_version\":3,\"ok\":true,\"command\":\"{command}\",\"status\":{{\"authenticated\":true,\"reason\":\"ready\",\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":7}}}}",
             "ab".repeat(16),
             "cd".repeat(16)
         )
+    }
+
+    fn status_json(reason: &str, authenticated: bool, generation: u64) -> String {
+        let ready = authenticated;
+        let account = if ready {
+            format!("\"{}\"", "ab".repeat(16))
+        } else {
+            "null".into()
+        };
+        let epoch = if reason == "state_missing" {
+            "null".into()
+        } else {
+            format!("\"{}\"", "cd".repeat(16))
+        };
+        let expiry_state = if ready { "valid" } else { "missing" };
+        let expires_at = if ready { "2000000000" } else { "null" };
+        format!(
+            "{{\"schema_version\":3,\"ok\":true,\"command\":\"status\",\"status\":{{\"authenticated\":{authenticated},\"reason\":\"{reason}\",\"account_hash\":{account},\"expiry_state\":\"{expiry_state}\",\"expires_at\":{expires_at},\"auth_epoch\":{epoch},\"auth_generation\":{generation}}}}}"
+        )
+    }
+
+    #[test]
+    fn legacy_method_is_rejected_by_the_real_tauri_invoke_handler() {
+        let app = tauri::test::mock_builder()
+            .manage(Arc::new(Mutex::new(AppState::default())) as SharedAppState)
+            .manage(Arc::new(crate::lifecycle::Lifecycle::new()) as SharedLifecycle)
+            .manage(Arc::new(CodexAuthSupervisor::default()) as SharedCodexAuthSupervisor)
+            .invoke_handler(tauri::generate_handler![codex_auth_start])
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let webview = tauri::WebviewWindowBuilder::new(&app, "main", Default::default())
+            .build()
+            .unwrap();
+        let error = tauri::test::get_ipc_response(
+            &webview,
+            tauri::webview::InvokeRequest {
+                cmd: "codex_auth_start".into(),
+                callback: tauri::ipc::CallbackFn(0),
+                error: tauri::ipc::CallbackFn(1),
+                url: "tauri://localhost".parse().unwrap(),
+                body: tauri::ipc::InvokeBody::Json(json!({"method": "device"})),
+                headers: Default::default(),
+                invoke_key: tauri::test::INVOKE_KEY.into(),
+            },
+        )
+        .unwrap_err();
+        assert!(error
+            .as_str()
+            .is_some_and(|message| message.starts_with("login_method_removed：")));
     }
 
     #[test]
@@ -1736,13 +2234,140 @@ mod tests {
     }
 
     #[test]
+    fn launch_snapshot_ignores_unrelated_config_but_detects_every_launch_boundary() {
+        let temp = TempDir::new("launch-snapshot");
+        let codex = config::Profile {
+            id: "codex-profile".into(),
+            name: "Codex display name".into(),
+            template_id: "codex".into(),
+            api_format: "openai_responses".into(),
+            base_url: String::new(),
+            model: String::new(),
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
+            credential_ref: Some("csswitch:codex:default".into()),
+            model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
+            notes: Some("ignored note".into()),
+            ..Default::default()
+        };
+        let other = config::Profile {
+            id: "other-profile".into(),
+            name: "Other".into(),
+            template_id: "glm".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://example.test/anthropic".into(),
+            model: "glm-test".into(),
+            api_key: "ignored-api-key".into(),
+            notes: Some("ignored".into()),
+            ..Default::default()
+        };
+        config::update(&temp.0, |cfg| {
+            cfg.profiles = vec![codex, other];
+            cfg.active_id = "codex-profile".into();
+            cfg.experimental_codex_enabled = true;
+            cfg.secret = "private-path-secret".into();
+        })
+        .unwrap();
+        let target = CodexPreflightTarget::ActiveProfile;
+        let base = config::load_from(&temp.0).unwrap();
+        let baseline = CodexLaunchSnapshot::from_config(&base, &target);
+        let mut unrelated = base.clone();
+        unrelated.pending_notice = Some("ignored notice".into());
+        unrelated.profiles[0].name = "Renamed Codex".into();
+        unrelated.profiles[0].notes = Some("changed note".into());
+        unrelated.profiles[1].name = "Renamed other".into();
+        unrelated.profiles[1].api_key = "changed-ignored-key".into();
+        assert!(CodexLaunchSnapshot::from_config(&unrelated, &target) == baseline);
+
+        type SnapshotMutation = Box<dyn Fn(&mut config::Config)>;
+        let mutations: Vec<(&str, SnapshotMutation)> = vec![
+            (
+                "active_id",
+                Box::new(|cfg| cfg.active_id = "other-profile".into()),
+            ),
+            (
+                "profile.id",
+                Box::new(|cfg| cfg.profiles[0].id = "changed-id".into()),
+            ),
+            (
+                "profile.template_id",
+                Box::new(|cfg| cfg.profiles[0].template_id = "changed-template".into()),
+            ),
+            (
+                "profile.api_format",
+                Box::new(|cfg| cfg.profiles[0].api_format = "changed-format".into()),
+            ),
+            (
+                "profile.base_url",
+                Box::new(|cfg| cfg.profiles[0].base_url = "https://changed.test".into()),
+            ),
+            (
+                "profile.model",
+                Box::new(|cfg| cfg.profiles[0].model = "changed-model".into()),
+            ),
+            (
+                "profile.credential_source",
+                Box::new(|cfg| {
+                    cfg.profiles[0].credential_source =
+                        crate::provider_contracts::CredentialSource::ApiKey
+                }),
+            ),
+            (
+                "profile.credential_ref",
+                Box::new(|cfg| cfg.profiles[0].credential_ref = None),
+            ),
+            (
+                "profile.model_policy",
+                Box::new(|cfg| {
+                    cfg.profiles[0].model_policy =
+                        crate::provider_contracts::ModelPolicy::RequiredFixed
+                }),
+            ),
+            (
+                "experimental_codex_enabled",
+                Box::new(|cfg| cfg.experimental_codex_enabled = false),
+            ),
+            (
+                "codex_network",
+                Box::new(|cfg| {
+                    cfg.codex_network.mode = csswitch_codex_network::CodexNetworkMode::Custom;
+                    cfg.codex_network.proxy_url = "http://127.0.0.1:8080".into();
+                }),
+            ),
+            ("proxy_port", Box::new(|cfg| cfg.proxy_port += 1)),
+            ("sandbox_port", Box::new(|cfg| cfg.sandbox_port += 1)),
+            (
+                "reuse_system_ssh",
+                Box::new(|cfg| cfg.reuse_system_ssh = true),
+            ),
+            ("mode", Box::new(|cfg| cfg.mode = "changed-mode".into())),
+            (
+                "path_secret",
+                Box::new(|cfg| cfg.secret = "changed-private-path-secret".into()),
+            ),
+        ];
+        for (field, mutate) in mutations {
+            let mut changed = base.clone();
+            mutate(&mut changed);
+            assert!(
+                CodexLaunchSnapshot::from_config(&changed, &target) != baseline,
+                "launch snapshot missed {field}"
+            );
+        }
+
+        let mut changed = base;
+        changed.profiles[0].model = "changed-model".into();
+        config::save_to(&temp.0, &changed).unwrap();
+        let error = verify_launch_snapshot_unchanged(&temp.0, &target, &baseline).unwrap_err();
+        assert!(error.starts_with("config_changed_retry："));
+    }
+
+    #[test]
     fn sidecar_runner_uses_exact_args_clean_env_and_returns_safe_success() {
         let temp = TempDir::new("success");
         let output = success_json("status");
         let script = temp.script(&format!(
-            "[ \"$#\" -eq 2 ]\n[ \"$1\" = \"codex-auth\" ]\n[ \"$2\" = \"status\" ]\n[ \"$HOME\" = \"{}\" ]\n[ \"$CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE\" = \"{}\" ]\n[ -z \"${{OPENAI_API_KEY:-}}\" ]\nprintf '%s\\n' '{}'",
+            "[ \"$#\" -eq 2 ]\n[ \"$1\" = \"codex-auth\" ]\n[ \"$2\" = \"status\" ]\n[ \"$HOME\" = \"{}\" ]\n[ -z \"${{CSSWITCH_EXPECTED_CODEX_KEYCHAIN_SERVICE:-}}\" ]\n[ -z \"${{OPENAI_API_KEY:-}}\" ]\nprintf '%s\\n' '{}'",
             temp.0.display(),
-            EXPECTED_CODEX_KEYCHAIN_SERVICE,
             output
         ));
         let value = run_codex_auth_sidecar_at(&script, &temp.0, CodexAuthAction::Status).unwrap();
@@ -1758,13 +2383,20 @@ mod tests {
     fn sidecar_runner_returns_typed_failure_but_discards_untrusted_message_and_stderr() {
         let temp = TempDir::new("failure");
         let script = temp.script(
-            "printf '%s\\n' 'secret-stderr' >&2\nprintf '%s\\n' '{\"schema_version\":2,\"ok\":false,\"command\":\"logout\",\"error\":{\"code\":\"oauth_denied\",\"message\":\"attacker supplied secret\",\"retryable\":false}}'\nexit 4",
+            "printf '%s\\n' 'secret-stderr' >&2\nprintf '%s\\n' '{\"schema_version\":3,\"ok\":false,\"command\":\"logout\",\"error\":{\"code\":\"oauth_denied\",\"message\":\"attacker supplied secret\",\"retryable\":false}}'\nexit 4",
         );
         let value = run_codex_auth_sidecar_at(&script, &temp.0, CodexAuthAction::Logout).unwrap();
         assert_eq!(value["ok"], false);
         assert_eq!(value["error"]["code"], "oauth_denied");
         assert!(!value.to_string().contains("attacker supplied secret"));
         assert!(!value.to_string().contains("secret-stderr"));
+
+        let identity = br#"{"schema_version":3,"ok":false,"command":"status","error":{"code":"identity_mismatch","message":"Gateway code identity mismatch.","retryable":false,"stage":"identity_check"}}"#;
+        let identity = parse_sidecar_output(identity, CodexAuthAction::Status, Some(8)).unwrap();
+        let typed = require_authenticated_status_typed(&identity).unwrap_err();
+        assert_eq!(typed.code, "codex_auth_unavailable");
+        assert_eq!(typed.cause, Some("identity_mismatch"));
+        assert!(!typed.retryable);
     }
 
     #[test]
@@ -1782,14 +2414,26 @@ mod tests {
             Some(0)
         )
         .is_err());
+        let missing_reason = success.replacen(",\"reason\":\"ready\"", "", 1);
+        assert!(
+            parse_sidecar_output(missing_reason.as_bytes(), CodexAuthAction::Status, Some(0))
+                .is_err()
+        );
+        let v2_with_v3_status = success.replacen("\"schema_version\":3", "\"schema_version\":2", 1);
+        assert!(parse_sidecar_output(
+            v2_with_v3_status.as_bytes(),
+            CodexAuthAction::Status,
+            Some(0)
+        )
+        .is_err());
         let extra = success.replacen(
-            "\"schema_version\":2",
-            "\"schema_version\":2,\"token\":\"must-reject\"",
+            "\"schema_version\":3",
+            "\"schema_version\":3,\"token\":\"must-reject\"",
             1,
         );
         assert!(parse_sidecar_output(extra.as_bytes(), CodexAuthAction::Status, Some(0)).is_err());
 
-        let denied = br#"{"schema_version":2,"ok":false,"command":"logout","error":{"code":"oauth_denied","message":"denied","retryable":false}}"#;
+        let denied = br#"{"schema_version":3,"ok":false,"command":"logout","error":{"code":"oauth_denied","message":"denied","retryable":false}}"#;
         assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, Some(7)).is_err());
         assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, None).is_err());
         assert!(parse_sidecar_output(denied, CodexAuthAction::Logout, Some(4)).is_ok());
@@ -1799,6 +2443,145 @@ mod tests {
             "i=0\nwhile [ \"$i\" -lt 70000 ]; do printf x; i=$((i + 1)); done\nprintf '\\n'",
         );
         assert!(run_codex_auth_sidecar_at(&script, &temp.0, CodexAuthAction::Status).is_err());
+    }
+
+    #[test]
+    fn sidecar_v3_round_trips_every_status_reason_and_rejects_illegal_combinations() {
+        for (reason, authenticated, generation) in [
+            ("ready", true, 7),
+            ("state_missing", false, 0),
+            ("state_uncommitted", false, 0),
+            ("oauth_missing", false, 7),
+            ("thinking_missing", false, 7),
+            ("record_mismatch", false, 7),
+        ] {
+            let encoded = status_json(reason, authenticated, generation);
+            let parsed = parse_sidecar_output(encoded.as_bytes(), CodexAuthAction::Status, Some(0))
+                .unwrap_or_else(|error| panic!("reason {reason} rejected: {error}"));
+            assert_eq!(parsed["status"]["reason"], reason);
+        }
+
+        let ready = status_json("ready", true, 7);
+        let invalid = [
+            status_json("oauth_missing", true, 7),
+            status_json("ready", false, 7),
+            status_json("oauth_missing", false, 0),
+            status_json("state_missing", false, 1),
+            ready.replacen("\"expires_at\":2000000000", "\"expires_at\":null", 1),
+            ready.replacen("\"reason\":\"ready\"", "\"reason\":\"unknown\"", 1),
+        ];
+        for encoded in invalid {
+            assert!(
+                parse_sidecar_output(encoded.as_bytes(), CodexAuthAction::Status, Some(0),)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn all_v2_login_event_kinds_and_error_envelopes_fail_closed() {
+        let operation_id = "ad".repeat(16);
+        for (name, line) in [
+            (
+                "progress",
+                format!("{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"waiting\"}}"),
+            ),
+            (
+                "terminal",
+                format!("{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{{\"authenticated\":true,\"reason\":\"ready\",\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}}}", "ab".repeat(16), "cd".repeat(16)),
+            ),
+            (
+                "error-terminal",
+                format!("{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"failed\",\"error\":{{\"code\":\"oauth_denied\",\"stage\":\"token_exchange\",\"retryable\":false}}}}"),
+            ),
+        ] {
+            let temp = TempDir::new(name);
+            let script = temp.script(&format!("printf '%s\\n' '{line}'"));
+            let process = spawn_codex_auth_sidecar_at(
+                &script,
+                &temp.0,
+                CodexAuthAction::LoginBrowser,
+                None,
+                Some(&operation_id),
+                false,
+            )
+            .unwrap();
+            let cancel = AtomicBool::new(false);
+            assert!(wait_for_login_sidecar(
+                process,
+                CodexAuthAction::LoginBrowser,
+                &operation_id,
+                &cancel,
+                |_| {},
+                |_| {},
+            )
+            .is_err());
+        }
+
+        let cancel_temp = TempDir::new("cancel-ack");
+        let cancel_script = cancel_temp.script(&format!(
+            "IFS= read -r cancel\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"cancel_ack\",\"disposition\":\"accepted\"}}'"
+        ));
+        let cancel_process = spawn_codex_auth_sidecar_at(
+            &cancel_script,
+            &cancel_temp.0,
+            CodexAuthAction::LoginBrowser,
+            None,
+            Some(&operation_id),
+            false,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(true);
+        assert!(wait_for_login_sidecar(
+            cancel_process,
+            CodexAuthAction::LoginBrowser,
+            &operation_id,
+            &cancel,
+            |_| {},
+            |_| {},
+        )
+        .is_err());
+
+        let v2_error = br#"{"schema_version":2,"ok":false,"command":"status","error":{"code":"auth_storage_error","message":"safe","retryable":true}}"#;
+        assert!(parse_sidecar_output(v2_error, CodexAuthAction::Status, Some(6)).is_err());
+    }
+
+    #[test]
+    fn login_terminal_rejects_missing_and_unknown_status_reason() {
+        let operation_id = "ae".repeat(16);
+        for (name, status) in [
+            (
+                "missing-reason",
+                format!("{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}", "ab".repeat(16), "cd".repeat(16)),
+            ),
+            (
+                "unknown-reason",
+                format!("{{\"authenticated\":true,\"reason\":\"future\",\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}", "ab".repeat(16), "cd".repeat(16)),
+            ),
+        ] {
+            let temp = TempDir::new(name);
+            let line = format!("{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{status}}}");
+            let script = temp.script(&format!("printf '%s\\n' '{line}'"));
+            let process = spawn_codex_auth_sidecar_at(
+                &script,
+                &temp.0,
+                CodexAuthAction::LoginBrowser,
+                None,
+                Some(&operation_id),
+                false,
+            )
+            .unwrap();
+            let cancel = AtomicBool::new(false);
+            assert!(wait_for_login_sidecar(
+                process,
+                CodexAuthAction::LoginBrowser,
+                &operation_id,
+                &cancel,
+                |_| {},
+                |_| {},
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1833,18 +2616,78 @@ mod tests {
     }
 
     #[test]
+    fn interactive_status_cancellation_reaps_the_child_promptly() {
+        let temp = TempDir::new("status-cancel");
+        let script = temp.script("exec /bin/sleep 5");
+        let process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::Status,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_writer = cancel.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            cancel_writer.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        assert_eq!(
+            wait_for_single_sidecar_response_controlled(
+                process,
+                CodexAuthAction::Status,
+                Duration::from_secs(120),
+                Some(cancel.as_ref()),
+            ),
+            Err(SidecarWaitFailure::Cancelled)
+        );
+        cancel_thread.join().unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(40));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn login_shutdown_race_reaps_child_when_pid_registration_is_rejected() {
+        let temp = TempDir::new("login-register-shutdown");
+        let script = temp.script("exec /bin/sleep 5");
+        let operation_id = "af".repeat(16);
+        let process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::LoginBrowser,
+            None,
+            Some(&operation_id),
+            false,
+        )
+        .unwrap();
+        let pid = process.child.id();
+        let supervisor = CodexAuthSupervisor::default();
+        let reservation = supervisor.begin_login().unwrap();
+        assert!(supervisor.cancel_for_exit().is_empty());
+        let started = Instant::now();
+        assert!(register_login_process(&supervisor, &reservation.operation_id, process).is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        supervisor.abort_login_start(&reservation.operation_id);
+    }
+
+    #[test]
     fn login_sidecar_ndjson_replays_progress_and_one_terminal() {
         let temp = TempDir::new("login-ndjson");
         let operation_id = "ab".repeat(16);
         let script = temp.script(&format!(
-            "[ \"$CSSWITCH_CODEX_AUTH_OPERATION_ID\" = \"{operation_id}\" ]\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"verification_required\",\"verification_url\":\"https://auth.openai.com/codex/device\",\"user_code\":\"ABCD-1234\",\"expires_at_ms\":2000000000000}}'\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"waiting\"}}'\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{{\"authenticated\":true,\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}}}'",
+            "[ \"$CSSWITCH_CODEX_AUTH_OPERATION_ID\" = \"{operation_id}\" ]\nprintf '%s\\n' '{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"waiting\"}}'\nprintf '%s\\n' '{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"progress\",\"state\":\"exchanging\"}}'\nprintf '%s\\n' '{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{{\"authenticated\":true,\"reason\":\"ready\",\"account_hash\":\"{}\",\"expiry_state\":\"valid\",\"expires_at\":2000000000,\"auth_epoch\":\"{}\",\"auth_generation\":1}}}}'",
             "ab".repeat(16),
             "cd".repeat(16),
         ));
         let process = spawn_codex_auth_sidecar_at(
             &script,
             &temp.0,
-            CodexAuthAction::LoginDevice,
+            CodexAuthAction::LoginBrowser,
             None,
             Some(&operation_id),
             false,
@@ -1854,16 +2697,253 @@ mod tests {
         let mut states = Vec::new();
         let value = wait_for_login_sidecar(
             process,
-            CodexAuthAction::LoginDevice,
+            CodexAuthAction::LoginBrowser,
             &operation_id,
             &cancel,
             |event| states.push(event.state.clone().unwrap()),
             |_| {},
         )
         .unwrap();
-        assert_eq!(states, vec!["verification_required", "waiting"]);
+        assert_eq!(states, vec!["waiting", "exchanging"]);
         assert_eq!(value["ok"], true);
         assert_eq!(value["state"], "succeeded");
+    }
+
+    #[test]
+    fn login_success_terminal_requires_authenticated_status() {
+        let temp = TempDir::new("login-success-requires-authenticated");
+        let operation_id = "bc".repeat(16);
+        let script = temp.script(&format!(
+            "printf '%s\\n' '{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"terminal\",\"state\":\"succeeded\",\"status\":{{\"authenticated\":false,\"reason\":\"state_missing\",\"account_hash\":null,\"expiry_state\":\"missing\",\"expires_at\":null,\"auth_epoch\":null,\"auth_generation\":0}}}}'"
+        ));
+        let process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::LoginBrowser,
+            None,
+            Some(&operation_id),
+            false,
+        )
+        .unwrap();
+        let cancel = AtomicBool::new(false);
+        let error = wait_for_login_sidecar(
+            process,
+            CodexAuthAction::LoginBrowser,
+            &operation_id,
+            &cancel,
+            |_| {},
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error, "Codex 认证成功终态必须包含已登录状态。");
+    }
+
+    #[test]
+    fn login_finalization_requires_profile_ready_before_succeeded() {
+        let supervisor = Arc::new(CodexAuthSupervisor::default());
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new());
+        let reservation = supervisor.begin_login().unwrap();
+        let snapshot = finalize_login_operation(
+            &supervisor,
+            &lifecycle,
+            &reservation.operation_id,
+            Ok(json!({ "ok": true, "state": "succeeded" })),
+            || {
+                Ok(crate::runtime::profile::EnsureCodexProfileResult {
+                    disposition: crate::runtime::profile::EnsureCodexProfileDisposition::Created,
+                    profile_id: "cd".repeat(16),
+                })
+            },
+        )
+        .unwrap();
+        assert_eq!(snapshot.state, "succeeded");
+        assert!(snapshot.error.is_none());
+
+        let supervisor = Arc::new(CodexAuthSupervisor::default());
+        let reservation = supervisor.begin_login().unwrap();
+        let snapshot = finalize_login_operation(
+            &supervisor,
+            &lifecycle,
+            &reservation.operation_id,
+            Ok(json!({ "ok": true, "state": "succeeded" })),
+            || Err("simulated config commit failure".into()),
+        )
+        .unwrap();
+        assert_eq!(snapshot.state, "failed");
+        let error = snapshot.error.unwrap();
+        assert_eq!(error.code, "profile_ensure_failed");
+        assert_eq!(error.stage, "profile_ensure");
+        assert!(error.retryable);
+    }
+
+    #[test]
+    fn failed_or_cancelled_login_never_runs_profile_ensure() {
+        for (state, code) in [("failed", "oauth_denied"), ("cancelled", "auth_cancelled")] {
+            let supervisor = Arc::new(CodexAuthSupervisor::default());
+            let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new());
+            let reservation = supervisor.begin_login().unwrap();
+            let called = Arc::new(AtomicBool::new(false));
+            let called_by_ensure = called.clone();
+            let snapshot = finalize_login_operation(
+                &supervisor,
+                &lifecycle,
+                &reservation.operation_id,
+                Ok(json!({
+                    "ok": false,
+                    "state": state,
+                    "error": {
+                        "code": code,
+                        "stage": if state == "cancelled" { "cancelled" } else { "browser_open" },
+                        "retryable": true
+                    }
+                })),
+                move || {
+                    called_by_ensure.store(true, Ordering::SeqCst);
+                    Err("must not run".into())
+                },
+            )
+            .unwrap();
+            assert_eq!(snapshot.state, state);
+            assert!(!called.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn terminal_ensure_races_repair_manual_create_logout_and_disable_without_deadlock() {
+        let temp = TempDir::new("profile-concurrency");
+        let active = crate::runtime::profile::create_profile_inner(
+            &temp.0,
+            "glm",
+            "当前 GLM",
+            Some("gk"),
+            None,
+            Some("glm-5.2"),
+        )
+        .unwrap();
+        config::update(&temp.0, |cfg| {
+            cfg.active_id = active.clone();
+            cfg.experimental_codex_enabled = true;
+        })
+        .unwrap();
+
+        let supervisor = Arc::new(CodexAuthSupervisor::default());
+        let lifecycle = Arc::new(crate::lifecycle::Lifecycle::new());
+        let reservation = supervisor.begin_login().unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(6));
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let ensured = Arc::new(Mutex::new(None));
+        let mut workers = Vec::new();
+
+        {
+            let dir = temp.0.clone();
+            let supervisor = supervisor.clone();
+            let lifecycle = lifecycle.clone();
+            let operation_id = reservation.operation_id.clone();
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            let ensured = ensured.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let snapshot = finalize_login_operation(
+                    &supervisor,
+                    &lifecycle,
+                    &operation_id,
+                    Ok(json!({ "ok": true, "state": "succeeded" })),
+                    || {
+                        let result = crate::runtime::profile::ensure_codex_profile_inner(&dir)?;
+                        *ensured.lock().unwrap_or_else(|error| error.into_inner()) =
+                            Some(result.clone());
+                        Ok(result)
+                    },
+                );
+                let state = snapshot
+                    .map(|snapshot| snapshot.state)
+                    .unwrap_or_else(|_| "error".into());
+                sender.send(format!("terminal:{state}")).unwrap();
+            }));
+        }
+
+        {
+            let dir = temp.0.clone();
+            let lifecycle = lifecycle.clone();
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result = lifecycle.with_serialized(|| {
+                    crate::runtime::profile::create_profile_inner(
+                        &dir,
+                        "codex",
+                        "手工 Codex",
+                        None,
+                        None,
+                        None,
+                    )
+                });
+                sender
+                    .send(format!(
+                        "manual:{}",
+                        if result.is_ok() { "ok" } else { "busy" }
+                    ))
+                    .unwrap();
+            }));
+        }
+
+        for action in ["repair", "logout", "disable"] {
+            let dir = temp.0.clone();
+            let supervisor = supervisor.clone();
+            let lifecycle = lifecycle.clone();
+            let barrier = barrier.clone();
+            let sender = sender.clone();
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                let result =
+                    lifecycle.with_serialized(|| {
+                        let _mutation = CodexAuthSupervisor::begin_mutation(&supervisor)?;
+                        match action {
+                            "repair" => crate::runtime::profile::ensure_codex_profile_inner(&dir)
+                                .map(|_| ()),
+                            "disable" => set_experimental_codex_enabled_at(&dir, false, || Ok(()))
+                                .map(|_| ()),
+                            _ => Ok(()),
+                        }
+                    });
+                sender
+                    .send(format!(
+                        "{action}:{}",
+                        if result.is_ok() { "ok" } else { "busy" }
+                    ))
+                    .unwrap();
+            }));
+        }
+
+        barrier.wait();
+        drop(sender);
+        let mut outcomes = Vec::new();
+        for _ in 0..5 {
+            outcomes.push(
+                receiver
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("concurrent Codex mutation deadlocked"),
+            );
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        assert!(outcomes
+            .iter()
+            .any(|outcome| outcome == "terminal:succeeded"));
+        assert!(ensured
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_some());
+        let cfg = config::load_from(&temp.0).unwrap();
+        assert_eq!(cfg.active_id, active);
+        assert!(cfg.profiles.iter().any(|profile| {
+            profile.template_id == "codex"
+                && profile.credential_source
+                    == crate::provider_contracts::CredentialSource::CsswitchOauth
+        }));
     }
 
     #[test]
@@ -1871,7 +2951,7 @@ mod tests {
         let temp = TempDir::new("login-cancel-watchdog");
         let operation_id = "ef".repeat(16);
         let script = temp.script(&format!(
-            "IFS= read -r cancel\nprintf '%s\\n' '{{\"schema_version\":2,\"operation_id\":\"{operation_id}\",\"kind\":\"cancel_ack\",\"disposition\":\"accepted\"}}'\nexec /bin/sleep 5"
+            "IFS= read -r cancel\nprintf '%s\\n' '{{\"schema_version\":3,\"operation_id\":\"{operation_id}\",\"kind\":\"cancel_ack\",\"disposition\":\"accepted\"}}'\nexec /bin/sleep 30"
         ));
         let process = spawn_codex_auth_sidecar_at(
             &script,
@@ -1897,12 +2977,13 @@ mod tests {
         assert_eq!(ack, "accepted");
         assert_eq!(value["state"], "cancelled");
         let elapsed = started.elapsed();
+        assert_eq!(ACCEPTED_CANCEL_WATCHDOG, Duration::from_secs(2));
         assert!(elapsed >= ACCEPTED_CANCEL_WATCHDOG);
-        // The fixture exits naturally after five seconds. A successful
-        // cancelled result before then proves the acknowledged-cancel watchdog
-        // reaped it; do not make this test depend on sub-second scheduler slack
-        // while the full Rust suite is running in parallel.
-        assert!(elapsed < Duration::from_secs(5));
+        // The fixture exits naturally after 30 seconds. Finishing well before
+        // that proves the acknowledged-cancel watchdog reaped it, while the
+        // margin avoids mistaking full-suite scheduler pauses for a product
+        // failure. The exact product budget remains asserted above.
+        assert!(elapsed < Duration::from_secs(10));
     }
 
     #[test]
@@ -1923,13 +3004,14 @@ mod tests {
     #[test]
     fn backend_readiness_rejects_unauthenticated_status_before_any_launch() {
         let authenticated: Value = serde_json::from_str(&success_json("status")).unwrap();
-        assert!(require_authenticated_status(&authenticated).is_ok());
+        assert!(require_authenticated_status_typed(&authenticated).is_ok());
         let unauthenticated = json!({
-            "schema_version": 1,
+            "schema_version": 3,
             "ok": true,
             "command": "status",
             "status": {
                 "authenticated": false,
+                "reason": "state_missing",
                 "account_hash": null,
                 "expiry_state": "missing",
                 "expires_at": null,
@@ -1937,52 +3019,182 @@ mod tests {
                 "auth_generation": 0
             }
         });
-        let error = require_authenticated_status(&unauthenticated).unwrap_err();
-        assert!(error.starts_with("CODEX_LOGIN_REQUIRED"));
+        let error = require_authenticated_status_typed(&unauthenticated).unwrap_err();
+        assert_eq!(error.code, "codex_login_required");
+        assert_eq!(error.reason.as_deref(), Some("state_missing"));
     }
 
     #[test]
-    fn diagnostic_summary_exposes_only_auth_and_expiry_state() {
-        let authenticated = json!({
+    fn structured_auth_errors_have_exact_reason_cause_and_retryability_contracts() {
+        for reason in [
+            "state_missing",
+            "state_uncommitted",
+            "oauth_missing",
+            "thinking_missing",
+            "record_mismatch",
+        ] {
+            let value = serde_json::to_value(RuntimeCommandError::from(
+                CodexAuthCommandError::login_required(reason),
+            ))
+            .unwrap();
+            assert_eq!(
+                value,
+                json!({"code":"codex_login_required","reason":reason,"retryable":false})
+            );
+        }
+        for (cause, retryable) in [
+            ("keychain_unavailable", true),
+            ("interaction_timeout", true),
+            ("sidecar_spawn_failed", false),
+            ("sidecar_protocol_error", false),
+            ("identity_mismatch", false),
+            ("auth_state_invalid", false),
+            ("storage_unavailable", true),
+            ("unsupported_platform", false),
+            ("auth_state_changed", true),
+        ] {
+            let value = serde_json::to_value(RuntimeCommandError::from(
+                CodexAuthCommandError::unavailable(cause),
+            ))
+            .unwrap();
+            assert_eq!(
+                value,
+                json!({"code":"codex_auth_unavailable","cause":cause,"retryable":retryable})
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(RuntimeCommandError::from(CodexAuthCommandError::busy())).unwrap(),
+            json!({"code":"codex_auth_busy","retryable":true})
+        );
+        assert_eq!(
+            serde_json::to_value(RuntimeCommandError::from("ordinary failure")).unwrap(),
+            json!("ordinary failure")
+        );
+
+        for failure in [SidecarWaitFailure::Cancelled, SidecarWaitFailure::Timeout] {
+            let error = auth_error_from_sidecar_wait(failure);
+            assert_eq!(error.cause, Some("interaction_timeout"));
+            assert!(error.retryable);
+        }
+        let protocol = auth_error_from_sidecar_wait(SidecarWaitFailure::Protocol);
+        assert_eq!(protocol.cause, Some("sidecar_protocol_error"));
+        assert!(!protocol.retryable);
+    }
+
+    #[test]
+    fn login_and_logout_replace_the_last_known_auth_observation() {
+        let supervisor = CodexAuthSupervisor::default();
+        let login = Ok(serde_json::from_str(&success_json("status")).unwrap());
+        record_login_terminal_auth_status(&supervisor, &login);
+        let ready = supervisor.last_auth_status().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert_eq!(ready.reason.as_deref(), Some("ready"));
+        assert_eq!(ready.cause, None);
+
+        let logout = json!({
+            "schema_version": 3,
             "ok": true,
+            "command": "logout",
             "status": {
-                "authenticated": true,
-                "expiry_state": "expiring",
-                "account_hash": "sensitive-account-hash",
-                "auth_epoch": "sensitive-auth-epoch",
-                "auth_generation": 99,
-                "access_token": "must-not-escape",
-                "email": "person@example.test"
+                "authenticated": false,
+                "reason": "state_uncommitted",
+                "account_hash": null,
+                "expiry_state": "missing",
+                "expires_at": null,
+                "auth_epoch": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+                "auth_generation": 8
             }
         });
-        let summary = summarize_auth_for_diagnostics(&authenticated);
-        assert_eq!(summary, "auth=authenticated expiry=expiring");
+        record_last_auth_status(&supervisor, &logout);
+        let logged_out = supervisor.last_auth_status().unwrap();
+        assert_eq!(logged_out.status, "not_authenticated");
+        assert_eq!(logged_out.reason.as_deref(), Some("state_uncommitted"));
+        assert_eq!(logged_out.cause, None);
+
+        record_login_terminal_auth_status(&supervisor, &Err("protocol".into()));
+        let unavailable = supervisor.last_auth_status().unwrap();
+        assert_eq!(unavailable.status, "unavailable");
+        assert_eq!(unavailable.reason, None);
+        assert_eq!(unavailable.cause.as_deref(), Some("sidecar_protocol_error"));
+    }
+
+    #[test]
+    fn profile_repair_requires_authentication_and_is_idempotent() {
+        let temp = TempDir::new("profile-repair");
+        config::update(&temp.0, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let unauthenticated = json!({
+            "ok": true,
+            "status": {
+                "authenticated": false,
+                "reason": "state_missing",
+                "account_hash": null,
+                "expiry_state": "missing",
+                "expires_at": null,
+                "auth_epoch": null,
+                "auth_generation": 0
+            }
+        });
+        assert!(require_authenticated_status_typed(&unauthenticated).is_err());
+        assert!(config::load_from(&temp.0).unwrap().profiles.is_empty());
+
+        let authenticated: Value = serde_json::from_str(&success_json("status")).unwrap();
+        require_authenticated_status_typed(&authenticated).unwrap();
+        let created = ensure_codex_profile_authenticated(&temp.0).unwrap();
+        assert_eq!(created["disposition"], "created");
+        assert!(created["profile_id"]
+            .as_str()
+            .is_some_and(|id| is_lower_hex(id, 32)));
+        let existing = ensure_codex_profile_authenticated(&temp.0).unwrap();
+        assert_eq!(existing["disposition"], "existing");
+        assert_eq!(existing["profile_id"], created["profile_id"]);
+    }
+
+    #[test]
+    fn profile_repair_exposes_only_safe_failure_when_config_is_unwritable() {
+        let temp = TempDir::new("profile-repair-save-failure");
+        config::update(&temp.0, |cfg| cfg.experimental_codex_enabled = true).unwrap();
+        let config_path = temp.0.join("config.json");
+        let preserved = temp.0.join("preserved-config.json");
+        fs::rename(&config_path, &preserved).unwrap();
+        std::os::unix::fs::symlink(&preserved, &config_path).unwrap();
+        let error = ensure_codex_profile_authenticated(&temp.0).unwrap_err();
+        assert_eq!(
+            error,
+            "profile_ensure_failed：授权已保存，但无法创建 Codex 配置；请重试。"
+        );
+        assert!(!error.contains(preserved.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn diagnostic_summary_uses_only_last_known_in_memory_status() {
+        let supervisor = Arc::new(CodexAuthSupervisor::default());
+        let app = tauri::test::mock_builder()
+            .manage(supervisor.clone() as SharedCodexAuthSupervisor)
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        assert_eq!(
+            codex_auth_diagnostic_summary(app.handle()),
+            "auth=not_checked"
+        );
+
+        supervisor.record_auth_status("ready", Some("ready"), None);
+        let ready = codex_auth_diagnostic_summary(app.handle());
+        assert!(ready.starts_with("auth=last_known_ready age_seconds="));
+        assert!(ready.ends_with("reason=ready"));
+
+        supervisor.record_auth_status("unavailable", None, Some("keychain_unavailable"));
+        let unavailable = codex_auth_diagnostic_summary(app.handle());
+        assert!(unavailable.starts_with("auth=last_known_unavailable age_seconds="));
+        assert!(unavailable.ends_with("cause=keychain_unavailable"));
         for secret in [
             "account",
             "epoch",
             "generation",
-            "access_token",
+            "token",
             "person@example.test",
         ] {
-            assert!(!summary.contains(secret));
+            assert!(!unavailable.contains(secret));
         }
-
-        let error = json!({
-            "ok": false,
-            "error": {
-                "code": "keychain_unavailable",
-                "message": "untrusted /Users/name path and secret",
-                "retryable": true
-            }
-        });
-        assert_eq!(
-            summarize_auth_for_diagnostics(&error),
-            "auth=error code=keychain_unavailable"
-        );
-        assert_eq!(
-            summarize_auth_for_diagnostics(&json!({"ok": false, "error": {"code": "invented"}})),
-            "auth=protocol_error"
-        );
     }
 
     #[test]
@@ -1992,7 +3204,7 @@ mod tests {
             name: "My Codex".into(),
             template_id: "codex".into(),
             api_key: "must-never-appear".into(),
-            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
             ..Default::default()
         };
@@ -2006,7 +3218,7 @@ mod tests {
         let preview = codex_downgrade_preview_for(&preview_cfg);
         assert_eq!(preview["profile_count"], 1);
         assert_eq!(preview["active_will_clear"], true);
-        assert_eq!(preview["keychain_unchanged"], true);
+        assert_eq!(preview["credentials_unchanged"], true);
         let encoded = preview.to_string();
         assert!(!encoded.contains("must-never-appear"));
         assert!(!encoded.contains("credential_ref"));

@@ -234,6 +234,7 @@ pub(crate) fn one_click_login<R: Runtime>(
     state: SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     runtime_choice: Option<&str>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<Value, String> {
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     let dir = config::default_dir();
@@ -243,8 +244,7 @@ pub(crate) fn one_click_login<R: Runtime>(
         .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
     config::require_template_enabled(&cfg, &active_profile.template_id)?;
     let active_launch = crate::runtime::provider::resolve_launch_plan(active_profile)?;
-    let _codex_use =
-        crate::commands::codex::ensure_provider_auth_ready(&app, &active_launch.adapter)?;
+    crate::commands::codex::require_provider_auth_proof(&active_launch.adapter, auth_proof)?;
     crate::runtime::settings::validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     let sport = cfg.sandbox_port;
 
@@ -286,6 +286,7 @@ pub(crate) fn one_click_login<R: Runtime>(
                     lifecycle,
                     Some(&running_runtime),
                     Some(&trace),
+                    auth_proof,
                 )?;
                 let installer_bridge = skill_install_bridge_dir(&secret)?;
                 // Science 已在运行时只读检查，不并发改写它的 MCP 配置。
@@ -389,8 +390,14 @@ pub(crate) fn one_click_login<R: Runtime>(
         return Err("找不到 scripts/launch-virtual-sandbox.sh。".into());
     }
 
-    let (pport, secret, proxy_action) =
-        ensure_proxy(&app, &state, lifecycle, Some(&launch_runtime), Some(&trace))?;
+    let (pport, secret, proxy_action) = ensure_proxy(
+        &app,
+        &state,
+        lifecycle,
+        Some(&launch_runtime),
+        Some(&trace),
+        auth_proof,
+    )?;
     let installer_bridge = skill_install_bridge_dir(&secret)?;
     // 本地 MCP 注册是 best-effort：失败只降级该工具，绝不阻断 Science 启动。
     let installer = match current_skill_install_bridge_key() {

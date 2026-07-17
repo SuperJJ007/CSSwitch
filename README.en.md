@@ -4,7 +4,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.6.0"><img src="https://img.shields.io/badge/release-v0.6.0-2ea44f.svg" alt="CSSwitch v0.6.0"></a>
+  <a href="https://github.com/SuperJJ007/CSSwitch/releases/tag/v0.7.0"><img src="https://img.shields.io/badge/release-v0.7.0-2ea44f.svg" alt="CSSwitch v0.7.0"></a>
   <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-1d1d1f.svg" alt="macOS Apple Silicon">
   <img src="https://img.shields.io/badge/built%20with-Tauri%202-C25A34.svg" alt="Tauri 2">
 </p>
@@ -16,21 +16,22 @@
 
 # CSSwitch
 
-CSSwitch is a local configuration converter for Claude Science. It translates Science inference requests and connects them to your own model API, including DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints. The current source also contains an off-by-default experimental Codex OAuth path that has not shipped in a stable release.
+CSSwitch is a local configuration converter for Claude Science. It translates Science inference requests and connects them to your own model API, including DeepSeek, Qwen, Kimi, MiniMax, GLM, OpenRouter, relay providers, or custom compatible endpoints. It can also connect the Codex models available to your account through a separate CSSwitch browser login.
 
-It is built for more than developers. You need Claude Science, a third-party API key, and the CSSwitch desktop panel: create a profile, make it active, then click "一键开始" (Start).
+It is built for more than developers. Install Claude Science, choose either a third-party API key or Codex login, make the profile active, then click "一键开始" (Start).
 
 > The current app mainly targets macOS Apple Silicon. Because the app is not notarized yet, macOS may ask you to right-click and choose "Open" the first time.
 
-[Download latest release](../../releases/latest) · [Documentation](./docs/README.md) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
+[Download latest release](https://github.com/SuperJJ007/CSSwitch/releases/latest) · [Documentation](./docs/README.md) · [Changelog](./CHANGELOG.md) · [Report a bug](https://github.com/SuperJJ007/CSSwitch/issues/new?template=bug_report.yml) · [Request a feature](https://github.com/SuperJJ007/CSSwitch/issues/new?template=feature_request.yml)
 
-> **0.6.0:** External Skills can now be installed from an exact public GitHub URL or a local `.zip` / `.skill` file selected in the desktop panel. Slow GitHub downloads expose single-request progress, terminal cleanup, and restart interruption recovery. Uninstalling any bundle member first returns the complete affected Skill list and requires confirmation for whole-bundle removal; partial physical deletion is not supported. Legacy v0.5.0 connector routes migrate automatically while user MCP entries and unknown fields are preserved. See the [external Skill bridge](./docs/features/external-skill-bridge.md), [system SSH contract](./docs/features/system-ssh.md), and [architecture contract](./docs/architecture/overview.md).
+> **0.7.0:** Adds an off-by-default experimental Codex bridge. CSSwitch performs its own browser OAuth, dynamically reads the account model catalog, and converts Codex Responses/SSE for Science through the Rust Gateway. Login, model discovery, inference, and logout share one network route; native Codex login is never read or modified. The ad-hoc release does not require an Apple developer account. This release also adopts the new orange rounded-square icon and fixes Codex SSE responses without `Content-Type` being misreported as temporary Claude unavailability. See the [Codex → Claude Science contract](./docs/features/codex-science-bridge.md).
 
 ## Contents
 
 - [Why CSSwitch exists](#why-csswitch-exists)
 - [What it can do](#what-it-can-do)
 - [Quick start](#quick-start)
+- [Using Codex](#using-codex)
 - [Installing and removing external Skills](#installing-and-removing-external-skills)
 - [Upgrading from an older version](#upgrading-from-an-older-version)
 - [Supported model sources](#supported-model-sources)
@@ -58,7 +59,7 @@ In short: CSSwitch is to Claude Science what CC Switch is to Claude Code, with a
 ```text
 Claude Science sandbox
   -> CSSwitch local proxy
-  -> DeepSeek / Qwen / Kimi / MiniMax / GLM / OpenRouter / custom endpoint
+  -> DeepSeek / Qwen / Kimi / MiniMax / GLM / OpenRouter / Codex / custom endpoint
 ```
 
 ## What it can do
@@ -70,8 +71,9 @@ Claude Science sandbox
 - Verify a key before making a profile active; failed checks do not silently switch your active setup.
 - Click "一键开始" (Start) to launch the proxy, prepare the sandbox, and open Science.
 - Show the actual selected model name in Science instead of a vague `claude` or `opus` label.
+- Complete a separate CSSwitch Codex browser login and choose among the account's dynamic `Codex / …` entries under Science “More models.”
 - Switch back to "Official Claude" without interfering with your real Claude login.
-- Reuse Science's persistent data-dir; Skill state is not a CSSwitch startup gate. Version 0.6.0 installs a Skill or bundle from an exact public GitHub URL or local `.zip` / `.skill` file; bundle removal requires whole-bundle confirmation and quarantines only CSSwitch-owned imports.
+- Reuse Science's persistent data-dir; Skill state is not a CSSwitch startup gate. A Skill or bundle can be installed from an exact public GitHub URL or local `.zip` / `.skill` file; bundle removal requires whole-bundle confirmation and quarantines only CSSwitch-owned imports.
 - CSSwitch inherits the Science version currently installed in `/Applications/Claude Science.app`; it does not compare, pin, upgrade, or downgrade that version. After the App updates, the next launch uses the updated App executable with the same persistent data-dir.
 - If the Science App is missing, CSSwitch never starts a data-dir cache silently. Only an executable cache with a readable version can be authorized for this launch once; the choice is not saved. Otherwise the UI offers the [official Claude download page](https://claude.com/download) or cancel.
 
@@ -89,10 +91,10 @@ Before starting, make sure you have:
 
 - [Claude Science (official Claude download page)](https://claude.com/download)
 - A macOS Apple Silicon device
-- A working third-party model API key; only the experimental Codex path uses a separate CSSwitch OAuth login
+- A working third-party model API key, or a Codex account that can complete browser authorization
 - No separate Python runtime is required; CSSwitch bundles its Rust inference gateway
 
-1. Download the latest `CSSwitch_*.dmg` from [GitHub Releases](../../releases/latest).
+1. Download the latest `CSSwitch_*.dmg` from [GitHub Releases](https://github.com/SuperJJ007/CSSwitch/releases/latest).
 2. Drag CSSwitch into Applications.
 3. If macOS blocks the first launch, right-click the app and choose "Open".
 4. Keep the top mode set to "第三方模型" (third-party model).
@@ -103,13 +105,23 @@ Before starting, make sure you have:
 
 CSSwitch does not choose a Science version for you. Normal startup uses the currently installed Claude Science App. If the App is missing, the panel shows an exact readable cache version and asks whether to use it for this launch only, or to open the official download page. That choice is not persisted, and a later detected App automatically becomes the default again.
 
-The Codex capability in the current source has not shipped in `v0.6.0` and is off by default. When testing from source, explicitly enable it under Advanced Settings, complete the separate CSSwitch login, then create a Codex profile; no API key, `base_url`, or fixed model is entered. After Science starts, choose a dynamic `Codex / …` entry under “More models.” This path neither reuses nor modifies native Codex login state, and real-account/live-provider acceptance is still pending.
-
 To use Science with its official service configuration, switch to "官方 Claude" (Official Claude). CSSwitch will tear down the third-party proxy path and open the real Science app.
+
+## Using Codex
+
+Codex remains an explicitly enabled experimental capability in 0.7.0. It uses CSSwitch-owned browser OAuth and private authentication files, never reads, reuses, or modifies native `~/.codex` login state, and does not require Apple Development or Developer ID signing.
+
+1. Open Advanced Settings and enable the Codex experiment.
+2. Choose the Codex network route. `auto` uses available `HTTPS_PROXY` / `ALL_PROXY` and `NO_PROXY` variables. An app launched from Finder usually does not inherit terminal proxy variables, so it may show `direct`; a system TUN can still take over that direct socket. You can instead enter an unauthenticated HTTP, HTTPS, SOCKS5, or SOCKS5h proxy.
+3. Click Codex browser login and complete account verification and authorization on the OpenAI page. Return to CSSwitch after the browser reaches `localhost` and reports completion.
+4. A successful login ensures that a Codex profile exists but never changes the active provider automatically. Make that profile active, then click "一键开始" (Start).
+5. Choose a `Codex / …` entry from Science “More models.” The list comes from the current account catalog rather than a model list hard-coded by CSSwitch.
+
+The current boundary is macOS Apple Silicon, one CSSwitch Codex account, and browser login. Multi-account, device-code login, proxy authentication, PAC, custom CAs, system-proxy discovery, and TUN detection are not supported. The system browser uses its own network configuration; the CSSwitch Codex route controls Gateway HTTPS traffic such as token exchange, model discovery, and inference.
 
 ## Installing and removing external Skills
 
-CSSwitch 0.6.0 provides GitHub and local-file installation paths. Both use the same path, size, symlink, and reserved-file validation, then attach the installed Skills to Science's default Agent through the native control path. The installer does not sign in to GitHub for you or read or take over Science credentials.
+CSSwitch provides GitHub and local-file installation paths. Both use the same path, size, symlink, and reserved-file validation, then attach the installed Skills to Science's default Agent through the native control path. The installer does not sign in to GitHub for you or read or take over Science credentials.
 
 **Install from a public GitHub URL**
 
@@ -143,7 +155,7 @@ See the [external Skill bridge](./docs/features/external-skill-bridge.md) for de
 
 ## Upgrading from an older version
 
-Version 0.6.0 keeps the existing v2 configuration format and reuses `~/.csswitch/sandbox/home/.claude-science`, so existing Science organizations, projects, and Skills are not migrated or overwritten. Legacy v0.5.0 external-Skill connectors are merged automatically while user-created MCP entries and unknown fields are preserved. Legacy CSSwitch Skill store/inventory files remain untouched but no longer participate in startup; external `~/.claude/skills` trees are not synchronized into Science.
+Version 0.7.0 atomically migrates v1/v2 configuration to v3 and preserves non-overwriting versioned backups before commit. Existing API providers, the active profile, ports, unknown fields, and `~/.csswitch/sandbox/home/.claude-science` remain intact. Config v3 adds Codex profiles and network settings. Before rolling back to 0.6.0, use “Export and downgrade to v2” in 0.7.0, or stop every CSSwitch process and restore the migration-created v2 backup; merely deleting Codex profiles does not change the schema. Legacy Skill store/inventory files remain untouched but do not participate in startup, and external `~/.claude/skills` trees are not synchronized into Science.
 
 For exact steps, backup locations, and rollback boundaries, see [Upgrade and rollback](./docs/operations/upgrade-and-rollback.md).
 
@@ -162,7 +174,7 @@ For exact steps, backup locations, and rollback boundaries, see [Upgrade and rol
 | Custom Anthropic | User-provided compatible endpoint | For private gateways, Claude-compatible relays, or local adapters |
 | Custom OpenAI | User-provided OpenAI Chat Completions base root | The proxy appends `/chat/completions` and `/models` |
 | Custom OpenAI Responses | User-provided OpenAI Responses base root | The proxy appends `/responses` and `/models` |
-| Codex (source experiment, off by default) | Separate CSSwitch OAuth + Responses/SSE | Dynamically reads the current account catalog; never reuses native Codex login; real-account acceptance is pending |
+| Codex (experiment, off by default) | Separate CSSwitch OAuth + Responses/SSE | Dynamically reads the current account catalog; never reuses native Codex login; single account and browser login |
 
 > If your URL is an `/anthropic` endpoint, choose "Custom Anthropic". If you choose "Custom OpenAI", enter an OpenAI-compatible base root such as `https://example.com/v1`, not an Anthropic endpoint.
 
@@ -181,7 +193,7 @@ CSSwitch's core boundary is simple: third-party model mode keeps credentials, da
 - It does not copy, read, or modify real Claude login credentials, OAuth tokens, account state, or user data.
 - The isolated Science instance uses its own HOME, ports, and data directory.
 - Third-party API keys are stored in `~/.csswitch/config.json` with `0600` file permissions.
-- Experimental Codex credentials are stored only in CSSwitch-owned macOS Keychain items; config contains a fixed opaque reference. CSSwitch does not read, copy, overwrite, or delete native `~/.codex` login state.
+- Experimental Codex credentials stay in private files under the CSSwitch data root: parent directories are `0700`, auth files are `0600`, symlinks are rejected, and commits use atomic generation/CAS rules. CSSwitch does not use macOS Keychain and does not read, copy, overwrite, or delete native `~/.codex` login state.
 - Keys are not displayed in application logs, and the local gateway listens only on loopback.
 - “Allow isolated Science to use system SSH configuration” is off by default. When enabled, it only makes real `~/.ssh/config` available to system OpenSSH calls made by Science. CSSwitch does not copy or link all of `.ssh`, start `sshd`, change the firewall, or expose a `0.0.0.0` listener. Native OpenSSH `Include`, key, Agent, and command rules still apply, so this is an explicit trust grant.
 - New isolated Science launches prefer the binary from the locally installed official Claude Science app. If the App is unavailable, a readable retained sandbox copy is used only after explicit one-launch authorization; the choice is not persisted. CSSwitch does not download Science and keeps `--no-auto-update`.
@@ -193,11 +205,11 @@ CSSwitch is not an official Claude service, and third-party model mode does not 
 
 - Anthropic-hosted remote MCP services are unavailable, including `pubmed`, `clinical-trials`, `chembl`, `biorxiv`, and other `*.mcp.claude.com` services.
 - Directory connectors, remote plugins, and cloud features that require real Claude account authorization may show session expired, unavailable, or skipped.
-- Science's native GitHub import, Skill publishing, and draft deletion may still query the Anthropic account catalog. CSSwitch does not emulate OAuth or that catalog; version 0.6.0 supports only exact public GitHub URLs or a user-selected local `.zip` / `.skill` file and quarantines CSSwitch-owned bundles, not deterministic name search, overwrite, member-level physical deletion, permanent-delete/restore UI, private repositories, or publishing.
+- Science's native GitHub import, Skill publishing, and draft deletion may still query the Anthropic account catalog. CSSwitch does not emulate OAuth or that catalog; the external Skill bridge supports only exact public GitHub URLs or a user-selected local `.zip` / `.skill` file and quarantines CSSwitch-owned bundles, not deterministic name search, overwrite, member-level physical deletion, permanent-delete/restore UI, private repositories, or publishing.
 - Third-party models differ in tool use, long context, thinking, image, and streaming compatibility. Native Anthropic endpoints are usually more reliable than OpenAI translation paths.
 - The macOS package is not notarized yet, so the first launch requires manual approval.
 - The inference gateway is a bundled Rust sidecar; no runtime Python fallback is shipped.
-- Codex OAuth currently exists only in experimental source and is off by default. User OAuth, live-provider behavior, signing/notarization, and release artifacts have not been accepted yet.
+- Codex remains an off-by-default experiment that depends on current OpenAI account entitlements, model catalog, and upstream protocol. Its single-account and network boundaries are not an official support or stability guarantee.
 
 Please report problems through [GitHub Issues](https://github.com/SuperJJ007/CSSwitch/issues).
 

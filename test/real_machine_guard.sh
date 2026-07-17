@@ -9,6 +9,7 @@ set -euo pipefail
 PROJ="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_ROOT="${CSSWITCH_REAL_TEST_ROOT:-${TMPDIR:-/tmp}/csswitch-real-machine-${UID}}"
 TEST_HOME="$TEST_ROOT/home"
+ACCEPTANCE_CONFIG_DIR="$TEST_HOME/.csswitch-acceptance"
 STATE_DIR="$TEST_ROOT/state"
 BASELINE="$STATE_DIR/port-8765.pids"
 PORT_STATE="$STATE_DIR/runtime-ports.v1"
@@ -106,53 +107,6 @@ persist_ports() {
   chmod 600 "$PORT_STATE"
 }
 
-prepare_isolated_keychain() {
-  [ "$(uname -s)" = "Darwin" ] || return 0
-  command -v security >/dev/null 2>&1 || \
-    die "macOS Acceptance 验收需要 security 命令初始化隔离钥匙串"
-
-  local library_dir="$TEST_HOME/Library"
-  local keychain_dir="$library_dir/Keychains"
-  local preferences_dir="$library_dir/Preferences"
-  local keychain="$keychain_dir/login.keychain-db"
-  local default_keychain
-
-  reject_symlinks \
-    "$library_dir" "$keychain_dir" "$preferences_dir" "$keychain"
-  umask 077
-  mkdir -p "$keychain_dir" "$preferences_dir"
-  chmod 700 "$library_dir" "$keychain_dir" "$preferences_dir"
-  reject_symlinks \
-    "$library_dir" "$keychain_dir" "$preferences_dir" "$keychain"
-  keychain_dir="$(cd "$keychain_dir" 2>/dev/null && pwd -P)" || \
-    die "无法规范化 Acceptance 隔离钥匙串目录"
-  keychain="$keychain_dir/login.keychain-db"
-
-  if [ ! -f "$keychain" ]; then
-    HOME="$TEST_HOME" security create-keychain -p "" "$keychain" >/dev/null 2>&1 || \
-      die "无法创建 Acceptance 隔离钥匙串"
-  fi
-  [ -f "$keychain" ] && [ ! -L "$keychain" ] || \
-    die "Acceptance 隔离钥匙串不是普通文件"
-
-  HOME="$TEST_HOME" security list-keychains -d user -s "$keychain" >/dev/null 2>&1 || \
-    die "无法设置 Acceptance 隔离钥匙串搜索列表"
-  HOME="$TEST_HOME" security default-keychain -d user -s "$keychain" >/dev/null 2>&1 || \
-    die "无法设置 Acceptance 隔离默认钥匙串"
-  HOME="$TEST_HOME" security unlock-keychain -p "" "$keychain" >/dev/null 2>&1 || \
-    die "无法解锁 Acceptance 隔离钥匙串"
-  HOME="$TEST_HOME" security set-keychain-settings "$keychain" >/dev/null 2>&1 || \
-    die "无法关闭 Acceptance 隔离钥匙串自动锁定"
-
-  default_keychain="$(HOME="$TEST_HOME" security default-keychain -d user 2>/dev/null)" || \
-    die "无法回读 Acceptance 隔离默认钥匙串"
-  default_keychain="$(printf '%s\n' "$default_keychain" | \
-    sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')"
-  [ "$default_keychain" = "$keychain" ] || \
-    die "Acceptance 默认钥匙串未指向隔离测试目录"
-  pass "Acceptance 默认钥匙串已隔离到测试 HOME"
-}
-
 listener_pids() {
   local lsof_bin output rc
   lsof_bin="$(command -v lsof 2>/dev/null || true)"
@@ -237,7 +191,6 @@ preflight() {
   [ -x "$SCIENCE_BIN" ] || die "未找到可执行 Science：$SCIENCE_BIN"
   [ -x "$PROJ/desktop/src-tauri/target/release/desktop" ] || \
     echo "WARN: release 测试二进制尚未构建"
-  prepare_isolated_keychain
   pass "测试 HOME 已隔离：$TEST_HOME"
   pass "测试端口空闲：$PROXY_PORT / $SANDBOX_PORT"
   pass "Codex OAuth callback 1455 / 1457 至少一个空闲（固定上游兼容端口，不动态改写）"
@@ -252,9 +205,9 @@ prepare_legacy() {
   command -v jq >/dev/null 2>&1 || die "prepare-legacy 需要 jq"
   # 写盘前再验隔离目录（含 STATE_DIR）都不是软链：这一步缩小 preflight 之后被换软链的窗口，并给出
   # 清晰早失败；真正的写安全由下面 write_fresh（删软链再写全新文件）保证，故不宣称消除竞态。
-  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$TEST_HOME/.csswitch"
+  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$ACCEPTANCE_CONFIG_DIR"
   assert_isolated_from_real_home "$TEST_HOME"
-  local cfg_dir="$TEST_HOME/.csswitch"
+  local cfg_dir="$ACCEPTANCE_CONFIG_DIR"
   umask 077
   mkdir -p "$cfg_dir"
   chmod 700 "$cfg_dir"
@@ -275,9 +228,9 @@ prepare_codex() {
   resolve_ports
   [ -f "$BASELINE" ] || die "先运行 preflight"
   command -v jq >/dev/null 2>&1 || die "prepare-codex 需要 jq"
-  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$TEST_HOME/.csswitch"
+  reject_symlinks "$TEST_ROOT" "$TEST_HOME" "$STATE_DIR" "$ACCEPTANCE_CONFIG_DIR"
   assert_isolated_from_real_home "$TEST_HOME"
-  local cfg_dir="$TEST_HOME/.csswitch"
+  local cfg_dir="$ACCEPTANCE_CONFIG_DIR"
   local cfg="$cfg_dir/config.json"
   [ ! -e "$cfg" ] && [ ! -L "$cfg" ] || die "隔离 config 已存在；为避免覆盖验收状态，请使用新的 CSSWITCH_REAL_TEST_ROOT"
   umask 077
@@ -289,7 +242,7 @@ prepare_codex() {
     '{schema_version:3,profiles:[],active_id:"",proxy_port:$proxy_port,sandbox_port:$sandbox_port,reuse_system_ssh:false,experimental_codex_enabled:false,secret:"",mode:"proxy",pending_notice:null}' \
     | write_fresh "$cfg"
   chmod 600 "$cfg"
-  pass "已写入隔离 v3 空配置：动态端口、Codex 实验默认关闭、无 profile / token / Keychain 内容"
+  pass "已写入隔离 v3 空配置：动态端口、Codex 实验默认关闭、无 profile / token / OAuth 内容"
 }
 
 assert_running() {
@@ -302,7 +255,7 @@ assert_running() {
     die "无法可靠查询端口 $SANDBOX_PORT 的 listener；拒绝继续"
   [ -n "$proxy_pids" ] || die "代理端口 $PROXY_PORT 未监听"
   [ -n "$sandbox_pids" ] || die "沙箱端口 $SANDBOX_PORT 未监听"
-  local sbx_home="$TEST_HOME/.csswitch/sandbox/home"
+  local sbx_home="$ACCEPTANCE_CONFIG_DIR/sandbox/home"
   local data_dir="$sbx_home/.claude-science"
   local out
   out="$(HOME="$sbx_home" "$SCIENCE_BIN" status --data-dir "$data_dir" 2>/dev/null || true)"

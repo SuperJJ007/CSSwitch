@@ -10,7 +10,7 @@ use crate::runtime::profile::{
 };
 use crate::runtime::profile_switch::{scratch_validate_candidate, set_active_profile_txn};
 use crate::runtime::provider::{reject_openai_custom_anthropic_base, resolve_launch_plan};
-use crate::{config, lifecycle, lock, run_blocking, SharedAppState, SharedLifecycle};
+use crate::{config, lifecycle, lock, run_blocking_typed, SharedAppState, SharedLifecycle};
 
 #[tauri::command]
 pub(crate) fn get_config() -> Result<serde_json::Value, String> {
@@ -140,10 +140,10 @@ pub(crate) async fn update_profile_connection(
     api_format: Option<String>,
     model: Option<String>,
     key: Option<String>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || {
+    run_blocking_typed(move || {
         update_profile_connection_inner_cmd(
             app, state, lifecycle, id, base_url, api_format, model, key,
         )
@@ -161,72 +161,127 @@ fn update_profile_connection_inner_cmd(
     api_format: Option<String>,
     model: Option<String>,
     key: Option<String>,
-) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| {
-        let dir = config::default_dir();
-        let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
-        // 未命中 id → Err（不静默 Ok）。
-        let mut candidate = cfg
-            .profile_by_id(&id)
-            .cloned()
-            .ok_or_else(|| format!("找不到 profile：{id}"))?;
-        config::require_template_enabled(&cfg, &candidate.template_id)?;
-        // 生效【后】的候选连接（None=不改则沿用旧值），active/非 active 共用一份。
-        let edit = ConnectionEdit::new(
-            base_url.clone(),
-            api_format.clone(),
-            model.clone(),
-            key.clone(),
-        );
-        edit.apply(&mut candidate);
-        let resolved = resolve_launch_plan(&candidate)?;
-        reject_openai_custom_anthropic_base(&resolved.adapter, &candidate.base_url)?;
-        // 保存前守卫（修 P2）：relay/自定义端点清空 base_url → 不可用连接（激活必失败）。
-        // 校验生效后的 base_url，空则拒绝落盘、绝不谎报「已保存」；native 走硬编码端点，空无妨。
-        if resolved.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired
-            && candidate.base_url.trim().is_empty()
-        {
-            return Err("中转 / 自定义端点必须填写连接地址（base_url），连接未保存。".to_string());
-        }
-        // 保存前守卫（修 #9 P1-a）：relay/自定义端点空 model → 无 force → 退回 passthrough（显示 claude）。
-        if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
-            && candidate.model.trim().is_empty()
-        {
-            return Err("中转 / 自定义端点必须选择或填写一个模型，连接未保存。".to_string());
-        }
-        if cfg.active_id == id {
-            // active（有正在服务的代理）：validate-before-persist —— 新连接作【内存候选】喂进
-            // 切换事务（校验→起正式→健康），探活健康【才】连同落盘；失败则磁盘连接零改动、
-            // 仍跑旧连接（杜绝「盘新运行旧」，修 P1-4）。
-            let v =
-                set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, false, Some(&edit))?;
-            // 连接编辑：committed:false（scratch 分类失败）也如实作为错误上抛（磁盘未改、代理仍跑旧的）。
-            if v.get("committed").and_then(|b| b.as_bool()) == Some(false) {
-                let hint = v
-                    .get("hint")
-                    .and_then(|h| h.as_str())
-                    .unwrap_or("连接校验未通过，连接未保存。")
-                    .to_string();
-                return Err(hint);
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let preflight_cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
+    let mut preflight_candidate = preflight_cfg
+        .profile_by_id(&id)
+        .cloned()
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    let preflight_edit = ConnectionEdit::new(
+        base_url.clone(),
+        api_format.clone(),
+        model.clone(),
+        key.clone(),
+    );
+    preflight_edit.apply(&mut preflight_candidate);
+    let target_adapter = resolve_launch_plan(&preflight_candidate)?.adapter;
+    let active_adapter = preflight_cfg
+        .active_profile()
+        .map(resolve_launch_plan)
+        .transpose()?
+        .map(|launch| launch.adapter);
+    let (preflight_adapter, preflight_target) = if target_adapter == "codex" {
+        (
+            "codex",
+            crate::commands::codex::CodexPreflightTarget::Profile(id.clone()),
+        )
+    } else if active_adapter.as_deref() == Some("codex") && preflight_cfg.active_id == id {
+        (
+            "codex",
+            crate::commands::codex::CodexPreflightTarget::ActiveProfile,
+        )
+    } else {
+        (
+            target_adapter.as_str(),
+            crate::commands::codex::CodexPreflightTarget::NoProfile,
+        )
+    };
+    let prepared =
+        crate::commands::codex::prepare_provider_auth(&app, preflight_adapter, preflight_target)?;
+    lifecycle
+        .with_serialized(|| -> Result<_, String> {
+            if let Some(prepared) = prepared.as_ref() {
+                prepared.verify_unchanged()?;
             }
-            // active：已连同起正式代理探活并落盘，视为已校验。
-            Ok(json!({ "validated": true }))
-        } else {
-            // 非 active：无正在服务的代理。先对候选做上游 scratch 校验（仅明确拒绝才拦，其余
-            // best-effort 落盘并如实标记「未校验」，修 P2-d：贴合设计「校验候选后提交」+ 如实报告），
-            // 再落盘（inner 内含格式门 + 覆盖前留底）。
-            let validated = scratch_validate_candidate(&app, &candidate)?;
-            update_profile_connection_inner(
-                &dir,
-                &id,
-                base_url.as_deref(),
-                api_format.as_deref(),
-                model.as_deref(),
-                key.as_deref(),
-            )?;
-            Ok(json!({ "validated": validated }))
-        }
-    })
+            let dir = config::default_dir();
+            let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
+            // 未命中 id → Err（不静默 Ok）。
+            let mut candidate = cfg
+                .profile_by_id(&id)
+                .cloned()
+                .ok_or_else(|| format!("找不到 profile：{id}"))?;
+            config::require_template_enabled(&cfg, &candidate.template_id)?;
+            // 生效【后】的候选连接（None=不改则沿用旧值），active/非 active 共用一份。
+            let edit = ConnectionEdit::new(
+                base_url.clone(),
+                api_format.clone(),
+                model.clone(),
+                key.clone(),
+            );
+            edit.apply(&mut candidate);
+            let resolved = resolve_launch_plan(&candidate)?;
+            reject_openai_custom_anthropic_base(&resolved.adapter, &candidate.base_url)?;
+            // 保存前守卫（修 P2）：relay/自定义端点清空 base_url → 不可用连接（激活必失败）。
+            // 校验生效后的 base_url，空则拒绝落盘、绝不谎报「已保存」；native 走硬编码端点，空无妨。
+            if resolved.endpoint_policy
+                == crate::provider_contracts::EndpointPolicy::ProfileRequired
+                && candidate.base_url.trim().is_empty()
+            {
+                return Err(
+                    "中转 / 自定义端点必须填写连接地址（base_url），连接未保存。".to_string(),
+                );
+            }
+            // 保存前守卫（修 #9 P1-a）：relay/自定义端点空 model → 无 force → 退回 passthrough（显示 claude）。
+            if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+                && candidate.model.trim().is_empty()
+            {
+                return Err("中转 / 自定义端点必须选择或填写一个模型，连接未保存。".to_string());
+            }
+            if cfg.active_id == id {
+                // active（有正在服务的代理）：validate-before-persist —— 新连接作【内存候选】喂进
+                // 切换事务（校验→起正式→健康），探活健康【才】连同落盘；失败则磁盘连接零改动、
+                // 仍跑旧连接（杜绝「盘新运行旧」，修 P1-4）。
+                let v = set_active_profile_txn(
+                    &app,
+                    &state,
+                    lifecycle.as_ref(),
+                    &id,
+                    false,
+                    Some(&edit),
+                    prepared.as_ref().map(|prepared| prepared.proof()),
+                )?;
+                // 连接编辑：committed:false（scratch 分类失败）也如实作为错误上抛（磁盘未改、代理仍跑旧的）。
+                if v.get("committed").and_then(|b| b.as_bool()) == Some(false) {
+                    let hint = v
+                        .get("hint")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or("连接校验未通过，连接未保存。")
+                        .to_string();
+                    return Err(hint);
+                }
+                // active：已连同起正式代理探活并落盘，视为已校验。
+                Ok(json!({ "validated": true }))
+            } else {
+                // 非 active：无正在服务的代理。先对候选做上游 scratch 校验（仅明确拒绝才拦，其余
+                // best-effort 落盘并如实标记「未校验」，修 P2-d：贴合设计「校验候选后提交」+ 如实报告），
+                // 再落盘（inner 内含格式门 + 覆盖前留底）。
+                let validated = scratch_validate_candidate(
+                    &app,
+                    &candidate,
+                    prepared.as_ref().map(|prepared| prepared.proof()),
+                )?;
+                update_profile_connection_inner(
+                    &dir,
+                    &id,
+                    base_url.as_deref(),
+                    api_format.as_deref(),
+                    model.as_deref(),
+                    key.as_deref(),
+                )?;
+                Ok(json!({ "validated": validated }))
+            }
+        })
+        .map_err(crate::commands::codex::RuntimeCommandError::from)
 }
 
 /// 一键切生效 profile：经串行器走 [`set_active_profile_txn`] 切换事务。
@@ -237,10 +292,11 @@ pub(crate) async fn set_active_profile(
     lifecycle: State<'_, SharedLifecycle>,
     id: String,
     skip_verify: bool,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || set_active_profile_inner_cmd(app, state, lifecycle, id, skip_verify)).await
+    run_blocking_typed(move || set_active_profile_inner_cmd(app, state, lifecycle, id, skip_verify))
+        .await
 }
 
 fn set_active_profile_inner_cmd(
@@ -249,20 +305,63 @@ fn set_active_profile_inner_cmd(
     lifecycle: SharedLifecycle,
     id: String,
     skip_verify: bool,
-) -> Result<serde_json::Value, String> {
-    lifecycle.with_serialized(|| {
-        let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
-        let profile = cfg
-            .profile_by_id(&id)
-            .ok_or_else(|| format!("找不到 profile：{id}"))?;
-        config::require_template_enabled(&cfg, &profile.template_id)?;
-        set_active_profile_txn(&app, &state, lifecycle.as_ref(), &id, skip_verify, None)
-    })
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let preflight_cfg =
+        config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    let target = preflight_cfg
+        .profile_by_id(&id)
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    let target_adapter = resolve_launch_plan(target)?.adapter;
+    // The target decides whether this user action needs Codex preflight.
+    // Switching away from an active Codex profile must remain possible even
+    // while Codex login/status is busy or its local auth record is incomplete.
+    let (preflight_adapter, preflight_target) = activation_preflight(&target_adapter, &id);
+    let prepared =
+        crate::commands::codex::prepare_provider_auth(&app, &preflight_adapter, preflight_target)?;
+    lifecycle
+        .with_serialized(|| -> Result<_, String> {
+            if let Some(prepared) = prepared.as_ref() {
+                prepared.verify_unchanged()?;
+            }
+            let cfg =
+                config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+            let profile = cfg
+                .profile_by_id(&id)
+                .ok_or_else(|| format!("找不到 profile：{id}"))?;
+            config::require_template_enabled(&cfg, &profile.template_id)?;
+            set_active_profile_txn(
+                &app,
+                &state,
+                lifecycle.as_ref(),
+                &id,
+                skip_verify,
+                None,
+                prepared.as_ref().map(|prepared| prepared.proof()),
+            )
+        })
+        .map_err(crate::commands::codex::RuntimeCommandError::from)
+}
+
+fn activation_preflight(
+    target_adapter: &str,
+    id: &str,
+) -> (String, crate::commands::codex::CodexPreflightTarget) {
+    if target_adapter == "codex" {
+        (
+            "codex".into(),
+            crate::commands::codex::CodexPreflightTarget::Profile(id.to_string()),
+        )
+    } else {
+        (
+            target_adapter.to_string(),
+            crate::commands::codex::CodexPreflightTarget::NoProfile,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clear_profile_key_cmd, delete_profile_cmd};
+    use super::{activation_preflight, clear_profile_key_cmd, delete_profile_cmd};
     use crate::{
         config::{self, Config, Profile},
         lifecycle, lock, AppState, SharedAppState,
@@ -388,5 +487,21 @@ mod tests {
         assert!(st.launch_id.is_empty());
         assert_eq!(st.key_fp, 0);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn non_codex_activation_never_reserves_codex_preflight() {
+        let (adapter, target) = activation_preflight("relay", "glm-profile");
+        assert_eq!(adapter, "relay");
+        assert!(matches!(
+            target,
+            crate::commands::codex::CodexPreflightTarget::NoProfile
+        ));
+        let (adapter, target) = activation_preflight("codex", "codex-profile");
+        assert_eq!(adapter, "codex");
+        assert!(matches!(
+            target,
+            crate::commands::codex::CodexPreflightTarget::Profile(id) if id == "codex-profile"
+        ));
     }
 }

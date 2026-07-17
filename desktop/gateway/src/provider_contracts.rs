@@ -87,7 +87,7 @@ pub(crate) fn load_codex_runtime_contract() -> Result<CodexRuntimeContract, Stri
     let mut codex = catalog.contracts.iter().filter(|contract| {
         contract.id == "codex-oauth"
             || contract.adapter == "codex"
-            || contract.auth_mode == "keychain_oauth"
+            || contract.auth_mode == "csswitch_oauth"
             || contract.transport == "codex_responses_sse"
     });
     let contract = codex
@@ -98,9 +98,9 @@ pub(crate) fn load_codex_runtime_contract() -> Result<CodexRuntimeContract, Stri
         || contract.template_ids != ["codex"]
         || contract.api_formats != ["openai_responses"]
         || contract.adapter != "codex"
-        || contract.auth_mode != "keychain_oauth"
-        || contract.credential_sources != ["keychain_oauth"]
-        || contract.default_credential_source != "keychain_oauth"
+        || contract.auth_mode != "csswitch_oauth"
+        || contract.credential_sources != ["csswitch_oauth"]
+        || contract.default_credential_source != "csswitch_oauth"
         || contract.model_policies != ["dynamic_catalog"]
         || contract.default_model_policy != "dynamic_catalog"
         || contract.model_discovery != "codex_account_catalog"

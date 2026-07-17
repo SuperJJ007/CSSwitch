@@ -36,7 +36,7 @@ installed Science 的可观测结果：
 
 ## 实现结论与自动测试
 
-Gateway 采用双 ID：官方响应与 `codex-models-cache.v2.json` 保留 raw id 及模型级 reasoning / tool capability；Science-facing `/v1/models` 暴露 `claude-csswitch-codex-<raw-id>` 并添加 `Codex / ` 显示前缀；`/v1/messages` 在账号目录校验成功后映射回 raw id，并按所选模型能力构造上游参数。raw id、未知 alias 和隐藏模型不能触发推理 POST。共享 HOME 的 formal/scratch 缓存另有持久化 cache epoch 与文件锁；双 catalog 竞态测试按“失效 → 新 live 恢复 → 旧请求最后完成”的 ABA 顺序证明旧在途响应无法复活缓存，重启也不会复用失效目录。
+Gateway 采用双 ID：官方响应与 `codex-models-cache.v3.json` 保留 raw id 及模型级 reasoning / tool / Responses Lite capability；Science-facing `/v1/models` 暴露 `claude-csswitch-codex-<raw-id>` 并添加 `Codex / ` 显示前缀；`/v1/messages` 在账号目录校验成功后映射回 raw id，并按所选模型能力构造上游参数。raw id、未知 alias 和隐藏模型不能触发推理 POST。共享 HOME 的 formal/scratch 缓存另有持久化 cache epoch 与文件锁；双 catalog 竞态测试按“失效 → 新 live 恢复 → 旧请求最后完成”的 ABA 顺序证明旧在途响应无法复活缓存，重启也不会复用失效目录。
 
 本次聚焦结果：
 

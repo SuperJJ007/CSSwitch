@@ -1,13 +1,14 @@
 use std::collections::HashSet;
 use std::fmt;
+use std::future::Future;
+use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use base64::Engine;
 use reqwest::header::CONTENT_TYPE;
-use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use zeroize::{Zeroize, Zeroizing};
@@ -22,7 +23,6 @@ use crate::codex_network::CodexHttpClientFactory;
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_PORTS: &[u16] = &[1455, 1457];
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-const DEVICE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const CALLBACK_IO_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_CALLBACK_HEAD: usize = 64 * 1024;
@@ -32,12 +32,6 @@ const CONTROL_RUNNING: u8 = 0;
 const CONTROL_CANCELLED: u8 = 1;
 const CONTROL_COMMITTING: u8 = 2;
 const CONTROL_FINISHED: u8 = 3;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AsyncLoginMethod {
-    Device,
-    Browser,
-}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CancelDisposition {
@@ -58,11 +52,6 @@ impl CancelDisposition {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LoginProgress {
-    VerificationRequired {
-        verification_url: String,
-        user_code: String,
-        expires_at_ms: i64,
-    },
     Waiting,
     Exchanging,
     Committing,
@@ -131,7 +120,6 @@ struct AsyncLoginOptions {
     client_id: String,
     callback_ports: Vec<u16>,
     browser_timeout: Duration,
-    device_timeout: Duration,
 }
 
 impl AsyncLoginOptions {
@@ -141,14 +129,12 @@ impl AsyncLoginOptions {
             client_id: CODEX_OAUTH_CLIENT_ID.to_string(),
             callback_ports: CALLBACK_PORTS.to_vec(),
             browser_timeout: BROWSER_TIMEOUT,
-            device_timeout: DEVICE_TIMEOUT,
         }
     }
 }
 
 pub async fn run_production_login<S, T, F>(
     repository: &AuthRepository<S, T>,
-    method: AsyncLoginMethod,
     control: &LoginControl,
     progress: F,
 ) -> Result<AuthStatus, OAuthFlowError>
@@ -189,253 +175,17 @@ where
             .at_stage("proxy_config")
         })?;
     let options = AsyncLoginOptions::production();
-    let result = match method {
-        AsyncLoginMethod::Device => {
-            run_device_login(
-                repository,
-                &client,
-                factory.has_proxy(),
-                &options,
-                control,
-                &progress,
-            )
-            .await
-        }
-        AsyncLoginMethod::Browser => {
-            run_browser_login(
-                repository,
-                &client,
-                factory.has_proxy(),
-                &options,
-                control,
-                &progress,
-            )
-            .await
-        }
-    };
+    let result = run_browser_login(
+        repository,
+        &client,
+        factory.has_proxy(),
+        &options,
+        control,
+        &progress,
+    )
+    .await;
     control.finish();
     result
-}
-
-#[derive(Serialize)]
-struct UserCodeRequest<'a> {
-    client_id: &'a str,
-}
-
-#[derive(Deserialize)]
-struct UserCodeResponse {
-    device_auth_id: String,
-    #[serde(alias = "usercode")]
-    user_code: String,
-    #[serde(default, deserialize_with = "deserialize_interval")]
-    interval: u64,
-}
-
-#[derive(Serialize)]
-struct TokenPollRequest<'a> {
-    device_auth_id: &'a str,
-    user_code: &'a str,
-}
-
-#[derive(Deserialize)]
-struct CodeSuccessResponse {
-    authorization_code: String,
-    code_challenge: String,
-    code_verifier: String,
-}
-
-#[derive(Deserialize)]
-struct DeviceErrorResponse {
-    #[serde(default)]
-    error: String,
-}
-
-fn deserialize_interval<'de, D>(deserializer: D) -> Result<u64, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Value {
-        Number(u64),
-        String(String),
-    }
-    match Value::deserialize(deserializer)? {
-        Value::Number(value) => Ok(value),
-        Value::String(value) => value.trim().parse().map_err(serde::de::Error::custom),
-    }
-}
-
-async fn run_device_login<S, T, F>(
-    repository: &AuthRepository<S, T>,
-    client: &reqwest::Client,
-    has_proxy: bool,
-    options: &AsyncLoginOptions,
-    control: &LoginControl,
-    progress: &F,
-) -> Result<AuthStatus, OAuthFlowError>
-where
-    S: SecretStore,
-    T: StateStore,
-    F: Fn(LoginProgress),
-{
-    let guard = repository.begin_mutation().map_err(OAuthFlowError::from)?;
-    let deadline = tokio::time::Instant::now() + options.device_timeout;
-    let issuer = options.issuer.trim_end_matches('/');
-    let user_code_endpoint = format!("{issuer}/api/accounts/deviceauth/usercode");
-    let user_code_body = serde_json::to_vec(&UserCodeRequest {
-        client_id: &options.client_id,
-    })
-    .map_err(|_| {
-        OAuthFlowError::protocol("The device code request is invalid")
-            .at_stage("device_code_request")
-    })?;
-    let response = send_request(
-        client
-            .post(user_code_endpoint)
-            .header(CONTENT_TYPE, "application/json")
-            .header("user-agent", crate::config::UPSTREAM_UA)
-            .body(user_code_body),
-        control,
-        has_proxy,
-        "device_code_request",
-    )
-    .await?;
-    let response = read_response(response, control, "device_code_request").await?;
-    reject_challenge(&response, "device_code_request")?;
-    if response.status == 404 && matches!(response.kind, "json" | "empty") {
-        return Err(OAuthFlowError::new(
-            OAuthErrorCode::DeviceAuthUnavailable,
-            false,
-            "Device code login is unavailable",
-        )
-        .at_stage("device_code_request")
-        .with_http(Some(response.status), Some(response.kind), Some(false)));
-    }
-    require_json_success(&response, "device_code_request")?;
-    let user_code: UserCodeResponse = serde_json::from_slice(&response.body).map_err(|_| {
-        OAuthFlowError::protocol("The device code response is invalid")
-            .at_stage("device_code_request")
-            .with_http(Some(response.status), Some(response.kind), Some(false))
-    })?;
-    if user_code.device_auth_id.is_empty()
-        || user_code.device_auth_id.len() > 1_024
-        || !valid_user_code(&user_code.user_code)
-    {
-        return Err(
-            OAuthFlowError::protocol("The device code response is invalid")
-                .at_stage("device_code_request")
-                .with_http(Some(response.status), Some(response.kind), Some(false)),
-        );
-    }
-    let interval = user_code.interval.clamp(1, 30);
-    let verification_url = format!("{issuer}/codex/device");
-    progress(LoginProgress::VerificationRequired {
-        verification_url: verification_url.clone(),
-        user_code: user_code.user_code.clone(),
-        expires_at_ms: now_ms().saturating_add(options.device_timeout.as_millis() as i64),
-    });
-    progress(LoginProgress::Waiting);
-
-    let token_endpoint = format!("{issuer}/api/accounts/deviceauth/token");
-    let code = loop {
-        if tokio::time::Instant::now() >= deadline {
-            return Err(OAuthFlowError::new(
-                OAuthErrorCode::CallbackTimeout,
-                true,
-                "Device code login timed out",
-            )
-            .at_stage("device_wait"));
-        }
-        let poll_body = serde_json::to_vec(&TokenPollRequest {
-            device_auth_id: &user_code.device_auth_id,
-            user_code: &user_code.user_code,
-        })
-        .map_err(|_| {
-            OAuthFlowError::protocol("The device authorization request is invalid")
-                .at_stage("device_wait")
-        })?;
-        let response = send_request(
-            client
-                .post(&token_endpoint)
-                .header(CONTENT_TYPE, "application/json")
-                .header("user-agent", crate::config::UPSTREAM_UA)
-                .body(poll_body),
-            control,
-            has_proxy,
-            "device_wait",
-        )
-        .await?;
-        let response = read_response(response, control, "device_wait").await?;
-        reject_challenge(&response, "device_wait")?;
-        if response.status >= 200 && response.status < 300 {
-            if response.kind != "json" {
-                return Err(unexpected_content_type(&response, "device_wait"));
-            }
-            let code: CodeSuccessResponse =
-                serde_json::from_slice(&response.body).map_err(|_| {
-                    OAuthFlowError::protocol("The device authorization response is invalid")
-                        .at_stage("device_wait")
-                        .with_http(Some(response.status), Some(response.kind), Some(false))
-                })?;
-            validate_code_success(&code)?;
-            break code;
-        }
-        if let Ok(error) = serde_json::from_slice::<DeviceErrorResponse>(&response.body) {
-            if matches!(
-                error.error.as_str(),
-                "access_denied" | "authorization_declined"
-            ) {
-                return Err(OAuthFlowError::new(
-                    OAuthErrorCode::OAuthDenied,
-                    false,
-                    "Device code login was denied",
-                )
-                .at_stage("device_wait")
-                .with_http(Some(response.status), Some(response.kind), Some(false)));
-            }
-            if error.error == "expired_token" {
-                return Err(OAuthFlowError::new(
-                    OAuthErrorCode::CallbackTimeout,
-                    true,
-                    "Device code login expired",
-                )
-                .at_stage("device_wait")
-                .with_http(Some(response.status), Some(response.kind), Some(false)));
-            }
-        }
-        if !matches!(response.status, 403 | 404) || !matches!(response.kind, "json" | "empty") {
-            if response.kind == "html" || response.kind == "other" {
-                return Err(unexpected_content_type(&response, "device_wait"));
-            }
-            return Err(
-                OAuthFlowError::protocol("Device authorization was rejected")
-                    .at_stage("device_wait")
-                    .with_http(Some(response.status), Some(response.kind), Some(false)),
-            );
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        cancellable_sleep(
-            Duration::from_secs(interval).min(remaining),
-            control,
-            "device_wait",
-        )
-        .await?;
-    };
-
-    progress(LoginProgress::Exchanging);
-    let redirect_uri = format!("{issuer}/deviceauth/callback");
-    let tokens = exchange_code(
-        client,
-        has_proxy,
-        options,
-        &redirect_uri,
-        &code.authorization_code,
-        &code.code_verifier,
-        control,
-    )
-    .await?;
-    commit_login(repository, &guard, tokens, control, progress)
 }
 
 async fn run_browser_login<S, T, F>(
@@ -451,6 +201,53 @@ where
     T: StateStore,
     F: Fn(LoginProgress),
 {
+    run_browser_login_with_launcher(
+        repository,
+        client,
+        has_proxy,
+        options,
+        control,
+        progress,
+        &SystemBrowserLauncher,
+    )
+    .await
+}
+
+trait BrowserLauncher {
+    fn open<'a>(
+        &'a self,
+        url: &'a str,
+        control: &'a LoginControl,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OAuthFlowError>> + 'a>>;
+}
+
+struct SystemBrowserLauncher;
+
+impl BrowserLauncher for SystemBrowserLauncher {
+    fn open<'a>(
+        &'a self,
+        url: &'a str,
+        control: &'a LoginControl,
+    ) -> Pin<Box<dyn Future<Output = Result<(), OAuthFlowError>> + 'a>> {
+        Box::pin(open_browser(url, control))
+    }
+}
+
+async fn run_browser_login_with_launcher<S, T, F, B>(
+    repository: &AuthRepository<S, T>,
+    client: &reqwest::Client,
+    has_proxy: bool,
+    options: &AsyncLoginOptions,
+    control: &LoginControl,
+    progress: &F,
+    launcher: &B,
+) -> Result<AuthStatus, OAuthFlowError>
+where
+    S: SecretStore,
+    T: StateStore,
+    F: Fn(LoginProgress),
+    B: BrowserLauncher,
+{
     let guard = repository.begin_mutation().map_err(OAuthFlowError::from)?;
     let deadline = tokio::time::Instant::now() + options.browser_timeout;
     let (listener, port) = bind_callback(&options.callback_ports)?;
@@ -464,7 +261,7 @@ where
         &pkce.challenge,
         &state,
     )?;
-    open_browser(&authorization_url, control).await?;
+    launcher.open(&authorization_url, control).await?;
     progress(LoginProgress::Waiting);
 
     let mut request_count = 0_usize;
@@ -594,7 +391,7 @@ where
     progress(LoginProgress::Committing);
     repository
         .commit_login_guarded(guard, tokens)
-        .map_err(|error| OAuthFlowError::from(error).at_stage("keychain_commit"))
+        .map_err(|error| OAuthFlowError::from(error).at_stage("credential_commit"))
 }
 
 async fn exchange_code(
@@ -838,17 +635,6 @@ fn unexpected_content_type(response: &ResponseData, stage: &'static str) -> OAut
     .with_http(Some(response.status), Some(response.kind), Some(false))
 }
 
-async fn cancellable_sleep(
-    duration: Duration,
-    control: &LoginControl,
-    stage: &'static str,
-) -> Result<(), OAuthFlowError> {
-    tokio::select! {
-        _ = control.cancelled() => Err(cancelled_error(stage)),
-        _ = tokio::time::sleep(duration) => Ok(()),
-    }
-}
-
 fn cancelled_error(stage: &'static str) -> OAuthFlowError {
     OAuthFlowError::new(
         OAuthErrorCode::AuthCancelled,
@@ -856,45 +642,6 @@ fn cancelled_error(stage: &'static str) -> OAuthFlowError {
         "Codex sign-in was cancelled",
     )
     .at_stage(stage)
-}
-
-fn validate_code_success(response: &CodeSuccessResponse) -> Result<(), OAuthFlowError> {
-    if response.authorization_code.is_empty()
-        || response.authorization_code.len() > 16 * 1024
-        || response.code_challenge.is_empty()
-        || response.code_challenge.len() > 1_024
-        || response.code_verifier.len() < 43
-        || response.code_verifier.len() > 1_024
-    {
-        return Err(
-            OAuthFlowError::protocol("The device authorization response is invalid")
-                .at_stage("device_wait"),
-        );
-    }
-    let expected = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .encode(Sha256::digest(response.code_verifier.as_bytes()));
-    if expected != response.code_challenge {
-        return Err(
-            OAuthFlowError::protocol("The device authorization PKCE binding is invalid")
-                .at_stage("device_wait"),
-        );
-    }
-    Ok(())
-}
-
-fn valid_user_code(value: &str) -> bool {
-    let Some((left, right)) = value.split_once('-') else {
-        return false;
-    };
-    !value.contains(['\r', '\n'])
-        && (4..=8).contains(&left.len())
-        && (4..=8).contains(&right.len())
-        && left
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
-        && right
-            .chars()
-            .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
 }
 
 struct PkceCodes {
@@ -1199,20 +946,12 @@ async fn write_callback(stream: &mut tokio::net::TcpStream, status: u16, message
     let _ = stream.shutdown().await;
 }
 
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
-        .unwrap_or(i64::MAX)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::thread;
@@ -1289,7 +1028,7 @@ mod tests {
             let mut random = [0_u8; 8];
             getrandom::getrandom(&mut random).unwrap();
             let path = std::env::temp_dir().join(format!(
-                "csswitch-login-async-test-{}-{}",
+                "csswitch-browser-login-test-{}-{}",
                 std::process::id(),
                 base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random)
             ));
@@ -1304,6 +1043,26 @@ mod tests {
         }
     }
 
+    struct TestBrowserLauncher<F>(F);
+
+    impl<F> BrowserLauncher for TestBrowserLauncher<F>
+    where
+        F: Fn(&str) -> Result<(), OAuthFlowError>,
+    {
+        fn open<'a>(
+            &'a self,
+            url: &'a str,
+            _control: &'a LoginControl,
+        ) -> Pin<Box<dyn Future<Output = Result<(), OAuthFlowError>> + 'a>> {
+            let result = (self.0)(url);
+            Box::pin(async move { result })
+        }
+    }
+
+    fn accept_browser_open(_: &str) -> Result<(), OAuthFlowError> {
+        Ok(())
+    }
+
     fn repository(root: &TempRoot) -> AuthRepository<MemorySecrets, MemoryState> {
         AuthRepository::new(
             MemorySecrets::default(),
@@ -1312,66 +1071,12 @@ mod tests {
         )
     }
 
-    fn http_response(status: &str, content_type: &str, headers: &str, body: &[u8]) -> Vec<u8> {
-        let mut response = format!(
-            "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n{headers}\r\n",
-            body.len()
-        )
-        .into_bytes();
-        response.extend_from_slice(body);
-        response
-    }
-
-    fn spawn_sequence_server(responses: Vec<Vec<u8>>) -> (String, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-        let address = listener.local_addr().unwrap();
-        let handle = thread::spawn(move || {
-            for response in responses {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
-                let mut request = Vec::new();
-                let mut chunk = [0_u8; 4096];
-                loop {
-                    let read = stream.read(&mut chunk).unwrap();
-                    if read == 0 {
-                        break;
-                    }
-                    request.extend_from_slice(&chunk[..read]);
-                    if let Some(head_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                    {
-                        let head_end = head_end + 4;
-                        let head = String::from_utf8_lossy(&request[..head_end]);
-                        let content_length = head
-                            .lines()
-                            .find_map(|line| {
-                                line.split_once(':').and_then(|(name, value)| {
-                                    name.eq_ignore_ascii_case("content-length")
-                                        .then(|| value.trim().parse::<usize>().ok())
-                                        .flatten()
-                                })
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= head_end + content_length {
-                            break;
-                        }
-                    }
-                }
-                stream.write_all(&response).unwrap();
-                stream.flush().unwrap();
-            }
-        });
-        (format!("http://{address}"), handle)
-    }
-
-    fn options(issuer: String) -> AsyncLoginOptions {
+    fn test_options(issuer: String, browser_timeout: Duration) -> AsyncLoginOptions {
         AsyncLoginOptions {
             issuer,
             client_id: "client-test".into(),
             callback_ports: vec![0],
-            browser_timeout: Duration::from_secs(2),
-            device_timeout: Duration::from_secs(5),
+            browser_timeout,
         }
     }
 
@@ -1382,6 +1087,77 @@ mod tests {
         format!("{header}.{payload}.sig")
     }
 
+    fn read_http_request(stream: &mut TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
+            let Some(head_end) = request.windows(4).position(|part| part == b"\r\n\r\n") else {
+                continue;
+            };
+            let head_end = head_end + 4;
+            let head = String::from_utf8_lossy(&request[..head_end]);
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    line.split_once(':').and_then(|(name, value)| {
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                })
+                .unwrap_or(0);
+            if request.len() >= head_end + content_length {
+                return request;
+            }
+        }
+    }
+
+    fn spawn_token_server(body: Vec<u8>) -> (String, Arc<Mutex<Vec<u8>>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = Arc::new(Mutex::new(Vec::new()));
+        let request_out = request.clone();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            *request_out.lock().unwrap() = read_http_request(&mut stream);
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).unwrap();
+            stream.write_all(&body).unwrap();
+            stream.flush().unwrap();
+        });
+        (format!("http://{address}"), request, handle)
+    }
+
+    fn send_callback(redirect_uri: &str, query: &str, host: Option<&str>) -> Vec<u8> {
+        let redirect = url::Url::parse(redirect_uri).unwrap();
+        let port = redirect.port().unwrap();
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET {}?{query} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+                    redirect.path(),
+                    host.map(str::to_string)
+                        .unwrap_or_else(|| format!("localhost:{port}"))
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        stream.flush().unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        response
+    }
+
     fn direct_client() -> reqwest::Client {
         CodexHttpClientFactory::direct_for_test()
             .async_builder()
@@ -1389,20 +1165,6 @@ mod tests {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .unwrap()
-    }
-
-    #[test]
-    fn user_code_and_pkce_binding_are_strict() {
-        assert!(valid_user_code("ABCD-1234"));
-        assert!(!valid_user_code("abcd-1234"));
-        assert!(!valid_user_code("ABCD1234"));
-        let pkce = generate_pkce().unwrap();
-        let response = CodeSuccessResponse {
-            authorization_code: "code".into(),
-            code_challenge: pkce.challenge,
-            code_verifier: pkce.verifier.to_string(),
-        };
-        validate_code_success(&response).unwrap();
     }
 
     #[test]
@@ -1446,10 +1208,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn device_flow_handles_pending_then_commits_one_generation() {
-        let verifier = "v".repeat(64);
-        let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
-            .encode(Sha256::digest(verifier.as_bytes()));
+    async fn async_browser_flow_rejects_bad_host_and_state_then_exchanges_and_commits() {
         let id_token = jwt(serde_json::json!({
             "https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"},
             "exp": 2_000_000_000_i64
@@ -1458,146 +1217,149 @@ mod tests {
             "chatgpt_account_id": "acct-test",
             "exp": 2_000_000_000_i64
         }));
-        let responses = vec![
-            http_response(
-                "200 OK",
-                "application/json",
-                "",
-                br#"{"device_auth_id":"device-1","user_code":"ABCD-1234","interval":"1"}"#,
-            ),
-            http_response("403 Forbidden", "application/json", "", b""),
-            http_response(
-                "200 OK",
-                "application/json",
-                "",
-                serde_json::to_vec(&serde_json::json!({
-                    "authorization_code": "authorization-code",
-                    "code_challenge": challenge,
-                    "code_verifier": verifier,
-                }))
-                .unwrap()
-                .as_slice(),
-            ),
-            http_response(
-                "200 OK",
-                "application/json",
-                "",
-                serde_json::to_vec(&serde_json::json!({
-                    "id_token": id_token,
-                    "access_token": access_token,
-                    "refresh_token": "refresh-test",
-                }))
-                .unwrap()
-                .as_slice(),
-            ),
-        ];
-        let (issuer, server) = spawn_sequence_server(responses);
+        let token_body = serde_json::to_vec(&serde_json::json!({
+            "id_token": id_token,
+            "access_token": access_token,
+            "refresh_token": "refresh-test"
+        }))
+        .unwrap();
+        let (issuer, token_request, token_server) = spawn_token_server(token_body);
+        let callback = Arc::new(Mutex::new(None));
+        let callback_out = callback.clone();
+        let launcher = TestBrowserLauncher(move |authorization_url: &str| {
+            let parsed = url::Url::parse(authorization_url).unwrap();
+            let fields = parsed.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            let redirect_uri = fields.get("redirect_uri").unwrap().clone();
+            let state = fields.get("state").unwrap().clone();
+            assert_eq!(
+                fields.get("code_challenge_method").map(String::as_str),
+                Some("S256")
+            );
+            assert!(fields
+                .get("code_challenge")
+                .is_some_and(|challenge| challenge.len() >= 43));
+            let handle = thread::spawn(move || {
+                let bad_host = send_callback(
+                    &redirect_uri,
+                    &format!("code=authorization-code&state={state}"),
+                    Some("attacker.invalid"),
+                );
+                assert!(bad_host.starts_with(b"HTTP/1.1 400"));
+                let bad_state = send_callback(
+                    &redirect_uri,
+                    "code=authorization-code&state=wrong-state",
+                    None,
+                );
+                assert!(bad_state.starts_with(b"HTTP/1.1 400"));
+                let success = send_callback(
+                    &redirect_uri,
+                    &format!("code=authorization-code&state={state}"),
+                    None,
+                );
+                assert!(success.starts_with(b"HTTP/1.1 200"));
+            });
+            *callback_out.lock().unwrap() = Some(handle);
+            Ok(())
+        });
         let root = TempRoot::new();
         let repository = repository(&root);
         let progress = Arc::new(Mutex::new(Vec::new()));
         let progress_out = progress.clone();
-        let status = run_device_login(
+        let status = run_browser_login_with_launcher(
             &repository,
             &direct_client(),
             false,
-            &options(issuer),
+            &test_options(issuer, Duration::from_secs(2)),
             &LoginControl::default(),
             &move |event| progress_out.lock().unwrap().push(event),
+            &launcher,
         )
         .await
         .unwrap();
+
+        callback.lock().unwrap().take().unwrap().join().unwrap();
+        token_server.join().unwrap();
         assert!(status.authenticated);
         assert_eq!(status.auth_generation, 1);
-        assert!(matches!(
-            progress.lock().unwrap().first(),
-            Some(LoginProgress::VerificationRequired { .. })
-        ));
-        assert!(matches!(
-            progress.lock().unwrap().last(),
-            Some(LoginProgress::Committing)
-        ));
-        server.join().unwrap();
+        assert_eq!(
+            *progress.lock().unwrap(),
+            [
+                LoginProgress::Waiting,
+                LoginProgress::Exchanging,
+                LoginProgress::Committing,
+            ]
+        );
+        let request = String::from_utf8_lossy(&token_request.lock().unwrap()).to_string();
+        assert!(request.starts_with("POST /oauth/token HTTP/1.1"));
+        assert!(request.contains("code=authorization-code"));
+        assert!(request.contains("code_verifier="));
+        assert!(repository.status().unwrap().authenticated);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn device_initial_404_is_unavailable_but_html_poll_is_not_pending() {
-        let (issuer, server) = spawn_sequence_server(vec![http_response(
-            "404 Not Found",
-            "application/json",
-            "",
-            br#"{}"#,
-        )]);
-        let root = TempRoot::new();
-        let error = run_device_login(
-            &repository(&root),
+    async fn async_browser_denial_and_timeout_never_commit() {
+        let denied_callback = Arc::new(Mutex::new(None));
+        let denied_callback_out = denied_callback.clone();
+        let denied_launcher = TestBrowserLauncher(move |authorization_url: &str| {
+            let parsed = url::Url::parse(authorization_url).unwrap();
+            let fields = parsed.query_pairs().into_owned().collect::<HashMap<_, _>>();
+            let redirect_uri = fields.get("redirect_uri").unwrap().clone();
+            let state = fields.get("state").unwrap().clone();
+            let handle = thread::spawn(move || {
+                let response = send_callback(
+                    &redirect_uri,
+                    &format!("error=access_denied&state={state}"),
+                    None,
+                );
+                assert!(response.starts_with(b"HTTP/1.1 400"));
+            });
+            *denied_callback_out.lock().unwrap() = Some(handle);
+            Ok(())
+        });
+        let denied_root = TempRoot::new();
+        let denied_repository = repository(&denied_root);
+        let denied = run_browser_login_with_launcher(
+            &denied_repository,
             &direct_client(),
             false,
-            &options(issuer),
+            &test_options("https://auth.openai.com".into(), Duration::from_secs(2)),
             &LoginControl::default(),
             &|_| {},
+            &denied_launcher,
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code, OAuthErrorCode::DeviceAuthUnavailable);
-        server.join().unwrap();
+        denied_callback
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(denied.code, OAuthErrorCode::OAuthDenied);
+        assert!(!denied_repository.status().unwrap().authenticated);
+        assert_eq!(denied_repository.status().unwrap().auth_generation, 0);
 
-        let responses = vec![
-            http_response(
-                "200 OK",
-                "application/json",
-                "",
-                br#"{"device_auth_id":"device-1","user_code":"ABCD-1234","interval":"1"}"#,
-            ),
-            http_response(
-                "403 Forbidden",
-                "text/html; charset=UTF-8",
-                "",
-                b"<html>challenge</html>",
-            ),
-        ];
-        let (issuer, server) = spawn_sequence_server(responses);
-        let root = TempRoot::new();
-        let error = run_device_login(
-            &repository(&root),
+        let timeout_root = TempRoot::new();
+        let timeout_repository = repository(&timeout_root);
+        let timeout = run_browser_login_with_launcher(
+            &timeout_repository,
             &direct_client(),
             false,
-            &options(issuer),
+            &test_options("https://auth.openai.com".into(), Duration::from_millis(50)),
             &LoginControl::default(),
             &|_| {},
+            &TestBrowserLauncher(accept_browser_open),
         )
         .await
         .unwrap_err();
-        assert_eq!(error.code, OAuthErrorCode::OAuthUnexpectedContentType);
-        assert_eq!(error.response_kind, Some("html"));
-        server.join().unwrap();
+        assert_eq!(timeout.code, OAuthErrorCode::CallbackTimeout);
+        assert!(!timeout_repository.status().unwrap().authenticated);
+        assert_eq!(timeout_repository.status().unwrap().auth_generation, 0);
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn cloudflare_header_wins_over_html_and_status() {
-        let (issuer, server) = spawn_sequence_server(vec![http_response(
-            "403 Forbidden",
-            "text/html",
-            "cf-mitigated: challenge\r\n",
-            b"<html>challenge</html>",
-        )]);
-        let root = TempRoot::new();
-        let error = run_device_login(
-            &repository(&root),
-            &direct_client(),
-            false,
-            &options(issuer),
-            &LoginControl::default(),
-            &|_| {},
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, OAuthErrorCode::OAuthChallengeResponse);
-        assert_eq!(error.challenge_detected, Some(true));
-        server.join().unwrap();
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn hung_header_slow_body_and_poll_sleep_are_cancellable() {
+    async fn hung_header_and_slow_body_are_cancellable() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
@@ -1615,7 +1377,7 @@ mod tests {
             direct_client().get(format!("http://{address}/hung")),
             &control,
             false,
-            "device_code_request",
+            "token_exchange",
         )
         .await
         .unwrap_err();
@@ -1663,19 +1425,6 @@ mod tests {
         assert_eq!(error.code, OAuthErrorCode::AuthCancelled);
         assert!(started.elapsed() < Duration::from_secs(2));
         server.join().unwrap();
-
-        let control = LoginControl::default();
-        let cancel = control.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_millis(50));
-            cancel.cancel();
-        });
-        let started = std::time::Instant::now();
-        let error = cancellable_sleep(Duration::from_secs(30), &control, "device_wait")
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, OAuthErrorCode::AuthCancelled);
-        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -1733,10 +1482,10 @@ mod tests {
         });
         let started = std::time::Instant::now();
         let error = send_request(
-            client.get("https://unresolvable.test:443/device"),
+            client.get("https://unresolvable.test:443/oauth/token"),
             &control,
             true,
-            "device_code_request",
+            "token_exchange",
         )
         .await
         .unwrap_err();
@@ -1764,10 +1513,10 @@ mod tests {
             .build()
             .unwrap();
         let error = send_request(
-            client.get("https://unresolvable.test:443/device"),
+            client.get("https://unresolvable.test:443/oauth/token"),
             &LoginControl::default(),
             true,
-            "device_code_request",
+            "token_exchange",
         )
         .await
         .unwrap_err();

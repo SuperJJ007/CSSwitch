@@ -988,6 +988,7 @@ struct CodexRequestPolicy<'a> {
     reasoning_effort: Option<&'a str>,
     supports_reasoning_summary: bool,
     supports_parallel_tool_calls: bool,
+    use_responses_lite: bool,
 }
 
 fn handle_codex_messages_with_policy(
@@ -1020,6 +1021,7 @@ fn handle_codex_messages_with_policy(
         reasoning_effort: policy.reasoning_effort,
         supports_reasoning_summary: policy.supports_reasoning_summary,
         supports_parallel_tool_calls: policy.supports_parallel_tool_calls,
+        use_responses_lite: policy.use_responses_lite,
     };
     let translated = match codex_protocol::translate_anthropic_request(raw, &context, &signer) {
         Ok(translated) => translated,
@@ -1049,19 +1051,20 @@ fn handle_codex_messages_with_policy(
             return;
         }
     };
-    let upstream = match transport.open_responses(&secrets, body, cancellation) {
-        Ok(upstream) => upstream,
-        Err(error) => {
-            if error.cancelled {
+    let upstream =
+        match transport.open_responses(&secrets, body, policy.use_responses_lite, cancellation) {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                if error.cancelled {
+                    return;
+                }
+                if let Some(status @ (401 | 403)) = error.upstream_status {
+                    auth_rejected(status, generation);
+                }
+                api_error_json(stream, error.status, error.detail);
                 return;
             }
-            if let Some(status @ (401 | 403)) = error.upstream_status {
-                auth_rejected(status, generation);
-            }
-            api_error_json(stream, error.status, error.detail);
-            return;
-        }
-    };
+        };
     let mut reducer = codex_protocol::ResponsesReducer::new(
         target_model,
         secrets.auth_epoch(),
@@ -1195,6 +1198,7 @@ fn handle_codex_messages_with_catalog(
             reasoning_effort: target_model.default_reasoning_effort(),
             supports_reasoning_summary: target_model.supports_reasoning_summary(),
             supports_parallel_tool_calls: target_model.supports_parallel_tool_calls(),
+            use_responses_lite: target_model.use_responses_lite(),
         },
         auth_rejected,
     );
@@ -2352,13 +2356,38 @@ mod tests {
                 "supports_reasoning_summary_parameter": true,
                 "supports_parallel_tool_calls": true
             }),
+            json!({
+                "slug": "gpt-lite",
+                "display_name": "Lite",
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": 2,
+                "default_reasoning_level": "high",
+                "supported_reasoning_levels": [{"effort": "high"}],
+                "supports_reasoning_summary_parameter": true,
+                "supports_parallel_tool_calls": true,
+                "use_responses_lite": true
+            }),
         ];
         let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
         let mut models_server = Some(models_server);
 
-        for (index, (alias, effort, summary, parallel)) in [
-            ("claude-csswitch-codex-gpt-sequential", "low", false, false),
-            ("claude-csswitch-codex-gpt-parallel", "high", true, true),
+        for (index, (alias, effort, summary, parallel, lite)) in [
+            (
+                "claude-csswitch-codex-gpt-sequential",
+                "low",
+                false,
+                false,
+                false,
+            ),
+            (
+                "claude-csswitch-codex-gpt-parallel",
+                "high",
+                true,
+                true,
+                false,
+            ),
+            ("claude-csswitch-codex-gpt-lite", "high", true, false, true),
         ]
         .into_iter()
         .enumerate()
@@ -2390,8 +2419,8 @@ mod tests {
             upstream.join().unwrap();
             assert!(response.starts_with(b"HTTP/1.1 200 OK"));
             assert_eq!(posts.load(Ordering::SeqCst), 1);
-            let upstream_body: Value =
-                serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
+            let raw_request = requests.lock().unwrap()[0].clone();
+            let upstream_body: Value = serde_json::from_slice(http_body(&raw_request)).unwrap();
             assert_eq!(
                 upstream_body["model"],
                 alias.trim_start_matches("claude-csswitch-codex-")
@@ -2399,6 +2428,23 @@ mod tests {
             assert_eq!(upstream_body["reasoning"]["effort"], effort);
             assert_eq!(upstream_body["reasoning"].get("summary").is_some(), summary);
             assert_eq!(upstream_body["parallel_tool_calls"], parallel);
+            let request_head = String::from_utf8_lossy(
+                &raw_request[..raw_request
+                    .windows(4)
+                    .position(|part| part == b"\r\n\r\n")
+                    .unwrap()],
+            )
+            .to_ascii_lowercase();
+            assert_eq!(
+                request_head.contains("x-openai-internal-codex-responses-lite: true"),
+                lite
+            );
+            if lite {
+                assert!(upstream_body.get("tools").is_none());
+                assert!(upstream_body.get("instructions").is_none());
+                assert_eq!(upstream_body["input"][0]["type"], "additional_tools");
+                assert_eq!(upstream_body["reasoning"]["context"], "all_turns");
+            }
         }
         let _ = std::fs::remove_dir_all(root);
     }
@@ -2474,7 +2520,28 @@ mod tests {
 
     #[test]
     fn codex_models_response_exposes_science_aliases_and_cache_diagnostics() {
-        let (catalog, models_server, root) = mock_codex_model_catalog(&["gpt-alpha", "gpt-beta"]);
+        let models = [
+            ("gpt-5.6-sol", "GPT-5.6-Sol"),
+            ("gpt-5.6-terra", "GPT-5.6-Terra"),
+            ("gpt-5.6-luna", "GPT-5.6-Luna"),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(priority, (slug, display_name))| {
+            json!({
+                "slug": slug,
+                "display_name": display_name,
+                "visibility": "list",
+                "supported_in_api": true,
+                "priority": priority + 1,
+                "default_reasoning_level": "medium",
+                "supported_reasoning_levels": [{"effort": "medium"}],
+                "supports_reasoning_summaries": true,
+                "supports_parallel_tool_calls": true,
+            })
+        })
+        .collect();
+        let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
         let snapshot = catalog
             .list(&InferenceSecrets::for_test("access", "account"))
             .unwrap();
@@ -2491,14 +2558,18 @@ mod tests {
         assert!(head.contains("x-csswitch-model-source: live"));
         assert!(head.contains("x-csswitch-model-age-seconds: 0"));
         let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
-        assert_eq!(body["data"].as_array().unwrap().len(), 2);
-        assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-alpha");
-        assert_eq!(body["data"][0]["display_name"], "Codex / gpt-alpha");
+        assert_eq!(body["data"].as_array().unwrap().len(), 3);
+        assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-5.6-sol");
+        assert_eq!(body["data"][0]["display_name"], "Codex / GPT-5.6-Sol");
+        assert_eq!(body["data"][1]["id"], "claude-csswitch-codex-gpt-5.6-terra");
+        assert_eq!(body["data"][1]["display_name"], "Codex / GPT-5.6-Terra");
+        assert_eq!(body["data"][2]["id"], "claude-csswitch-codex-gpt-5.6-luna");
+        assert_eq!(body["data"][2]["display_name"], "Codex / GPT-5.6-Luna");
         assert_eq!(body["diagnostics"]["source"], "live");
         assert_eq!(body["diagnostics"]["stale"], false);
         assert!(!serde_json::to_string(&body)
             .unwrap()
-            .contains("\"id\":\"gpt-alpha\""));
+            .contains("\"id\":\"gpt-5.6-sol\""));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2546,7 +2617,7 @@ mod tests {
             let upstream_body: Value =
                 serde_json::from_slice(http_body(&requests.lock().unwrap()[0])).unwrap();
             assert_eq!(upstream_body["model"], "gpt-known");
-            assert!(!root.join("codex-models-cache.v2.json").exists());
+            assert!(!root.join("codex-models-cache.v3.json").exists());
             let _ = std::fs::remove_dir_all(root);
         }
     }

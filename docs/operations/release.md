@@ -27,7 +27,10 @@ git diff --check
 cd desktop
 npm ci
 npm run tauri build
+cd ..
 ```
+
+Codex OAuth 与 Gateway 不要求 Apple Developer 身份、Developer ID、Team ID 或正式签名。需要公开分发时，维护者可以在独立发布流水线中选择 Developer ID / notarization；不得把该可选分发步骤写成源码构建或 Codex 登录前置。
 
 从目标 commit 构建后核对：
 
@@ -57,15 +60,7 @@ npm run tauri build
 
 分别执行并记录：
 
-```bash
-shasum -a 256 CSSwitch_<version>_aarch64.dmg
-codesign --verify --deep --strict --verbose=4 CSSwitch.app
-codesign -dvvv CSSwitch.app
-spctl --assess --type open --context context:primary-signature --verbose=4 CSSwitch_<version>_aarch64.dmg
-xcrun stapler validate CSSwitch_<version>_aarch64.dmg
-```
-
-`codesign --verify` 通过只说明 seal / 签名结构有效。必须另记签名身份、TeamIdentifier、是否 Developer ID、notarization、stapled ticket 和 Gatekeeper 结果。
+至少记录最终附件 SHA-256、包内 Desktop/Gateway hash、版本和安装/runtime 结果。如果维护者选择公开 macOS 分发签名，再单独记录 Developer ID、notarization、stapled ticket 与 Gatekeeper 结果；本项目不提供或强制一个固定 Team ID，也不把这些分发证据当作 Codex 功能本身的前置。
 
 ## 6. 发布与回读
 

@@ -1,4 +1,5 @@
-//! 本地配置读写：`~/.csswitch/config.json`。多 profile 形态（schema v3）。
+//! 本地配置读写：正式构建使用 `~/.csswitch/config.json`，Acceptance 构建使用
+//! `~/.csswitch-acceptance/config.json`。多 profile 形态（schema v3）。
 //!
 //! 安全要求（对齐 spec §3 / §5.1，参考 CC Switch 的明文本地存储但加严文件安全）：
 //!   - 目录 0700，文件 0600。
@@ -11,7 +12,7 @@
 //! 清 key / 删 profile 后净化滚动备份（旧明文 key 不可从 .bak 恢复）。
 //!
 //! 所有函数以显式 `dir` 参数工作，便于用临时目录做无副作用的单元测试；
-//! 生产代码用 [`default_dir`]（`$HOME/.csswitch`）。
+//! 生产代码用 [`default_dir`]；目录名由编译期构建变体固定，不能由运行时输入改写。
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -133,7 +134,7 @@ pub struct Config {
     /// 默认关闭；不复制或链接 `.ssh`，只在启动时注入受控 PATH wrapper。
     #[serde(default)]
     pub reuse_system_ssh: bool,
-    /// 非官方 Codex → Science 桥接实验开关。默认关闭；关闭不删除 profile 或 Keychain。
+    /// 非官方 Codex → Science 桥接实验开关。默认关闭；关闭不删除 profile 或本地 OAuth。
     #[serde(default)]
     pub experimental_codex_enabled: bool,
     /// Codex 专用网络路由。v3 已发布前追加为 serde(default)，旧 v3 文件自动采用 auto。
@@ -362,12 +363,22 @@ pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config
     })
 }
 
-/// 生产环境配置目录：`$HOME/.csswitch`。
+#[cfg(not(feature = "acceptance-build"))]
+pub(crate) const CONFIG_DIR_NAME: &str = ".csswitch";
+#[cfg(feature = "acceptance-build")]
+pub(crate) const CONFIG_DIR_NAME: &str = ".csswitch-acceptance";
+
+fn default_dir_from_home(home: &Path) -> PathBuf {
+    home.join(CONFIG_DIR_NAME)
+}
+
+/// 构建变体固定的配置目录。正式构建为 `$HOME/.csswitch`，Acceptance 为
+/// `$HOME/.csswitch-acceptance`；两者不会因 Finder 使用同一个 HOME 而互相迁移配置。
 pub fn default_dir() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".csswitch")
+    default_dir_from_home(&home)
 }
 
 fn config_path(dir: &Path) -> PathBuf {
@@ -911,7 +922,7 @@ fn validate_profile_contracts(cfg: &Config) -> io::Result<()> {
                     format!("API-key profile `{}` 不得保存 credential_ref", profile.id),
                 ));
             }
-            CredentialSource::KeychainOauth => {
+            CredentialSource::CsswitchOauth => {
                 if profile.credential_ref.as_deref() != Some("csswitch:codex:default")
                     || !profile.api_key.is_empty()
                 {
@@ -1173,7 +1184,7 @@ pub(crate) fn prepare_downgrade_to_v2(
     let codex_ids: BTreeSet<String> = cfg
         .profiles
         .iter()
-        .filter(|profile| profile.credential_source == CredentialSource::KeychainOauth)
+        .filter(|profile| profile.credential_source == CredentialSource::CsswitchOauth)
         .map(|profile| profile.id.clone())
         .collect();
     let action_ids: BTreeSet<String> = actions.keys().cloned().collect();
@@ -1185,7 +1196,7 @@ pub(crate) fn prepare_downgrade_to_v2(
     let mut profiles = Vec::new();
     let mut exports = Vec::new();
     for profile in &cfg.profiles {
-        if profile.credential_source == CredentialSource::KeychainOauth {
+        if profile.credential_source == CredentialSource::CsswitchOauth {
             if actions.get(&profile.id) == Some(&CodexDowngradeAction::ExportThenRemove) {
                 exports.push(serde_json::json!({
                     "schema_version": 1,
@@ -1247,7 +1258,7 @@ pub(crate) fn prepare_downgrade_to_v2(
 }
 
 /// 把当前 v3 原子降为 v2。调用方必须先停止受管 Codex 链路；本函数从不读取、
-/// 删除或修改 Keychain。若 action 要求 export，先把 bundle 原子持久化到调用方明确
+/// 删除或修改 CSSwitch 私有认证文件。若 action 要求 export，先把 bundle 原子持久化到调用方明确
 /// 给出的目标，再提交 v2。两次提交之间崩溃只会留下“原配置 + 已完成 export”，不会
 /// 出现 profile 已移除但 export 尚未落盘的数据丢失窗口。
 #[allow(dead_code)]
@@ -1347,6 +1358,22 @@ pub fn update<F: FnOnce(&mut Config)>(dir: &Path, f: F) -> io::Result<Config> {
     Ok(cfg)
 }
 
+/// Serialized fallible read-modify-write. If the caller rejects the in-memory
+/// mutation, no config or rolling backup is written.
+pub fn update_result<T, F>(dir: &Path, f: F) -> Result<T, String>
+where
+    F: FnOnce(&mut Config) -> Result<(T, bool), String>,
+{
+    let access = config_access();
+    ensure_config_access_open(&access).map_err(|error| error.to_string())?;
+    let mut cfg = load_from_unlocked(dir).map_err(|error| error.to_string())?;
+    let (result, changed) = f(&mut cfg)?;
+    if changed {
+        save_to_unlocked(dir, &cfg).map_err(|error| error.to_string())?;
+    }
+    Ok(result)
+}
+
 /// 掩码：固定 4 个圆点 + 末 4 位（`••••tail`）。空 key 返回空串；≤4 位全遮。
 /// 定长而非随 key 长度增长：长 key 的掩码不会在列表里撑出横向溢出（WKWebView 不给连续
 /// 圆点断行，`word-break` 拦不住），且不泄漏 key 长度。绝不返回完整 key，是回显前端的唯一形式。
@@ -1398,6 +1425,16 @@ mod tests {
         );
         assert!(c.codex_network.proxy_url.is_empty());
         assert_eq!(c.mode, "proxy");
+    }
+
+    #[test]
+    fn default_dir_is_compile_time_isolated_by_build_variant() {
+        let home = Path::new("/tmp/csswitch-home-contract");
+        let got = default_dir_from_home(home);
+        #[cfg(feature = "acceptance-build")]
+        assert_eq!(got, home.join(".csswitch-acceptance"));
+        #[cfg(not(feature = "acceptance-build"))]
+        assert_eq!(got, home.join(".csswitch"));
     }
 
     #[test]
@@ -2091,7 +2128,7 @@ mod tests {
             template_id: "codex".into(),
             category: "official".into(),
             api_format: "openai_responses".into(),
-            credential_source: CredentialSource::KeychainOauth,
+            credential_source: CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
             model_policy: ModelPolicy::DynamicCatalog,
             model: "gpt-test".into(),

@@ -9,17 +9,17 @@ use crate::runtime::proxy_lifecycle::start_proxy_for;
 use crate::runtime::transaction::{
     decide_switch, rollback_status_clause, skip_scratch_verify, SwitchOutcome,
 };
-use crate::{config, lifecycle, scratch, SharedAppState};
+use crate::{config, lifecycle, lock, scratch, SharedAppState};
 
 /// Validate a non-active candidate without touching config, AppState, or the active proxy.
 pub(crate) fn scratch_validate_candidate(
     app: &tauri::AppHandle,
     candidate: &config::Profile,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<bool, String> {
     let launch = proxy_args_for(candidate)?;
     let scratch_plan = launch.scratch();
-    let _codex_use =
-        crate::commands::codex::ensure_provider_auth_ready(app, &scratch_plan.provider)?;
+    crate::commands::codex::require_provider_auth_proof(&scratch_plan.provider, auth_proof)?;
     let trace = OperationTrace::start(
         OperationKind::ValidateConnection,
         format!(
@@ -45,6 +45,7 @@ pub(crate) fn scratch_validate_candidate(
         },
         probe_kind_for(&scratch_plan.provider, &scratch_plan.model),
         Some(&trace),
+        auth_proof.map(|proof| proof.exit_cancel_flag()),
     );
     let outcome = scratch::classify(res.status);
     trace.finish(format!("outcome={outcome:?}"));
@@ -61,6 +62,7 @@ pub(crate) fn set_active_profile_txn(
     id: &str,
     skip_verify: bool,
     conn_edit: Option<&ConnectionEdit>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<Value, String> {
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -81,7 +83,7 @@ pub(crate) fn set_active_profile_txn(
     assert_format_supported(&candidate)?;
     let launch = proxy_args_for(&candidate)?;
     let formal_plan = launch.formal();
-    let _codex_use = crate::commands::codex::ensure_provider_auth_ready(app, &formal_plan.adapter)?;
+    crate::commands::codex::require_provider_auth_proof(&formal_plan.adapter, auth_proof)?;
     reject_openai_custom_anthropic_base(&formal_plan.adapter, &candidate.base_url)?;
     if !formal_plan.credential_configured() {
         return Err(format!(
@@ -135,6 +137,7 @@ pub(crate) fn set_active_profile_txn(
             },
             probe_kind_for(&scratch_plan.provider, &scratch_plan.model),
             Some(&trace),
+            auth_proof.map(|proof| proof.exit_cancel_flag()),
         );
         let outcome = scratch::classify(res.status);
         trace.stage(
@@ -172,7 +175,16 @@ pub(crate) fn set_active_profile_txn(
 
     lifecycle.bump_generation();
     let real_healthy = scratch_ok
-        && start_proxy_for(app, state, lifecycle, &candidate, None, Some(&trace)).is_ok();
+        && start_proxy_for(
+            app,
+            state,
+            lifecycle,
+            &candidate,
+            None,
+            Some(&trace),
+            auth_proof,
+        )
+        .is_ok();
 
     match decide_switch(scratch_ok, real_healthy) {
         SwitchOutcome::Commit => {
@@ -195,6 +207,7 @@ pub(crate) fn set_active_profile_txn(
                     &cfg,
                     &old_active,
                     Some(&trace),
+                    auth_proof,
                 );
                 trace.finish(format!("error=config_write_failed restored={restored}"));
                 return Err(format!(
@@ -213,8 +226,15 @@ pub(crate) fn set_active_profile_txn(
         }
         SwitchOutcome::RollbackToOld => {
             trace.stage(OperationStage::Rollback, "reason=proxy_unhealthy");
-            let restored =
-                restore_proxy_for_active(app, state, lifecycle, &cfg, &old_active, Some(&trace));
+            let restored = restore_proxy_for_active(
+                app,
+                state,
+                lifecycle,
+                &cfg,
+                &old_active,
+                Some(&trace),
+                auth_proof,
+            );
             let clause = rollback_status_clause(restored);
             trace.finish(format!("rollback restored={restored}"));
             if is_edit {
@@ -238,13 +258,14 @@ pub(crate) fn set_active_profile_txn(
     }
 }
 
-fn restore_proxy_for_active(
-    app: &tauri::AppHandle,
+fn restore_proxy_for_active<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
     state: &SharedAppState,
     lifecycle: &lifecycle::Lifecycle,
     cfg: &config::Config,
     old_active: &str,
     trace: Option<&OperationTrace>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> bool {
     if old_active.is_empty() {
         return true;
@@ -252,8 +273,69 @@ fn restore_proxy_for_active(
     match cfg.profile_by_id(old_active) {
         Some(old) => {
             lifecycle.bump_generation();
-            start_proxy_for(app, state, lifecycle, old, None, trace).is_ok()
+            let old_adapter = proxy_args_for(old)
+                .ok()
+                .map(|launch| launch.formal().adapter);
+            if old_adapter.as_deref() == Some("codex") && auth_proof.is_none() {
+                // A switch to a non-Codex target intentionally performs no
+                // interactive Codex preflight. If rollback would require
+                // restarting the old Codex Gateway, fail closed without a
+                // auth-file read and stop the candidate runtime so
+                // config/runtime cannot silently disagree.
+                lock(state).stop_proxy();
+                return false;
+            }
+            start_proxy_for(app, state, lifecycle, old, None, trace, auth_proof).is_ok()
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn rollback_to_codex_without_a_current_proof_stops_candidate_fail_closed() {
+        let old = config::Profile {
+            id: "old-codex".into(),
+            name: "Old Codex".into(),
+            template_id: "codex".into(),
+            api_format: "openai_responses".into(),
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
+            credential_ref: Some("csswitch:codex:default".into()),
+            model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
+            ..Default::default()
+        };
+        let cfg = config::Config {
+            profiles: vec![old],
+            active_id: "old-codex".into(),
+            experimental_codex_enabled: true,
+            ..Default::default()
+        };
+        let mut running = crate::AppState::default();
+        running.provider = "relay".into();
+        running.secret = "candidate-secret".into();
+        running.gateway_kind = "rust".into();
+        let state = Arc::new(Mutex::new(running));
+        let app = tauri::test::mock_builder()
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let lifecycle = crate::lifecycle::Lifecycle::new();
+
+        assert!(!restore_proxy_for_active(
+            app.handle(),
+            &state,
+            &lifecycle,
+            &cfg,
+            "old-codex",
+            None,
+            None,
+        ));
+        let stopped = lock(&state);
+        assert!(stopped.provider.is_empty());
+        assert!(stopped.secret.is_empty());
+        assert!(stopped.gateway_kind.is_empty());
     }
 }

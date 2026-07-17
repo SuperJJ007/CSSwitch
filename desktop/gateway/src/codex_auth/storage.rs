@@ -15,28 +15,24 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use zeroize::{Zeroize, Zeroizing};
 
-#[cfg(not(feature = "acceptance-keychain"))]
-pub const OAUTH_KEYCHAIN_SERVICE: &str = "com.csswitch.codex.oauth.v1";
-#[cfg(feature = "acceptance-keychain")]
-pub const OAUTH_KEYCHAIN_SERVICE: &str = "com.csswitch.acceptance.codex.oauth.v1";
-#[cfg(not(feature = "acceptance-keychain"))]
-pub const THINKING_KEYCHAIN_SERVICE: &str = "com.csswitch.codex.thinking.v1";
-#[cfg(feature = "acceptance-keychain")]
-pub const THINKING_KEYCHAIN_SERVICE: &str = "com.csswitch.acceptance.codex.thinking.v1";
-pub const KEYCHAIN_ACCOUNT: &str = "default";
+pub const OAUTH_SECRET_SLOT: &str = "codex-oauth.v1";
+pub const THINKING_SECRET_SLOT: &str = "codex-thinking.v1";
+pub const SECRET_ACCOUNT: &str = "default";
 
 const AUTH_STATE_FILE: &str = "codex-auth-state.v1.json";
 const AUTH_LOCK_FILE: &str = "codex-auth.mutation.lock";
+const OAUTH_SECRET_FILE: &str = "codex-oauth.v1.json";
+const THINKING_SECRET_FILE: &str = "codex-thinking.v1.json";
 const AUTH_RECORD_VERSION: u32 = 1;
 const AUTH_STATE_VERSION: u32 = 1;
 const MAX_STATE_BYTES: u64 = 64 * 1024;
+const MAX_SECRET_BYTES: u64 = 256 * 1024;
 const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCK_RETRY: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StorageError {
     Busy,
-    KeychainUnavailable(String),
     NotAuthenticated,
     Unavailable(String),
     InvalidState(String),
@@ -49,9 +45,6 @@ impl fmt::Display for StorageError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Busy => write!(f, "Codex auth mutation is already in progress"),
-            Self::KeychainUnavailable(detail) => {
-                write!(f, "Codex Keychain unavailable: {detail}")
-            }
             Self::NotAuthenticated => write!(f, "Codex authentication is not available"),
             Self::Unavailable(detail) => write!(f, "Codex auth storage unavailable: {detail}"),
             Self::InvalidState(detail) => write!(f, "Codex auth state invalid: {detail}"),
@@ -59,9 +52,7 @@ impl fmt::Display for StorageError {
             Self::RollbackFailed => {
                 write!(f, "Codex auth rollback failed; credentials are disabled")
             }
-            Self::UnsupportedPlatform => {
-                write!(f, "Codex Keychain auth is supported only on macOS")
-            }
+            Self::UnsupportedPlatform => write!(f, "Codex auth storage is unsupported here"),
         }
     }
 }
@@ -74,63 +65,113 @@ pub trait SecretStore: Send + Sync + 'static {
     fn delete(&self, service: &str, account: &str) -> Result<(), StorageError>;
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct KeychainSecretStore;
+#[derive(Clone, Debug)]
+pub struct FileSecretStore {
+    root: PathBuf,
+}
 
-#[cfg(target_os = "macos")]
-impl SecretStore for KeychainSecretStore {
-    fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        use security_framework::passwords::get_generic_password;
-        use security_framework_sys::base::errSecItemNotFound;
-
-        match get_generic_password(service, account) {
-            Ok(value) => Ok(Some(value)),
-            Err(error) if error.code() == errSecItemNotFound => Ok(None),
-            Err(error) => Err(StorageError::KeychainUnavailable(format!(
-                "Keychain read failed with status {}",
-                error.code()
-            ))),
-        }
+impl FileSecretStore {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
-    fn save(&self, service: &str, account: &str, value: &[u8]) -> Result<(), StorageError> {
-        security_framework::passwords::set_generic_password(service, account, value).map_err(
-            |error| {
-                StorageError::KeychainUnavailable(format!(
-                    "Keychain write failed with status {}",
-                    error.code()
+    fn slot_path(&self, service: &str, account: &str) -> Result<PathBuf, StorageError> {
+        if account != SECRET_ACCOUNT {
+            return Err(StorageError::InvalidState(
+                "unsupported Codex secret account".into(),
+            ));
+        }
+        let file_name = match service {
+            OAUTH_SECRET_SLOT => OAUTH_SECRET_FILE,
+            THINKING_SECRET_SLOT => THINKING_SECRET_FILE,
+            _ => {
+                return Err(StorageError::InvalidState(
+                    "unsupported Codex secret slot".into(),
                 ))
-            },
-        )
-    }
-
-    fn delete(&self, service: &str, account: &str) -> Result<(), StorageError> {
-        use security_framework::passwords::delete_generic_password;
-        use security_framework_sys::base::errSecItemNotFound;
-
-        match delete_generic_password(service, account) {
-            Ok(()) => Ok(()),
-            Err(error) if error.code() == errSecItemNotFound => Ok(()),
-            Err(error) => Err(StorageError::KeychainUnavailable(format!(
-                "Keychain delete failed with status {}",
-                error.code()
-            ))),
-        }
+            }
+        };
+        Ok(self.root.join(file_name))
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-impl SecretStore for KeychainSecretStore {
-    fn load(&self, _service: &str, _account: &str) -> Result<Option<Vec<u8>>, StorageError> {
-        Err(StorageError::UnsupportedPlatform)
+impl SecretStore for FileSecretStore {
+    fn load(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, StorageError> {
+        let path = self.slot_path(service, account)?;
+        if !validate_private_root(&self.root)? {
+            return Ok(None);
+        }
+        match fs::symlink_metadata(&path) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() || !metadata.file_type().is_file() =>
+            {
+                return Err(StorageError::InvalidState(
+                    "Codex secret is not a regular file".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error("inspect Codex secret", error)),
+        }
+        let file = match open_read_nofollow(&path) {
+            Ok(file) => file,
+            #[cfg(unix)]
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                return Err(StorageError::InvalidState(
+                    "Codex secret is not a regular file".into(),
+                ));
+            }
+            Err(error) => return Err(io_error("open Codex secret", error)),
+        };
+        let metadata = file
+            .metadata()
+            .map_err(|error| io_error("inspect opened Codex secret", error))?;
+        if !metadata.is_file() || metadata.len() > MAX_SECRET_BYTES {
+            return Err(StorageError::InvalidState(
+                "Codex secret is invalid or too large".into(),
+            ));
+        }
+        #[cfg(unix)]
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(StorageError::InvalidState(
+                "Codex secret permissions are not 0600".into(),
+            ));
+        }
+        let mut bytes = Vec::with_capacity(metadata.len() as usize);
+        file.take(MAX_SECRET_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|error| io_error("read Codex secret", error))?;
+        if bytes.len() as u64 > MAX_SECRET_BYTES {
+            return Err(StorageError::InvalidState(
+                "Codex secret is too large".into(),
+            ));
+        }
+        Ok(Some(bytes))
     }
 
-    fn save(&self, _service: &str, _account: &str, _value: &[u8]) -> Result<(), StorageError> {
-        Err(StorageError::UnsupportedPlatform)
+    fn save(&self, service: &str, account: &str, value: &[u8]) -> Result<(), StorageError> {
+        if value.len() as u64 > MAX_SECRET_BYTES {
+            return Err(StorageError::InvalidState(
+                "Codex secret is too large".into(),
+            ));
+        }
+        let path = self.slot_path(service, account)?;
+        ensure_private_dir(&self.root)?;
+        write_private_atomic(&self.root, &path, value, "Codex secret")
     }
 
-    fn delete(&self, _service: &str, _account: &str) -> Result<(), StorageError> {
-        Err(StorageError::UnsupportedPlatform)
+    fn delete(&self, service: &str, account: &str) -> Result<(), StorageError> {
+        let path = self.slot_path(service, account)?;
+        if !validate_private_root(&self.root)? {
+            return Ok(());
+        }
+        reject_unsafe_target(&path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => File::open(&self.root)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| io_error("sync Codex secret directory", error)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(io_error("delete Codex secret", error)),
+        }
     }
 }
 
@@ -504,9 +545,34 @@ impl fmt::Debug for RevokeToken {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthStatusReason {
+    Ready,
+    StateMissing,
+    StateUncommitted,
+    OauthMissing,
+    ThinkingMissing,
+    RecordMismatch,
+}
+
+impl AuthStatusReason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::StateMissing => "state_missing",
+            Self::StateUncommitted => "state_uncommitted",
+            Self::OauthMissing => "oauth_missing",
+            Self::ThinkingMissing => "thinking_missing",
+            Self::RecordMismatch => "record_mismatch",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct AuthStatus {
     pub authenticated: bool,
+    pub reason: AuthStatusReason,
     pub account_hash: Option<String>,
     pub expires_at: Option<i64>,
     pub auth_epoch: Option<String>,
@@ -607,9 +673,13 @@ impl<S: SecretStore, T: StateStore> Clone for AuthRepository<S, T> {
     }
 }
 
-impl AuthRepository<KeychainSecretStore, FsStateStore> {
+impl AuthRepository<FileSecretStore, FsStateStore> {
     pub fn production(root: PathBuf) -> Self {
-        Self::new(KeychainSecretStore, FsStateStore::new(root.clone()), root)
+        Self::new(
+            FileSecretStore::new(root.clone()),
+            FsStateStore::new(root.clone()),
+            root,
+        )
     }
 }
 
@@ -656,11 +726,11 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
 
         let old_oauth = self
             .secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
+            .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)?
             .map(Zeroizing::new);
         let old_thinking = self
             .secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
+            .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)?
             .map(Zeroizing::new);
 
         let oauth = OAuthRecord {
@@ -693,9 +763,9 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
                 .map_err(|_| StorageError::InvalidState("thinking serialization failed".into()))?,
         );
 
-        if let Err(error) =
-            self.secrets
-                .save(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &oauth_bytes)
+        if let Err(error) = self
+            .secrets
+            .save(OAUTH_SECRET_SLOT, SECRET_ACCOUNT, &oauth_bytes)
         {
             return self.rollback_or(
                 error,
@@ -703,9 +773,9 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
                 old_thinking.as_ref().map(|value| value.as_slice()),
             );
         }
-        if let Err(error) =
-            self.secrets
-                .save(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &thinking_bytes)
+        if let Err(error) = self
+            .secrets
+            .save(THINKING_SECRET_SLOT, SECRET_ACCOUNT, &thinking_bytes)
         {
             return self.rollback_or(
                 error,
@@ -722,6 +792,7 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         }
         Ok(AuthStatus {
             authenticated: true,
+            reason: AuthStatusReason::Ready,
             account_hash: Some(account_hash(&oauth.account_id)),
             expires_at: oauth.expires_at,
             auth_epoch: Some(next.auth_epoch),
@@ -734,6 +805,7 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         let Some(state) = state else {
             return Ok(AuthStatus {
                 authenticated: false,
+                reason: AuthStatusReason::StateMissing,
                 account_hash: None,
                 expires_at: None,
                 auth_epoch: None,
@@ -745,34 +817,50 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         if !state.committed {
             return Ok(AuthStatus {
                 authenticated: false,
+                reason: AuthStatusReason::StateUncommitted,
                 account_hash: None,
                 expires_at: None,
                 auth_epoch: epoch,
                 auth_generation: generation,
             });
         }
-        let oauth = self.load_oauth()?;
-        let thinking = self.load_thinking()?;
-        let matched = oauth
-            .as_ref()
-            .zip(thinking.as_ref())
-            .filter(|(oauth, thinking)| {
-                oauth.auth_epoch == state.auth_epoch
-                    && thinking.auth_epoch == state.auth_epoch
-                    && oauth.auth_generation == state.auth_generation
-                    && thinking.auth_generation == state.auth_generation
-            });
-        let Some((oauth, _thinking)) = matched else {
+        let Some(oauth) = self.load_oauth()? else {
             return Ok(AuthStatus {
                 authenticated: false,
+                reason: AuthStatusReason::OauthMissing,
+                account_hash: None,
+                expires_at: None,
+                auth_epoch: epoch.clone(),
+                auth_generation: generation,
+            });
+        };
+        let Some(thinking) = self.load_thinking()? else {
+            return Ok(AuthStatus {
+                authenticated: false,
+                reason: AuthStatusReason::ThinkingMissing,
+                account_hash: None,
+                expires_at: None,
+                auth_epoch: epoch.clone(),
+                auth_generation: generation,
+            });
+        };
+        if oauth.auth_epoch != state.auth_epoch
+            || thinking.auth_epoch != state.auth_epoch
+            || oauth.auth_generation != state.auth_generation
+            || thinking.auth_generation != state.auth_generation
+        {
+            return Ok(AuthStatus {
+                authenticated: false,
+                reason: AuthStatusReason::RecordMismatch,
                 account_hash: None,
                 expires_at: None,
                 auth_epoch: epoch,
                 auth_generation: generation,
             });
-        };
+        }
         Ok(AuthStatus {
             authenticated: true,
+            reason: AuthStatusReason::Ready,
             account_hash: Some(account_hash(&oauth.account_id)),
             expires_at: oauth.expires_at,
             auth_epoch: epoch,
@@ -862,12 +950,12 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
             .ok_or(StorageError::AuthChanged)?;
         let old_oauth = self
             .secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
+            .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)?
             .map(Zeroizing::new)
             .ok_or(StorageError::AuthChanged)?;
         let old_thinking = self
             .secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
+            .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)?
             .map(Zeroizing::new)
             .ok_or(StorageError::AuthChanged)?;
         let oauth = parse_oauth_record(&old_oauth)?;
@@ -934,9 +1022,9 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
                 .map_err(|_| StorageError::InvalidState("thinking serialization failed".into()))?,
         );
 
-        if let Err(error) =
-            self.secrets
-                .save(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &oauth_bytes)
+        if let Err(error) = self
+            .secrets
+            .save(OAUTH_SECRET_SLOT, SECRET_ACCOUNT, &oauth_bytes)
         {
             return self.rollback_or(
                 error,
@@ -944,9 +1032,9 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
                 Some(old_thinking.as_slice()),
             );
         }
-        if let Err(error) =
-            self.secrets
-                .save(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT, &thinking_bytes)
+        if let Err(error) = self
+            .secrets
+            .save(THINKING_SECRET_SLOT, SECRET_ACCOUNT, &thinking_bytes)
         {
             return self.rollback_or(
                 error,
@@ -963,6 +1051,7 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         }
         Ok(AuthStatus {
             authenticated: true,
+            reason: AuthStatusReason::Ready,
             account_hash: Some(account_hash(&refreshed.account_id)),
             expires_at: refreshed.expires_at,
             auth_epoch: Some(next.auth_epoch),
@@ -1013,16 +1102,13 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         let next = current.next_logged_out()?;
         self.state.commit(&next)?;
 
-        let oauth_delete = self
-            .secrets
-            .delete(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
-        let thinking_delete = self
-            .secrets
-            .delete(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT);
+        let oauth_delete = self.secrets.delete(OAUTH_SECRET_SLOT, SECRET_ACCOUNT);
+        let thinking_delete = self.secrets.delete(THINKING_SECRET_SLOT, SECRET_ACCOUNT);
         oauth_delete?;
         thinking_delete?;
         Ok(AuthStatus {
             authenticated: false,
+            reason: AuthStatusReason::StateUncommitted,
             account_hash: None,
             expires_at: None,
             auth_epoch: Some(next.auth_epoch),
@@ -1050,10 +1136,7 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
     }
 
     fn load_oauth(&self) -> Result<Option<OAuthRecord>, StorageError> {
-        let Some(bytes) = self
-            .secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
-        else {
+        let Some(bytes) = self.secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)? else {
             return Ok(None);
         };
         let bytes = Zeroizing::new(bytes);
@@ -1061,10 +1144,7 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
     }
 
     fn load_thinking(&self) -> Result<Option<ThinkingRecord>, StorageError> {
-        let Some(bytes) = self
-            .secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)?
-        else {
+        let Some(bytes) = self.secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)? else {
             return Ok(None);
         };
         let bytes = Zeroizing::new(bytes);
@@ -1073,8 +1153,8 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
 
     fn restore_secret(&self, service: &str, old: Option<&[u8]>) -> Result<(), StorageError> {
         match old {
-            Some(value) => self.secrets.save(service, KEYCHAIN_ACCOUNT, value),
-            None => self.secrets.delete(service, KEYCHAIN_ACCOUNT),
+            Some(value) => self.secrets.save(service, SECRET_ACCOUNT, value),
+            None => self.secrets.delete(service, SECRET_ACCOUNT),
         }
     }
 
@@ -1084,8 +1164,8 @@ impl<S: SecretStore, T: StateStore> AuthRepository<S, T> {
         old_oauth: Option<&[u8]>,
         old_thinking: Option<&[u8]>,
     ) -> Result<AuthStatus, StorageError> {
-        let oauth_restore = self.restore_secret(OAUTH_KEYCHAIN_SERVICE, old_oauth);
-        let thinking_restore = self.restore_secret(THINKING_KEYCHAIN_SERVICE, old_thinking);
+        let oauth_restore = self.restore_secret(OAUTH_SECRET_SLOT, old_oauth);
+        let thinking_restore = self.restore_secret(THINKING_SECRET_SLOT, old_thinking);
         if oauth_restore.is_ok() && thinking_restore.is_ok() {
             Err(original)
         } else {
@@ -1284,6 +1364,57 @@ fn reject_unsafe_target(path: &Path) -> Result<(), StorageError> {
     }
 }
 
+fn write_private_atomic(
+    root: &Path,
+    target: &Path,
+    bytes: &[u8],
+    context: &str,
+) -> Result<(), StorageError> {
+    ensure_private_dir(root)?;
+    reject_unsafe_target(target)?;
+    if target.parent() != Some(root) {
+        return Err(StorageError::InvalidState(
+            "Codex secret target escaped auth root".into(),
+        ));
+    }
+    let file_name = target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| StorageError::InvalidState("Codex secret filename is invalid".into()))?;
+    let mut random = [0_u8; 8];
+    getrandom::getrandom(&mut random)
+        .map_err(|error| StorageError::Unavailable(format!("random failed: {error}")))?;
+    let temp = root.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        hex(&random)
+    ));
+    let result = (|| {
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = options
+            .open(&temp)
+            .map_err(|error| io_error(&format!("create {context} temp file"), error))?;
+        file.write_all(bytes)
+            .map_err(|error| io_error(&format!("write {context}"), error))?;
+        file.sync_all()
+            .map_err(|error| io_error(&format!("sync {context}"), error))?;
+        fs::rename(&temp, target)
+            .map_err(|error| io_error(&format!("replace {context}"), error))?;
+        File::open(root)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| io_error(&format!("sync {context} directory"), error))
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    result
+}
+
 fn open_read_nofollow(path: &Path) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1315,22 +1446,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn keychain_namespace_is_compile_time_fixed_for_the_build_variant() {
-        #[cfg(feature = "acceptance-keychain")]
-        {
-            assert_eq!(
-                OAUTH_KEYCHAIN_SERVICE,
-                "com.csswitch.acceptance.codex.oauth.v1"
-            );
-            assert_eq!(
-                THINKING_KEYCHAIN_SERVICE,
-                "com.csswitch.acceptance.codex.thinking.v1"
-            );
-        }
-        #[cfg(not(feature = "acceptance-keychain"))]
-        {
-            assert_eq!(OAUTH_KEYCHAIN_SERVICE, "com.csswitch.codex.oauth.v1");
-            assert_eq!(THINKING_KEYCHAIN_SERVICE, "com.csswitch.codex.thinking.v1");
+    fn file_secret_slots_are_fixed_and_contain_no_path_syntax() {
+        assert_eq!(OAUTH_SECRET_SLOT, "codex-oauth.v1");
+        assert_eq!(THINKING_SECRET_SLOT, "codex-thinking.v1");
+        for slot in [OAUTH_SECRET_SLOT, THINKING_SECRET_SLOT] {
+            assert!(!slot.contains('/'));
+            assert!(!slot.contains(".."));
         }
     }
     use std::collections::{HashMap, HashSet, VecDeque};
@@ -1407,9 +1528,7 @@ mod tests {
         fn delete(&self, service: &str, account: &str) -> Result<(), StorageError> {
             self.delete_calls.lock().unwrap().push(service.to_string());
             if self.delete_failures.lock().unwrap().contains(service) {
-                return Err(StorageError::KeychainUnavailable(
-                    "injected delete failure".into(),
-                ));
+                return Err(StorageError::Unavailable("injected delete failure".into()));
             }
             self.values
                 .lock()
@@ -1504,17 +1623,76 @@ mod tests {
 
         let status = repo.commit_login(tokens("one")).unwrap();
         assert!(status.authenticated);
+        assert_eq!(status.reason, AuthStatusReason::Ready);
         assert_eq!(status.auth_generation, 1);
         assert_eq!(status.account_hash.as_deref().map(str::len), Some(32));
         assert!(secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)
             .unwrap()
             .is_some());
         assert!(secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
             .unwrap()
             .is_some());
         assert!(state.load().unwrap().unwrap().committed);
+    }
+
+    #[test]
+    fn status_reason_distinguishes_missing_uncommitted_and_incomplete_records() {
+        let root = TempRoot::new();
+        let secrets = MemorySecrets::default();
+        let state = MemoryState::default();
+        let repo = repository(secrets.clone(), state.clone(), &root);
+
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::StateMissing
+        );
+
+        state.commit(&AuthState::fresh().unwrap()).unwrap();
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::StateUncommitted
+        );
+
+        repo.commit_login(tokens("reason")).unwrap();
+        secrets.delete(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::OauthMissing
+        );
+
+        repo.commit_login(tokens("reason-oauth-restored")).unwrap();
+        secrets
+            .delete(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
+            .unwrap();
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::ThinkingMissing
+        );
+
+        repo.commit_login(tokens("reason-both-missing")).unwrap();
+        secrets.delete(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        secrets
+            .delete(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
+            .unwrap();
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::OauthMissing
+        );
+
+        repo.commit_login(tokens("reason-missing-before-mismatch"))
+            .unwrap();
+        let mut mismatched_state = state.load().unwrap().unwrap();
+        mismatched_state.auth_generation += 1;
+        state.commit(&mismatched_state).unwrap();
+        secrets
+            .delete(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
+            .unwrap();
+        assert_eq!(
+            repo.status().unwrap().reason,
+            AuthStatusReason::ThinkingMissing
+        );
     }
 
     #[test]
@@ -1551,28 +1729,20 @@ mod tests {
         let state = MemoryState::default();
         let repo = repository(secrets.clone(), state, &root);
         repo.commit_login(tokens("old")).unwrap();
-        let old_oauth = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
-        let old_thinking = secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
+        let old_oauth = secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        let old_thinking = secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
 
         secrets.script_save(
-            THINKING_KEYCHAIN_SERVICE,
+            THINKING_SECRET_SLOT,
             [SaveBehavior::MutateThenFail, SaveBehavior::Succeed],
         );
         assert!(repo.commit_login(tokens("new")).is_err());
         assert_eq!(
-            secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_oauth
         );
         assert_eq!(
-            secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_thinking
         );
         assert_eq!(repo.status().unwrap().auth_generation, 1);
@@ -1586,25 +1756,17 @@ mod tests {
         let state = MemoryState::default();
         let repo = repository(secrets.clone(), state.clone(), &root);
         repo.commit_login(tokens("old")).unwrap();
-        let old_oauth = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
-        let old_thinking = secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
+        let old_oauth = secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        let old_thinking = secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
 
         state.fail_commit(2);
         assert!(repo.commit_login(tokens("new")).is_err());
         assert_eq!(
-            secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_oauth
         );
         assert_eq!(
-            secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_thinking
         );
         assert_eq!(repo.status().unwrap().auth_generation, 1);
@@ -1621,11 +1783,11 @@ mod tests {
 
         state.fail_commit(2);
         secrets.script_save(
-            OAUTH_KEYCHAIN_SERVICE,
+            OAUTH_SECRET_SLOT,
             [SaveBehavior::Succeed, SaveBehavior::FailBeforeWrite],
         );
         secrets.script_save(
-            THINKING_KEYCHAIN_SERVICE,
+            THINKING_SECRET_SLOT,
             [SaveBehavior::Succeed, SaveBehavior::Succeed],
         );
         let error = repo
@@ -1633,7 +1795,9 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error, StorageError::RollbackFailed);
-        assert!(!repo.status().unwrap().authenticated);
+        let status = repo.status().unwrap();
+        assert!(!status.authenticated);
+        assert_eq!(status.reason, AuthStatusReason::RecordMismatch);
         let rendered = format!("{error:?} {error}");
         assert!(!rendered.contains("new-sentinel-secret"));
     }
@@ -1647,7 +1811,7 @@ mod tests {
         repo.commit_login(tokens("old")).unwrap();
         let old_thinking: ThinkingRecord = serde_json::from_slice(
             &secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
                 .unwrap()
                 .unwrap(),
         )
@@ -1665,14 +1829,14 @@ mod tests {
         assert_eq!(status.auth_generation, 2);
         let oauth: OAuthRecord = serde_json::from_slice(
             &secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)
                 .unwrap()
                 .unwrap(),
         )
         .unwrap();
         let thinking: ThinkingRecord = serde_json::from_slice(
             &secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
                 .unwrap()
                 .unwrap(),
         )
@@ -1707,7 +1871,7 @@ mod tests {
             .unwrap();
         let oauth: OAuthRecord = serde_json::from_slice(
             &secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+                .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)
                 .unwrap()
                 .unwrap(),
         )
@@ -1728,15 +1892,15 @@ mod tests {
         let guard = repo.begin_mutation().unwrap();
         let snapshot = repo.refresh_snapshot_guarded(&guard).unwrap();
         let raw = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT)
             .unwrap()
             .unwrap();
         let mut oauth: OAuthRecord = serde_json::from_slice(&raw).unwrap();
         oauth.refresh_token = "externally-changed".into();
         secrets
             .save(
-                OAUTH_KEYCHAIN_SERVICE,
-                KEYCHAIN_ACCOUNT,
+                OAUTH_SECRET_SLOT,
+                SECRET_ACCOUNT,
                 &serde_json::to_vec(&oauth).unwrap(),
             )
             .unwrap();
@@ -1759,14 +1923,10 @@ mod tests {
         let secrets = MemorySecrets::default();
         let repo = repository(secrets.clone(), MemoryState::default(), &root);
         repo.commit_login(tokens("old")).unwrap();
-        let old_oauth = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
-        let old_thinking = secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
+        let old_oauth = secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        let old_thinking = secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
         secrets.script_save(
-            THINKING_KEYCHAIN_SERVICE,
+            THINKING_SECRET_SLOT,
             [SaveBehavior::MutateThenFail, SaveBehavior::Succeed],
         );
         let guard = repo.begin_mutation().unwrap();
@@ -1780,15 +1940,11 @@ mod tests {
             )
             .is_err());
         assert_eq!(
-            secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_oauth
         );
         assert_eq!(
-            secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_thinking
         );
         assert_eq!(repo.status().unwrap().auth_generation, 1);
@@ -1801,12 +1957,8 @@ mod tests {
         let state = MemoryState::default();
         let repo = repository(secrets.clone(), state.clone(), &root);
         repo.commit_login(tokens("old")).unwrap();
-        let old_oauth = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
-        let old_thinking = secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
+        let old_oauth = secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
+        let old_thinking = secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
         state.fail_commit(2);
         let guard = repo.begin_mutation().unwrap();
         let snapshot = repo.refresh_snapshot_guarded(&guard).unwrap();
@@ -1819,15 +1971,11 @@ mod tests {
             )
             .is_err());
         assert_eq!(
-            secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_oauth
         );
         assert_eq!(
-            secrets
-                .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(THINKING_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_thinking
         );
         assert_eq!(repo.status().unwrap().auth_generation, 1);
@@ -1840,9 +1988,7 @@ mod tests {
         let secrets = MemorySecrets::default();
         let repo = repository(secrets.clone(), MemoryState::default(), &root);
         repo.commit_login(tokens("old")).unwrap();
-        let old_oauth = secrets
-            .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-            .unwrap();
+        let old_oauth = secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap();
         let guard = repo.begin_mutation().unwrap();
         let snapshot = repo.refresh_snapshot_guarded(&guard).unwrap();
         assert_eq!(
@@ -1855,9 +2001,7 @@ mod tests {
             StorageError::AuthChanged
         );
         assert_eq!(
-            secrets
-                .load(OAUTH_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
-                .unwrap(),
+            secrets.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT).unwrap(),
             old_oauth
         );
         assert_eq!(repo.status().unwrap().auth_generation, 1);
@@ -1869,7 +2013,7 @@ mod tests {
         let secrets = MemorySecrets::default();
         let repo = repository(secrets.clone(), MemoryState::default(), &root);
         repo.commit_login(tokens("old")).unwrap();
-        secrets.fail_delete(OAUTH_KEYCHAIN_SERVICE);
+        secrets.fail_delete(OAUTH_SECRET_SLOT);
         let guard = repo.begin_mutation().unwrap();
         assert_eq!(
             repo.revoke_token_guarded(&guard).unwrap().unwrap().kind,
@@ -1880,12 +2024,8 @@ mod tests {
         assert!(!status.authenticated);
         assert_eq!(status.auth_generation, 2);
         let calls = secrets.delete_calls.lock().unwrap().clone();
-        assert!(calls
-            .iter()
-            .any(|service| service == OAUTH_KEYCHAIN_SERVICE));
-        assert!(calls
-            .iter()
-            .any(|service| service == THINKING_KEYCHAIN_SERVICE));
+        assert!(calls.iter().any(|service| service == OAUTH_SECRET_SLOT));
+        assert!(calls.iter().any(|service| service == THINKING_SECRET_SLOT));
     }
 
     #[test]
@@ -1910,15 +2050,15 @@ mod tests {
         let repo = repository(secrets.clone(), state, &root);
         repo.commit_login(tokens("one")).unwrap();
         let raw = secrets
-            .load(THINKING_KEYCHAIN_SERVICE, KEYCHAIN_ACCOUNT)
+            .load(THINKING_SECRET_SLOT, SECRET_ACCOUNT)
             .unwrap()
             .unwrap();
         let mut record: ThinkingRecord = serde_json::from_slice(&raw).unwrap();
         record.auth_generation += 1;
         secrets
             .save(
-                THINKING_KEYCHAIN_SERVICE,
-                KEYCHAIN_ACCOUNT,
+                THINKING_SECRET_SLOT,
+                SECRET_ACCOUNT,
                 &serde_json::to_vec(&record).unwrap(),
             )
             .unwrap();
@@ -1969,6 +2109,62 @@ mod tests {
         std::os::unix::fs::symlink("target", root.0.join(AUTH_STATE_FILE)).unwrap();
         #[cfg(unix)]
         assert!(matches!(store.load(), Err(StorageError::InvalidState(_))));
+    }
+
+    #[test]
+    fn production_repository_uses_private_atomic_files_for_secrets() {
+        let root = TempRoot::new();
+        let repository = AuthRepository::production(root.0.clone());
+        let status = repository.commit_login(tokens("file-store")).unwrap();
+        assert!(status.authenticated);
+
+        let oauth_path = root.0.join(OAUTH_SECRET_FILE);
+        let thinking_path = root.0.join(THINKING_SECRET_FILE);
+        assert!(oauth_path.is_file());
+        assert!(thinking_path.is_file());
+        #[cfg(unix)]
+        for path in [&oauth_path, &thinking_path] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&root.0).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(fs::read_dir(&root.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+        assert_eq!(repository.status().unwrap().reason, AuthStatusReason::Ready);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_secret_store_rejects_symlink_and_broad_permissions() {
+        let root = TempRoot::new();
+        fs::create_dir_all(&root.0).unwrap();
+        fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+        let oauth_path = root.0.join(OAUTH_SECRET_FILE);
+        std::os::unix::fs::symlink("target", &oauth_path).unwrap();
+        let store = FileSecretStore::new(root.0.clone());
+        assert!(matches!(
+            store.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT),
+            Err(StorageError::InvalidState(_))
+        ));
+
+        fs::remove_file(&oauth_path).unwrap();
+        fs::write(&oauth_path, b"{}").unwrap();
+        fs::set_permissions(&oauth_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.load(OAUTH_SECRET_SLOT, SECRET_ACCOUNT),
+            Err(StorageError::InvalidState(_))
+        ));
     }
 
     #[cfg(unix)]

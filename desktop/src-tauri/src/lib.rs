@@ -8,7 +8,7 @@
 //! 运行行为由 typed provider-contract catalog 与生效 profile 合并成受限 launch plan，
 //! 再投影给 formal gateway、scratch 和前端；展示模板不再决定 adapter/鉴权/transport。
 //!
-//! 铁律相关：API key 只在内存与 0600 的 config.json，OAuth token 只在 CSSwitch Keychain；回显前端只给掩码/脱敏状态；沙箱端口/目录护栏
+//! 铁律相关：API key 只在内存与 0600 的 config.json，OAuth token 只在 CSSwitch 私有认证文件；回显前端只给掩码/脱敏状态；沙箱端口/目录护栏
 //! 由被调脚本负责（对 8765 与真实目录失败关闭）；关窗只隐藏，显式退出停代理与沙箱。
 
 mod codex_auth_supervisor;
@@ -49,6 +49,7 @@ fn decide_launch_with_auto_boot(cfg: &config::Config, auto_boot: bool) -> Launch
     match cfg.active_profile() {
         Some(p)
             if config::require_template_enabled(cfg, &p.template_id).is_ok()
+                && p.template_id != "codex"
                 && runtime::provider::resolve_launch_plan(p)
                     .map(|plan| plan.public().credential_configured)
                     .unwrap_or(false) =>
@@ -153,6 +154,18 @@ where
         .map_err(|e| format!("后台任务失败：{e}"))?
 }
 
+pub(crate) async fn run_blocking_typed<T, E>(
+    f: impl FnOnce() -> Result<T, E> + Send + 'static,
+) -> Result<T, E>
+where
+    T: Send + 'static,
+    E: From<String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| E::from(format!("后台任务失败：{e}")))?
+}
+
 fn show_main_window<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     if let Some(win) = app.get_webview_window("main") {
         let _ = win.show();
@@ -199,12 +212,25 @@ fn install_menu(app: &tauri::App) -> tauri::Result<()> {
 
 fn cleanup_for_exit<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
     let supervisor = app.state::<SharedCodexAuthSupervisor>().inner().clone();
-    if let Some(pid) = supervisor.cancel_for_exit() {
+    // First give login its protocol-level cancel path and read-only preflight
+    // its cancellation token. Do not signal a possibly committing login child
+    // until the bounded waiter has had a chance to reap it normally.
+    let _ = supervisor.cancel_for_exit();
+    let remaining = supervisor.wait_for_auth_children_exit(std::time::Duration::from_secs(2));
+    for pid in remaining {
         #[cfg(unix)]
         unsafe {
             libc::kill(pid as i32, libc::SIGTERM);
         }
     }
+    let remaining = supervisor.wait_for_auth_children_exit(std::time::Duration::from_millis(500));
+    for pid in remaining {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
+    let _ = supervisor.wait_for_auth_children_exit(std::time::Duration::from_millis(500));
     let state = app.state::<SharedAppState>().inner().clone();
     let lifecycle = app.state::<SharedLifecycle>().inner().clone();
     lifecycle.with_serialized(|| {
@@ -282,7 +308,7 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
                         st.boot = BootState::Ready;
                         st.boot_error = None;
                     }
-                    Err(e) => mark_boot_failed(&app, e),
+                    Err(e) => mark_boot_failed(&app, e.to_string()),
                 }
             }
         }
@@ -308,6 +334,7 @@ pub fn run() {
             commands::codex::codex_auth_start,
             commands::codex::codex_auth_cancel,
             commands::codex::codex_auth_operation_status,
+            commands::codex::codex_ensure_profile,
             commands::codex::codex_auth_logout,
             commands::codex::codex_downgrade_preview,
             commands::codex::codex_downgrade_export_all,
@@ -445,7 +472,7 @@ mod tests {
             template_id: "codex".into(),
             category: "experimental".into(),
             api_format: "openai_responses".into(),
-            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
             model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
             ..Default::default()
@@ -531,7 +558,7 @@ mod tests {
         };
         assert_eq!(
             decide_launch_with_auto_boot(&codex_enabled, true),
-            LaunchPath::BootScience
+            LaunchPath::ShowPanel
         );
     }
 

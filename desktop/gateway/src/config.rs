@@ -10,7 +10,7 @@ pub struct GatewayConfig {
     pub relay_thinking: Option<String>,
     pub shim_mode: String,
     /// CSSwitch-owned auth state root. Present only for Codex; OAuth secrets
-    /// themselves remain in CSSwitch Keychain records.
+    /// themselves remain in CSSwitch private auth files.
     pub codex_state_root: Option<std::path::PathBuf>,
     pub(crate) codex_contract: Option<crate::provider_contracts::CodexRuntimeContract>,
     /// Opaque per-spawn identity supplied by the Tauri process manager.
@@ -253,7 +253,7 @@ impl GatewayConfig {
                     .map(std::path::PathBuf::from)
                     .filter(|path| path.is_absolute())
                     .ok_or("codex provider 需要绝对 HOME")?
-                    .join(".csswitch"),
+                    .join(crate::codex_auth::CODEX_STATE_DIR_NAME),
             )
         } else {
             None

@@ -146,8 +146,8 @@ impl ResolvedLaunchPlan {
                 !value.is_empty(),
             ),
             CredentialHandle::CodexDefault => (
-                AuthMode::KeychainOauth,
-                CredentialSource::KeychainOauth,
+                AuthMode::CsswitchOauth,
+                CredentialSource::CsswitchOauth,
                 true,
             ),
             CredentialHandle::None => (AuthMode::None, CredentialSource::None, true),
@@ -240,7 +240,7 @@ pub(crate) fn resolve_launch_plan(p: &config::Profile) -> Result<ResolvedLaunchP
                 value: p.api_key.clone(),
             }
         }
-        CredentialSource::KeychainOauth => {
+        CredentialSource::CsswitchOauth => {
             if p.credential_ref.as_deref() != Some("csswitch:codex:default")
                 || !p.api_key.is_empty()
             {
@@ -276,7 +276,7 @@ pub(crate) fn resolve_launch_plan(p: &config::Profile) -> Result<ResolvedLaunchP
 }
 
 /// UI 模板预览也走与正式 profile 相同的 resolver。OAuth 模板只构造固定 opaque ref，
-/// 不读 Keychain；PublicPlanView 不会序列化这个 ref。
+/// 不读 OAuth 文件；PublicPlanView 不会序列化这个 ref。
 pub(crate) fn resolve_template_plan(
     template_id: &str,
     api_format: &str,
@@ -289,7 +289,7 @@ pub(crate) fn resolve_template_plan(
             .map(|template| template.base_url.to_string())
             .unwrap_or_default(),
         credential_source: contract.default_credential_source,
-        credential_ref: (contract.default_credential_source == CredentialSource::KeychainOauth)
+        credential_ref: (contract.default_credential_source == CredentialSource::CsswitchOauth)
             .then(|| "csswitch:codex:default".to_string()),
         model_policy: contract.default_model_policy,
         ..Default::default()
@@ -627,7 +627,7 @@ mod tests {
             id: "codex-1".into(),
             template_id: "codex".into(),
             api_format: "openai_responses".into(),
-            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
             model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
             base_url: "https://attacker.invalid/must-never-be-injected".into(),
@@ -655,7 +655,7 @@ mod tests {
         assert!(scratch.should_probe());
 
         let public = serde_json::to_string(&resolved.public()).unwrap();
-        assert!(public.contains("keychain_oauth"));
+        assert!(public.contains("csswitch_oauth"));
         assert!(public.contains("dynamic_catalog"));
         assert!(!public.contains("csswitch:codex:default"));
         assert!(!public.contains("credential_ref"));
@@ -670,7 +670,7 @@ mod tests {
                 .public(),
         )
         .unwrap();
-        assert!(public.contains("keychain_oauth"));
+        assert!(public.contains("csswitch_oauth"));
         assert!(public.contains("codex_account_catalog"));
         assert!(public.contains("codex_responses_sse"));
         assert!(!public.contains("csswitch:codex:default"));
@@ -812,7 +812,7 @@ mod tests {
             id: "codex-profile".into(),
             template_id: "codex".into(),
             api_format: "openai_responses".into(),
-            credential_source: crate::provider_contracts::CredentialSource::KeychainOauth,
+            credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
             model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
             ..Default::default()

@@ -6,7 +6,7 @@
 # 覆盖变量（便于测试与自定义）：
 #   CSSWITCH_PROVIDER (生效 template_id，如 deepseek/qwen/glm/xiaomi/…)
 #   CSSWITCH_ADAPTER  (deepseek|qwen|relay|codex)   CSSWITCH_KEY_PRESENT (0|1)
-#   CSSWITCH_AUTH_MODE (api_key|keychain_oauth|none)
+#   CSSWITCH_AUTH_MODE (api_key|csswitch_oauth|none)
 #   CSSWITCH_PROXY_PORT  CSSWITCH_SANDBOX_PORT  CSSWITCH_CONFIG (config.json 路径)
 #   CSSWITCH_GATEWAY_BIN  SCIENCE_BIN
 #   CSSWITCH_DOCTOR_CHECK_REAL_HOME=1  显式 opt-in 后才检查 $HOME/.claude-science 是否存在
@@ -43,8 +43,8 @@ echo "[生效配置]"
 # OAuth 凭据绝不进入 config.json 或脚本环境；脱敏状态由 app 另列在 [Codex 实验]。
 if [ -z "$PROVIDER" ]; then
   warn "当前没有「生效」配置（在面板点「设为当前」选一条）"
-elif [ "$AUTH_MODE" = "keychain_oauth" ]; then
-  pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· CSSwitch Keychain OAuth（脱敏状态见 [Codex 实验]）"
+elif [ "$AUTH_MODE" = "csswitch_oauth" ]; then
+  pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· CSSwitch 私有文件 OAuth（脱敏状态见 [Codex 实验]）"
 elif [ "$AUTH_MODE" = "none" ]; then
   pass "生效来源：${PROVIDER}（${ADAPTER:-?} 适配器）· 无需凭据"
 elif [ "$KEY_PRESENT" = "1" ]; then
