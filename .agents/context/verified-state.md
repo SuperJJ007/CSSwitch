@@ -1,6 +1,18 @@
 # 已验证状态快照
 
-最后复核：2026-07-16。
+最后复核：2026-07-17。
+
+## v0.7.0 已发布
+
+- 新增默认关闭的 Codex → Claude Science 实验桥接：CSSwitch 自有浏览器 OAuth、动态多模型目录、Science alias、Responses/SSE 文本与工具链路，以及 direct / HTTP(S) / SOCKS5 / SOCKS5h 统一网络路线。
+- Codex 认证保存在 CSSwitch 自有 data root 私有文件中，不使用 macOS Keychain，也不读取、复用、修改或删除原生 `~/.codex` 登录；单账号、browser-only 和不支持代理认证 / PAC / 自定义 CA / TUN 检测是公开边界。
+- 功能树完整 Gate 退出 0并汇总 `release-ready green: YES`：Desktop 311 passed / 3 explicit ignored，Gateway 228 lib + 1 CLI passed；fmt、clippy `-D warnings`、前端与 `git diff --check` 通过。
+- 用户在 0.6.0 版本号的 Acceptance 候选上完成 CSSwitch OAuth、动态模型、`Codex / GPT-5.6-Sol` 和 Science 最小文本 live 验收，修复后日志无 `Claude is temporarily unavailable`；该候选不是最终 v0.7.0 DMG，不能冒充最终附件 live 证据。
+- PR #60 已合并；公开 peeled `v0.7.0`、发布时 `origin/main` 与 clean build source 都是 `b8ed8d8a818c38e5b1823c11e357a7fdbda81b85`。
+- 最终 DMG 为 12,267,718 bytes，SHA-256 `72fc5dc47dd428951a055762296e1b654af3b577b62ff409b72910698c5c700f`；GitHub asset metadata 相同，重新下载后逐字节一致，`hdiutil verify` 为 `VALID`。
+- 最终 DMG 只读挂载后 app 为 0.7.0 / arm64，Desktop、Gateway 与 bundle 逐字节相同；隔离 status 返回 sidecar v3 `state_missing`，隔离 app 启动未自动拉起 provider / Gateway。正式 `/Applications/CSSwitch.app` 未修改。
+- 新 1 号暖橙圆角图标已进入源码和 DMG；四角透明、无可见黑边，没有合并 UI 重制代码。
+- app seal 结构有效但身份为 ad-hoc、无 TeamIdentifier；Gatekeeper 拒绝且没有 stapled ticket。这是明确的无正式签名发布边界。
 
 ## v0.6.0 已发布
 
