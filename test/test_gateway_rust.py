@@ -1,4 +1,5 @@
 import http.client
+import hashlib
 import json
 import os
 import pathlib
@@ -36,6 +37,36 @@ def gateway_bin():
         if path.is_file():
             return path
     return None
+
+
+def static_catalog_fingerprint(catalog):
+    digest = hashlib.sha256()
+    digest.update(b"csswitch-static-catalog-fp-v1\0")
+
+    def number(value):
+        digest.update(int(value).to_bytes(4, "big"))
+
+    def text(value):
+        encoded = str(value).encode()
+        number(len(encoded))
+        digest.update(encoded)
+
+    number(catalog["schema_version"])
+    text(catalog["adapter"])
+    text(catalog["default_selector_id"])
+    number(len(catalog["routes"]))
+    for route in catalog["routes"]:
+        text(route["selector_id"])
+        text(route["display_name"])
+        text(route["upstream_model"])
+        digest.update(bytes([{None: 0, False: 1, True: 2}[route.get("supports_tools")]]))
+    for role in ("sonnet", "opus", "haiku", "fable"):
+        text(catalog["role_bindings"][role])
+    number(len(catalog["legacy_aliases"]))
+    for legacy in catalog["legacy_aliases"]:
+        text(legacy["alias"])
+        text(legacy["selector_id"])
+    return digest.hexdigest()
 
 
 def recv_http_head(sock):
@@ -326,6 +357,8 @@ class RustGatewayLoopback(unittest.TestCase):
         launch_id="loopback-launch",
         port=None,
         env_overrides=None,
+        gateway_intent="formal",
+        static_catalog=None,
     ):
         port = port or free_port()
         self.assertNotEqual(port, 8765)
@@ -335,8 +368,46 @@ class RustGatewayLoopback(unittest.TestCase):
                 "CSSWITCH_AUTH_TOKEN": secret,
                 "CSSWITCH_TOOLUSE_SHIM": shim_mode,
                 "CSSWITCH_LAUNCH_ID": launch_id,
+                "CSSWITCH_GATEWAY_INTENT": gateway_intent,
             }
         )
+        if gateway_intent == "formal":
+            if static_catalog is None:
+                target = openai_model or "claude-opus-4-8"
+                if provider == "deepseek":
+                    routes = [
+                        ("claude-opus-4-8", "DeepSeek Pro", "deepseek-v4-pro", True),
+                        ("claude-haiku-4-5", "DeepSeek Flash", "deepseek-v4-flash", True),
+                    ]
+                    roles = {"sonnet": routes[0][0], "opus": routes[0][0], "haiku": routes[1][0], "fable": routes[0][0]}
+                elif provider == "qwen":
+                    routes = [
+                        ("claude-csswitch-qwen-max-222222222222", "Qwen Max", "qwen3.7-max", True),
+                        ("claude-csswitch-qwen-plus-111111111111", "Qwen Plus", "qwen-plus-latest", True),
+                        ("claude-csswitch-qwen-turbo-333333333333", "Qwen Turbo", "qwen-turbo", True),
+                    ]
+                    roles = {"sonnet": routes[1][0], "opus": routes[0][0], "haiku": routes[2][0], "fable": routes[0][0]}
+                else:
+                    routes = [("claude-opus-4-8", target, target, None)]
+                    roles = {name: routes[0][0] for name in ("sonnet", "opus", "haiku", "fable")}
+                static_catalog = {
+                    "schema_version": 1,
+                    "adapter": provider,
+                    "default_selector_id": routes[0][0],
+                    "routes": [
+                        {"selector_id": selector, "display_name": display, "upstream_model": upstream, "supports_tools": tools}
+                        for selector, display, upstream, tools in routes
+                    ],
+                    "role_bindings": roles,
+                    "legacy_aliases": [],
+                }
+            static_catalog = dict(static_catalog)
+            static_catalog["catalog_fp"] = static_catalog_fingerprint(static_catalog)
+            env["CSSWITCH_STATIC_MODEL_CATALOG_V1"] = json.dumps(
+                static_catalog, separators=(",", ":"), sort_keys=True
+            )
+        else:
+            env.pop("CSSWITCH_STATIC_MODEL_CATALOG_V1", None)
         if provider == "qwen":
             env["DASHSCOPE_API_KEY"] = "fake-qwen-key"
             env.pop("DEEPSEEK_API_KEY", None)
@@ -524,18 +595,126 @@ class RustGatewayLoopback(unittest.TestCase):
             body = json.loads(resp.read())
             conn.close()
             self.assertEqual(resp.status, 200)
-            self.assertEqual(
-                body,
-                {
-                    "status": "ok",
-                    "gateway": "rust",
-                    "provider": "deepseek",
-                    "shim": "off",
-                    "launch_id": "loopback-launch",
-                },
-            )
+            self.assertEqual(body["status"], "ok")
+            self.assertEqual(body["gateway"], "rust")
+            self.assertEqual(body["provider"], "deepseek")
+            self.assertEqual(body["shim"], "off")
+            self.assertEqual(body["launch_id"], "loopback-launch")
+            self.assertEqual(body["intent"], "formal")
+            self.assertRegex(body["catalog_fp"], r"^[0-9a-f]{64}$")
         finally:
             self.stop_gateway(proc)
+
+    def test_models_response_replaces_default_placeholder_with_upstream_name(self):
+        selector = "claude-csswitch-relay-real-model-123456789abc"
+        catalog = {
+            "schema_version": 1,
+            "adapter": "relay",
+            "default_selector_id": selector,
+            "routes": [{
+                "selector_id": selector,
+                "display_name": "default",
+                "upstream_model": "vendor/real-model-name",
+                "supports_tools": None,
+            }],
+            "role_bindings": {role: selector for role in ("sonnet", "opus", "haiku", "fable")},
+            "legacy_aliases": [],
+        }
+        proc, port = self.start_current_gateway(provider="relay", static_catalog=catalog)
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/secret/v1/models")
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            self.assertEqual(response.status, 200)
+            self.assertEqual(body["data"][0]["display_name"], "vendor/real-model-name")
+            self.assertNotEqual(body["data"][0]["display_name"].lower(), "default")
+        finally:
+            self.stop_gateway(proc)
+
+    def test_formal_five_model_whitelist_routes_exact_upstream_ids(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "msg_exact", "type": "message", "role": "assistant",
+            "model": "ignored", "content": [{"type": "text", "text": "ok"}],
+            "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 1},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        routes = [
+            (f"claude-csswitch-relay-model-{index}-00000000000{index}", f"Model {index}", f"vendor/model-{index}", True)
+            for index in range(1, 6)
+        ]
+        catalog = {
+            "schema_version": 1,
+            "adapter": "relay",
+            "default_selector_id": routes[0][0],
+            "routes": [
+                {"selector_id": selector, "display_name": display, "upstream_model": target, "supports_tools": tools}
+                for selector, display, target, tools in routes
+            ],
+            "role_bindings": {"sonnet": routes[0][0], "opus": routes[1][0], "haiku": routes[4][0], "fable": routes[1][0]},
+            "legacy_aliases": [],
+        }
+        proc, port = self.start_gateway(
+            provider="relay",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            static_catalog=catalog,
+        )
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/secret/v1/models")
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            self.assertEqual(response.status, 200)
+            self.assertEqual([item["id"] for item in body["data"]], [item[0] for item in routes])
+
+            for selector, _, target, _ in routes:
+                payload = json.dumps({
+                    "model": selector,
+                    "max_tokens": 1,
+                    "messages": [{"role": "user", "content": "ping"}],
+                }).encode()
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+                conn.request("POST", "/secret/v1/messages", body=payload, headers={"content-type": "application/json"})
+                response = conn.getresponse()
+                response.read()
+                conn.close()
+                self.assertEqual(response.status, 200)
+                self.assertEqual(json.loads(upstream.requests[-1]["body"])["model"], target)
+            self.assertEqual(len(upstream.requests), 5)
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
+    def test_qwen_rejects_old_codex_alias_before_upstream(self):
+        upstream = MockUpstream(b'{"unexpected":true}')
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        proc, port = self.start_gateway(
+            provider="qwen",
+            upstream_url=f"http://127.0.0.1:{upstream.server_port}/compatible-mode/v1/chat/completions",
+        )
+        try:
+            payload = json.dumps({
+                "model": "claude-csswitch-codex-gpt-5.6-sol",
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }).encode()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("POST", "/secret/v1/messages", body=payload, headers={"content-type": "application/json"})
+            response = conn.getresponse()
+            body = json.loads(response.read())
+            conn.close()
+            self.assertEqual(response.status, 400)
+            self.assertEqual(body["error"]["type"], "route_unknown")
+            self.assertEqual(upstream.requests, [])
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
 
     def test_bind_failure_cannot_adopt_old_launch_identity(self):
         old_proc, port = self.start_gateway(launch_id="old-launch")
@@ -951,8 +1130,8 @@ class RustGatewayLoopback(unittest.TestCase):
             models_body = json.loads(models_resp.read())
             conn.close()
             self.assertEqual(models_resp.status, 200)
-            self.assertEqual(models_body["first_id"], "qwen3.7-max")
-            self.assertEqual(models_body["last_id"], "qwen-turbo")
+            self.assertEqual(models_body["first_id"], "claude-csswitch-qwen-max-222222222222")
+            self.assertEqual(models_body["last_id"], "claude-csswitch-qwen-turbo-333333333333")
 
             request = {
                 "model": "claude-haiku-4-5-20250514",
@@ -1825,6 +2004,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="openai-custom",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -1861,6 +2041,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="openai-responses",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -1977,6 +2158,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="relay",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2014,6 +2196,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="relay",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         message_response = json.dumps(
             {
@@ -2054,7 +2237,7 @@ class RustGatewayLoopback(unittest.TestCase):
             resp = conn.getresponse()
             resp.read()
             conn.close()
-            self.assertEqual(resp.status, 200)
+            self.assertEqual(resp.status, 400)
 
         try:
             status, body = get_models()
@@ -2094,10 +2277,7 @@ class RustGatewayLoopback(unittest.TestCase):
             post_message()
 
             posts = [request for request in upstream.requests if request.get("method") != "GET"]
-            self.assertEqual(len(posts), 5)
-            for captured in posts:
-                mapped = json.loads(captured["body"])
-                self.assertEqual(mapped["model"], discovered)
+            self.assertEqual(len(posts), 0, "scratch-models must reject inference before upstream")
         finally:
             self.stop_gateway(proc)
             upstream.shutdown()
@@ -2112,6 +2292,7 @@ class RustGatewayLoopback(unittest.TestCase):
                 proc, port = self.start_gateway(
                     provider="relay",
                     openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+                    gateway_intent="scratch-models",
                 )
                 try:
                     raw = self.raw_request(
@@ -2145,6 +2326,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="relay",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2167,6 +2349,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="relay",
             openai_base_url=f"http://127.0.0.1:{unavailable_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=8)
@@ -2203,6 +2386,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="relay",
             openai_base_url=f"http://127.0.0.1:{upstream.port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2292,6 +2476,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="openai-custom",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2315,6 +2500,7 @@ class RustGatewayLoopback(unittest.TestCase):
         proc, port = self.start_gateway(
             provider="openai-custom",
             openai_base_url=f"http://127.0.0.1:{upstream.server_port}/up",
+            gateway_intent="scratch-models",
         )
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
@@ -2455,8 +2641,8 @@ class RustGatewayLoopback(unittest.TestCase):
                     b"Host: 127.0.0.1\r\n"
                     b"Connection: close\r\n\r\n",
                     400,
-                    "invalid_request_error",
-                    "request body must be a JSON object",
+                    "route_unknown",
+                    "model selector is required",
                 ),
                 (
                     b"POST /secret/v1/messages HTTP/1.1\r\n"
@@ -2464,8 +2650,8 @@ class RustGatewayLoopback(unittest.TestCase):
                     b"Content-Length: 0\r\n"
                     b"Connection: close\r\n\r\n",
                     400,
-                    "invalid_request_error",
-                    "request body must be a JSON object",
+                    "route_unknown",
+                    "model selector is required",
                 ),
                 (
                     b"POST /secret/v1/messages HTTP/1.1\r\n"
@@ -2482,8 +2668,8 @@ class RustGatewayLoopback(unittest.TestCase):
                     b"Content-Length: 17\r\n"
                     b"Connection: close\r\n\r\n{\"messages\":null}",
                     400,
-                    "invalid_request_error",
-                    "request body must be a JSON object",
+                    "route_unknown",
+                    "model selector is required",
                 ),
                 (
                     b"POST /secret/v1/unknown HTTP/1.1\r\n"

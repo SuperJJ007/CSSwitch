@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
 
@@ -22,6 +23,9 @@ pub enum CodexNetworkMode {
 pub struct CodexNetworkSettings {
     pub mode: CodexNetworkMode,
     pub proxy_url: String,
+    /// 前向兼容透传；runtime 只解释已知字段。
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -430,6 +434,7 @@ mod tests {
             &CodexNetworkSettings {
                 mode: CodexNetworkMode::Custom,
                 proxy_url: "socks5h://localhost:1080/".into(),
+                ..Default::default()
             },
             &EnvironmentSnapshot {
                 no_proxy: Some("*".into()),
@@ -443,6 +448,7 @@ mod tests {
             &CodexNetworkSettings {
                 mode: CodexNetworkMode::Custom,
                 proxy_url: "http://localhost".into(),
+                ..Default::default()
             },
             &EnvironmentSnapshot::default(),
         )
@@ -467,6 +473,7 @@ mod tests {
             &CodexNetworkSettings {
                 mode: CodexNetworkMode::Custom,
                 proxy_url: "https://proxy.example:8443".into(),
+                ..Default::default()
             },
             &EnvironmentSnapshot::default(),
         )

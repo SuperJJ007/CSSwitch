@@ -140,16 +140,24 @@ fn profile_api_format(p: &config::Profile) -> String {
 
 pub(crate) fn context_for_profile(p: &config::Profile, shim_mode: &str) -> CatalogContext {
     let resolved = resolve_launch_plan(p).ok();
+    let contract = crate::provider_contracts::contract_for(&p.template_id, &profile_api_format(p));
+    let model = p
+        .model_catalog
+        .iter()
+        .find(|route| route.selector_id == p.default_model_route_id)
+        .map(|route| route.upstream_model.clone())
+        .unwrap_or_else(|| p.model.clone());
     CatalogContext {
         provider: resolved
             .as_ref()
             .map(|plan| plan.adapter.clone())
-            .unwrap_or_else(|| "unsupported".to_string()),
+            .unwrap_or_else(|| crate::runtime::provider::adapter_for_profile(p)),
         api_format: profile_api_format(p),
         base_url: p.base_url.clone(),
-        model: p.model.clone(),
+        model,
         thinking_policy: resolved
             .map(|plan| plan.thinking_policy)
+            .or_else(|| contract.ok().map(|contract| contract.thinking_policy))
             .unwrap_or_default(),
         shim_mode: shim_mode.to_string(),
     }

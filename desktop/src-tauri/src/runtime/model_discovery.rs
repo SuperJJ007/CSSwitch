@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -65,7 +65,53 @@ fn build_fetch_models_contract_response(
     status: Option<u16>,
     body: &str,
     builtin: &[&str],
+    saved: &[crate::model_catalog::ModelRoute],
 ) -> Result<Value, String> {
+    let decorate = |live: Vec<(String, Option<bool>)>,
+                    display_names: &BTreeMap<String, String>,
+                    authoritative: bool,
+                    healthy: bool| {
+        let live_ids: BTreeSet<String> = live.iter().map(|(id, _)| id.clone()).collect();
+        let mut candidates: Vec<String> = builtin.iter().map(|id| (*id).to_string()).collect();
+        candidates.extend(saved.iter().map(|route| route.upstream_model.clone()));
+        let candidate_refs: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        let builtin_ids: BTreeSet<&str> = builtin.iter().copied().collect();
+        let mut models = merge_and_sort_models(live, &candidate_refs);
+        for model in &mut models {
+            let Some(id) = model.get("id").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let saved_route = saved.iter().find(|route| route.upstream_model == id);
+            let origin = if builtin_ids.contains(id.as_str()) {
+                "preset"
+            } else if saved_route.is_some() {
+                "manual"
+            } else {
+                "discovered"
+            };
+            let availability = if live_ids.contains(&id) && healthy {
+                "available"
+            } else if authoritative {
+                "not_reported"
+            } else {
+                "unknown"
+            };
+            model["origin"] = json!(origin);
+            model["availability"] = json!(availability);
+            if let Some(display_name) = display_names
+                .get(&id)
+                .or_else(|| saved_route.map(|route| &route.display_name))
+            {
+                model["display_name"] = json!(display_name);
+            }
+            if model.get("supports_tools").is_none_or(Value::is_null) {
+                if let Some(value) = saved_route.and_then(|route| route.supports_tools) {
+                    model["supports_tools"] = json!(value);
+                }
+            }
+        }
+        models
+    };
     match outcome {
         scratch::ProbeOutcome::Ok => {
             let v: Value =
@@ -114,22 +160,15 @@ fn build_fetch_models_contract_response(
                         .collect()
                 })
                 .unwrap_or_default();
-            if live.is_empty() && !builtin.is_empty() {
+            if live.is_empty() && (!builtin.is_empty() || !saved.is_empty()) {
                 return Ok(json!({
-                    "models": merge_and_sort_models(vec![], builtin),
+                    "models": decorate(vec![], &display_names, false, false),
                     "source": "builtin", "error_kind": null, "upstream_status": 200,
                     "stale": false, "age_seconds": 0
                 }));
             }
-            let mut models = merge_and_sort_models(live, builtin);
-            for model in &mut models {
-                let Some(id) = model.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                if let Some(display_name) = display_names.get(id) {
-                    model["display_name"] = json!(display_name);
-                }
-            }
+            let authoritative = !live.is_empty() && !stale;
+            let models = decorate(live, &display_names, authoritative, !stale);
             Ok(json!({
                 "models": models,
                 "source": reported_source,
@@ -157,7 +196,7 @@ fn build_fetch_models_contract_response(
                 json!(null)
             };
             Ok(json!({
-                "models": merge_and_sort_models(vec![], builtin),
+                "models": decorate(vec![], &BTreeMap::new(), false, false),
                 "source": source,
                 "error_kind": error_kind,
                 "upstream_status": status,
@@ -178,6 +217,27 @@ fn live_model_count_from_body(body: &str) -> Result<usize, String> {
                 .count()
         })
         .unwrap_or(0))
+}
+
+fn builtin_static_response(tpl: &templates::Template) -> Result<Value, String> {
+    let (preset, _, _) = tpl
+        .preset_catalog_id
+        .ok_or_else(|| "builtin_static 模板缺少 preset catalog".to_string())
+        .and_then(crate::model_catalog::preset_catalog)?;
+    Ok(json!({
+        "models": preset.into_iter().map(|route| json!({
+            "id": route.upstream_model,
+            "display_name": route.display_name,
+            "supports_tools": route.supports_tools,
+            "origin": "preset",
+            "availability": "unknown",
+        })).collect::<Vec<_>>(),
+        "source": "builtin",
+        "error_kind": null,
+        "upstream_status": null,
+        "stale": false,
+        "age_seconds": 0,
+    }))
 }
 
 pub(crate) fn request_adapter(req: &ModelDiscoveryRequest) -> Result<String, String> {
@@ -218,6 +278,14 @@ pub(crate) fn fetch_models(
         req.api_format.as_deref(),
     )?;
     let contract = crate::provider_contracts::contract_for(tid, &api_format)?;
+    // Builtin-static providers (currently DeepSeek and Qwen) expose Science
+    // compatibility shell aliases from their local gateway. Those aliases are
+    // not upstream model IDs and must never enter a saved whitelist as live
+    // discovery results. Return the versioned preset directly and be explicit
+    // that no upstream availability check was performed.
+    if contract.model_discovery == crate::provider_contracts::ModelDiscovery::BuiltinStatic {
+        return builtin_static_response(tpl);
+    }
     if contract.endpoint_policy == EndpointPolicy::ProfileRequired
         && (base_url.is_empty()
             || !(base_url.starts_with("http://") || base_url.starts_with("https://")))
@@ -245,8 +313,25 @@ pub(crate) fn fetch_models(
     candidate.template_id = tid.to_string();
     candidate.api_format = api_format;
     candidate.base_url = base_url;
+    let saved_catalog = candidate.model_catalog.clone();
     if candidate.credential_source == CredentialSource::ApiKey {
         candidate.api_key = resolve_probe_key(req.profile_id.as_deref(), &req.key)?;
+    }
+    if candidate.model_policy == crate::provider_contracts::ModelPolicy::SavedCatalog
+        && candidate.model_catalog.is_empty()
+    {
+        let placeholder = (tpl.model_catalog_source == "manual_or_discovered")
+            .then_some("csswitch-scratch-discovery-placeholder");
+        let (catalog, default, roles) =
+            crate::model_catalog::new_profile_catalog(tid, &candidate.api_format, placeholder)?;
+        candidate.model = catalog
+            .iter()
+            .find(|route| route.selector_id == default)
+            .map(|route| route.upstream_model.clone())
+            .unwrap_or_default();
+        candidate.model_catalog = catalog;
+        candidate.default_model_route_id = default;
+        candidate.role_bindings = roles;
     }
     let resolved = resolve_launch_plan(&candidate)?;
     let scratch_plan = resolved.scratch();
@@ -267,20 +352,31 @@ pub(crate) fn fetch_models(
             base_url: &scratch_plan.endpoint,
             key,
             model: None,
+            static_model_catalog: None,
             relay_thinking: &scratch_plan.thinking_policy,
         },
         scratch::ProbeKind::Models,
         Some(&trace),
         auth_proof.map(|proof| proof.exit_cancel_flag()),
     );
-    let builtin = tpl.builtin_models;
+    let builtin_owned = tpl
+        .preset_catalog_id
+        .map(crate::model_catalog::preset_upstream_models)
+        .transpose()?
+        .unwrap_or_default();
+    let builtin: Vec<&str> = builtin_owned.iter().map(String::as_str).collect();
     let outcome = scratch::classify(res.status);
     match &outcome {
         scratch::ProbeOutcome::Ok => {
             trace.stage(OperationStage::ScratchUpstreamProbe, "outcome=ok");
             let live_count = live_model_count_from_body(&res.body)?;
-            let response =
-                build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)?;
+            let response = build_fetch_models_contract_response(
+                &outcome,
+                res.status,
+                &res.body,
+                &builtin,
+                &saved_catalog,
+            )?;
             let source = response
                 .get("source")
                 .and_then(Value::as_str)
@@ -290,7 +386,13 @@ pub(crate) fn fetch_models(
         }
         scratch::ProbeOutcome::Auth(code) => {
             trace.finish(format!("rejected status={code}"));
-            build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)
+            build_fetch_models_contract_response(
+                &outcome,
+                res.status,
+                &res.body,
+                &builtin,
+                &saved_catalog,
+            )
         }
         // 非 200 且非 Auth：一律 builtin 兜底，但按语义分「发现不支持」(4xx) 与「网络/上游临时」(5xx/429/无响应)，
         // 供前端区分提示（spec v3 §3.4.3）。绝不把 Auth 混进来掩盖坏 key。
@@ -301,7 +403,13 @@ pub(crate) fn fetch_models(
                 scratch::discovery_fallback_source(other)
             };
             trace.finish(format!("fallback source={source} outcome={other:?}"));
-            build_fetch_models_contract_response(&outcome, res.status, &res.body, builtin)
+            build_fetch_models_contract_response(
+                &outcome,
+                res.status,
+                &res.body,
+                &builtin,
+                &saved_catalog,
+            )
         }
     }
 }
@@ -309,8 +417,8 @@ pub(crate) fn fetch_models(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_fetch_models_contract_response, effective_api_format_from_dir, resolve_probe_key,
-        resolve_probe_key_from_dir,
+        build_fetch_models_contract_response, builtin_static_response,
+        effective_api_format_from_dir, resolve_probe_key, resolve_probe_key_from_dir,
     };
     use crate::{config, runtime::profile::create_profile_inner, scratch::ProbeOutcome};
 
@@ -335,6 +443,24 @@ mod tests {
             resolve_probe_key(Some("missing"), "  new-key ").unwrap(),
             "new-key"
         );
+    }
+
+    #[test]
+    fn builtin_static_discovery_never_returns_science_shell_aliases_as_upstreams() {
+        for template_id in ["deepseek", "qwen"] {
+            let response =
+                builtin_static_response(crate::templates::by_id(template_id).unwrap()).unwrap();
+            let models = response["models"].as_array().unwrap();
+            assert!(!models.is_empty());
+            assert!(models.iter().all(|model| {
+                model["origin"] == "preset"
+                    && model["availability"] == "unknown"
+                    && !model["id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .starts_with("claude-")
+            }));
+        }
     }
 
     #[test]
@@ -401,6 +527,7 @@ mod tests {
             Some(200),
             r#"{"data":[{"id":"m-live","display_name":"Codex / GPT-5.6-Sol","supports_tools":true}]}"#,
             &["m-builtin"],
+            &[],
         )
         .unwrap();
         assert_eq!(live["source"], "live");
@@ -415,6 +542,7 @@ mod tests {
             Some(200),
             r#"{"data":[{"id":"m-live","display_name":"bad\u0001name"}]}"#,
             &[],
+            &[],
         )
         .unwrap();
         assert!(unsafe_display["models"][0]["display_name"].is_null());
@@ -424,6 +552,7 @@ mod tests {
             Some(200),
             r#"{"data":[]}"#,
             &["m-builtin"],
+            &[],
         )
         .unwrap();
         assert_eq!(empty_live["source"], "builtin");
@@ -436,6 +565,7 @@ mod tests {
             Some(200),
             r#"{"data":[],"diagnostics":{"source":"live","stale":false,"age_seconds":0}}"#,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(empty_dynamic["source"], "live");
@@ -446,12 +576,94 @@ mod tests {
             Some(200),
             r#"{"data":[{"id":"m-cached"}],"diagnostics":{"source":"stale-cache","stale":true,"age_seconds":301}}"#,
             &[],
+            &[],
         )
         .unwrap();
         assert_eq!(stale["source"], "stale-cache");
         assert_eq!(stale["stale"], true);
         assert_eq!(stale["age_seconds"], 301);
         assert_eq!(stale["error_kind"], "network");
+    }
+
+    #[test]
+    fn fetch_models_contract_preserves_origins_and_authoritative_availability() {
+        let saved = [crate::model_catalog::ModelRoute {
+            selector_id: "claude-csswitch-custom-saved-123456789abc".into(),
+            display_name: "Saved display".into(),
+            upstream_model: "m-saved".into(),
+            supports_tools: Some(true),
+            ..Default::default()
+        }];
+        let response = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[{"id":"m-live","supports_tools":true},{"id":"m-saved"}]}"#,
+            &["m-preset"],
+            &saved,
+        )
+        .unwrap();
+        let models = response["models"].as_array().unwrap();
+        let by_id = |id: &str| models.iter().find(|model| model["id"] == id).unwrap();
+
+        assert_eq!(by_id("m-live")["origin"], "discovered");
+        assert_eq!(by_id("m-live")["availability"], "available");
+        assert_eq!(by_id("m-live")["supports_tools"], true);
+        assert_eq!(by_id("m-saved")["origin"], "manual");
+        assert_eq!(by_id("m-saved")["availability"], "available");
+        assert_eq!(by_id("m-saved")["display_name"], "Saved display");
+        assert_eq!(by_id("m-saved")["supports_tools"], true);
+        assert_eq!(by_id("m-preset")["origin"], "preset");
+        assert_eq!(by_id("m-preset")["availability"], "not_reported");
+    }
+
+    #[test]
+    fn fetch_models_contract_keeps_whitelist_unknown_on_empty_stale_or_network() {
+        let saved = [crate::model_catalog::ModelRoute {
+            selector_id: "claude-csswitch-custom-saved-123456789abc".into(),
+            display_name: "Saved display".into(),
+            upstream_model: "m-saved".into(),
+            supports_tools: None,
+            ..Default::default()
+        }];
+        let assert_whitelist_unknown = |response: &serde_json::Value| {
+            let models = response["models"].as_array().unwrap();
+            assert_eq!(models.len(), 2);
+            for (id, origin) in [("m-preset", "preset"), ("m-saved", "manual")] {
+                let model = models.iter().find(|model| model["id"] == id).unwrap();
+                assert_eq!(model["origin"], origin);
+                assert_eq!(model["availability"], "unknown");
+            }
+        };
+
+        let empty = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[]}"#,
+            &["m-preset"],
+            &saved,
+        )
+        .unwrap();
+        assert_whitelist_unknown(&empty);
+
+        let stale = build_fetch_models_contract_response(
+            &ProbeOutcome::Ok,
+            Some(200),
+            r#"{"data":[],"diagnostics":{"source":"stale-cache","stale":true,"age_seconds":301}}"#,
+            &["m-preset"],
+            &saved,
+        )
+        .unwrap();
+        assert_whitelist_unknown(&stale);
+
+        let network = build_fetch_models_contract_response(
+            &ProbeOutcome::NoResponse,
+            None,
+            "",
+            &["m-preset"],
+            &saved,
+        )
+        .unwrap();
+        assert_whitelist_unknown(&network);
     }
 
     #[test]
@@ -475,7 +687,8 @@ mod tests {
         })
         .to_string();
         let response =
-            build_fetch_models_contract_response(&ProbeOutcome::Ok, Some(200), &body, &[]).unwrap();
+            build_fetch_models_contract_response(&ProbeOutcome::Ok, Some(200), &body, &[], &[])
+                .unwrap();
         let models = response["models"].as_array().unwrap();
         let display = |id: &str| {
             models
@@ -501,6 +714,7 @@ mod tests {
             Some(401),
             "",
             &["m-builtin"],
+            &[],
         );
         assert!(auth.unwrap_err().contains("401"));
 
@@ -509,6 +723,7 @@ mod tests {
             Some(405),
             "",
             &["m-builtin"],
+            &[],
         )
         .unwrap();
         assert_eq!(unsupported["source"], "unsupported");
@@ -521,6 +736,7 @@ mod tests {
             None,
             "",
             &["m-builtin"],
+            &[],
         )
         .unwrap();
         assert_eq!(network["source"], "network");
@@ -531,6 +747,7 @@ mod tests {
             &ProbeOutcome::Ambiguous(Some(502)),
             Some(502),
             r#"{"error_kind":"protocol","message":"private detail"}"#,
+            &[],
             &[],
         )
         .unwrap();

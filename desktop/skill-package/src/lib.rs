@@ -2,6 +2,7 @@ mod archive;
 mod bundle;
 mod github;
 mod install;
+mod listing;
 mod science;
 
 use std::path::PathBuf;
@@ -20,9 +21,13 @@ pub use install::{
     active_org, install_local_package, install_local_skill, verify_csswitch_import_origin,
     InstallAction, InstallCommit, InstalledPackage, LocalArchiveInput,
 };
+pub use listing::{
+    inspect_active_org_skills, InstalledSkillSource, InstalledSkillSummary,
+    SkillFilesystemSnapshot, SkillListWarning, MAX_LISTED_SKILLS, MAX_SKILL_FRONTMATTER_BYTES,
+};
 pub use science::{
-    attach_skill, update_agent_skills, verify_attach_control_ready, AttachError, AttachResult,
-    BatchSkillUpdate,
+    attach_skill, read_agent_skill_names, update_agent_skills, verify_attach_control_ready,
+    AttachError, AttachResult, BatchSkillUpdate,
 };
 
 pub const SCHEMA_VERSION: u64 = 2;

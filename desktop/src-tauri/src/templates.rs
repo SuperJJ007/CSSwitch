@@ -1,4 +1,4 @@
-//! UI 模板注册表：只保存名称、默认地址、图标和内置模型等展示元数据。
+//! UI 模板注册表：只保存名称、默认地址、图标和 preset 引用等展示元数据。
 //! adapter、鉴权、模型策略、transport、thinking 等启动 capability 的唯一来源是
 //! `catalog/provider-contracts.v1.json`；前端 list_templates 由两者合并后铺 UI。
 
@@ -10,7 +10,10 @@ pub struct Template {
     pub api_format: &'static str, // anthropic | openai_chat | openai_responses | gemini_native
     pub base_url: &'static str, // 默认；空=用户填
     pub base_url_editable: bool,
-    pub builtin_models: &'static [&'static str],
+    /// 内置推荐目录的稳定 id。已有 profile 不会因 catalog 升级被静默重写。
+    pub preset_catalog_id: Option<&'static str>,
+    /// preset | manual_or_discovered | dynamic_codex
+    pub model_catalog_source: &'static str,
     pub website_url: &'static str,
     pub icon: &'static str,
     pub icon_color: &'static str,
@@ -45,7 +48,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://api.deepseek.com/anthropic",
         base_url_editable: false,
-        builtin_models: &["claude-opus-4-8", "claude-haiku-4-5"],
+        preset_catalog_id: Some("deepseek"),
+        model_catalog_source: "preset",
         website_url: "https://platform.deepseek.com",
         icon: "deepseek",
         icon_color: "#1E88E5",
@@ -57,7 +61,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://open.bigmodel.cn/api/anthropic",
         base_url_editable: true,
-        builtin_models: &["glm-5.2", "glm-4.7", "glm-4.6", "glm-4.5-air"], // 官方核定 2026-07-04：旗舰 glm-5.2
+        preset_catalog_id: Some("glm"),
+        model_catalog_source: "preset",
         website_url: "https://open.bigmodel.cn",
         icon: "glm",
         icon_color: "#2E6BE6",
@@ -69,7 +74,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://api.xiaomimimo.com/anthropic",
         base_url_editable: true,
-        builtin_models: &["mimo-v2.5-pro"],
+        preset_catalog_id: Some("xiaomi"),
+        model_catalog_source: "preset",
         website_url: "https://xiaomimimo.com",
         icon: "xiaomi",
         icon_color: "#FF6900",
@@ -81,12 +87,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://api.siliconflow.cn",
         base_url_editable: true,
-        builtin_models: &[
-            "deepseek-ai/DeepSeek-V4-Pro",
-            "deepseek-ai/DeepSeek-V4-Flash",
-            "deepseek-ai/DeepSeek-V3.2",
-            "zai-org/GLM-5.2",
-        ], // 官方核定 2026-07-04；真机证实 api.siliconflow.cn/v1/messages 返回 Anthropic 200（relay/anthropic 配置正确，无需翻译）
+        preset_catalog_id: Some("siliconflow"),
+        model_catalog_source: "preset",
         website_url: "https://siliconflow.cn",
         icon: "siliconflow",
         icon_color: "#7C3AED",
@@ -98,7 +100,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://api.moonshot.cn/anthropic", // 国际站可改 api.moonshot.ai/anthropic
         base_url_editable: true,
-        builtin_models: &["kimi-k2.7-code", "kimi-k2.7-code-highspeed", "kimi-k2.6"], // 官方核定 2026-07-04
+        preset_catalog_id: Some("kimi"),
+        model_catalog_source: "preset",
         website_url: "https://platform.moonshot.cn",
         icon: "kimi",
         icon_color: "#16182F",
@@ -110,7 +113,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://api.minimaxi.com/anthropic", // 国内站（真机验证：key 有效 + /v1/models 实时发现 200）；国际站改 api.minimax.io
         base_url_editable: true,
-        builtin_models: &["MiniMax-M3", "MiniMax-M2.7", "MiniMax-M2.7-highspeed"], // 官方核定 2026-07-04：旗舰 M3（2026-06-01 GA）
+        preset_catalog_id: Some("minimax"),
+        model_catalog_source: "preset",
         website_url: "https://platform.minimaxi.com",
         icon: "minimax",
         icon_color: "#E1341E",
@@ -122,11 +126,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "https://openrouter.ai/api",
         base_url_editable: true,
-        builtin_models: &[
-            "anthropic/claude-sonnet-5",
-            "anthropic/claude-opus-4.8",
-            "anthropic/claude-opus-4.8-fast",
-        ], // 官方核定 2026-07-04：补非 2x 价的 opus-4.8
+        preset_catalog_id: Some("openrouter"),
+        model_catalog_source: "preset",
         website_url: "https://openrouter.ai",
         icon: "openrouter",
         icon_color: "#6467F2",
@@ -138,7 +139,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "openai_chat",
         base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         base_url_editable: false,
-        builtin_models: &["qwen3.7-max", "qwen-plus-latest", "qwen-turbo"],
+        preset_catalog_id: Some("qwen"),
+        model_catalog_source: "preset",
         website_url: "https://dashscope.aliyun.com",
         icon: "qwen",
         icon_color: "#615CED",
@@ -150,7 +152,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "openai_responses",
         base_url: "",
         base_url_editable: false,
-        builtin_models: &[],
+        preset_catalog_id: None,
+        model_catalog_source: "dynamic_codex",
         website_url: "https://developers.openai.com/codex/",
         icon: "custom",
         icon_color: "#111827",
@@ -162,7 +165,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "openai_chat",
         base_url: "",
         base_url_editable: true,
-        builtin_models: &[],
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
         website_url: "",
         icon: "custom",
         icon_color: "#2563EB",
@@ -174,7 +178,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "openai_responses",
         base_url: "",
         base_url_editable: true,
-        builtin_models: &[],
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
         website_url: "",
         icon: "custom",
         icon_color: "#0F766E",
@@ -186,7 +191,8 @@ static TEMPLATES: &[Template] = &[
         api_format: "anthropic",
         base_url: "",
         base_url_editable: true,
-        builtin_models: &[],
+        preset_catalog_id: None,
+        model_catalog_source: "manual_or_discovered",
         website_url: "",
         icon: "custom",
         icon_color: "#6B7280",
@@ -261,6 +267,37 @@ mod tests {
     }
 
     #[test]
+    fn every_template_has_exactly_one_catalog_strategy_and_presets_do_not_cross() {
+        let mut preset_ids = std::collections::BTreeSet::new();
+        for template in all() {
+            match (template.preset_catalog_id, template.model_catalog_source) {
+                (Some(preset_id), "preset") => {
+                    assert_eq!(preset_id, template.id);
+                    assert!(preset_ids.insert(preset_id));
+                    let upstreams =
+                        crate::model_catalog::preset_upstream_models(preset_id).unwrap();
+                    assert!(!upstreams.is_empty());
+                }
+                (None, "dynamic_codex") => assert_eq!(template.id, "codex"),
+                (None, "manual_or_discovered") => assert!(matches!(
+                    template.id,
+                    "custom" | "custom-openai" | "custom-openai-responses"
+                )),
+                other => panic!("template {} catalog strategy 非法：{other:?}", template.id),
+            }
+        }
+        assert_eq!(preset_ids.len(), 8);
+        assert_ne!(
+            by_id("glm").unwrap().preset_catalog_id,
+            by_id("kimi").unwrap().preset_catalog_id
+        );
+        assert_ne!(
+            by_id("openrouter").unwrap().preset_catalog_id,
+            by_id("siliconflow").unwrap().preset_catalog_id
+        );
+    }
+
+    #[test]
     fn provider_contract_owns_adapter_mapping() {
         assert_eq!(
             crate::provider_contracts::contract_for("deepseek", "anthropic")
@@ -310,14 +347,20 @@ mod tests {
                 crate::provider_contracts::contract_for(id, api_format)
                     .unwrap()
                     .default_model_policy,
-                crate::provider_contracts::ModelPolicy::RequiredFixed
+                crate::provider_contracts::ModelPolicy::SavedCatalog
             );
         }
-        // 旗舰默认 = builtin_models 首项（官方核定，2026-07-04）
-        assert_eq!(by_id("glm").unwrap().builtin_models[0], "glm-5.2");
-        assert_eq!(by_id("minimax").unwrap().builtin_models[0], "MiniMax-M3");
+        // 旗舰默认由版本化 preset 单一真源提供。
         assert_eq!(
-            by_id("openrouter").unwrap().builtin_models[0],
+            crate::model_catalog::preset_upstream_models("glm").unwrap()[0],
+            "glm-5.2"
+        );
+        assert_eq!(
+            crate::model_catalog::preset_upstream_models("minimax").unwrap()[0],
+            "MiniMax-M3"
+        );
+        assert_eq!(
+            crate::model_catalog::preset_upstream_models("openrouter").unwrap()[0],
             "anthropic/claude-sonnet-5"
         );
     }

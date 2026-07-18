@@ -1,10 +1,10 @@
-# CSSwitch v0.7.0 真机验收
+# CSSwitch v0.8.0 真机验收
 
 本矩阵描述应如何验收，不表示各项已经通过。每次执行必须记录目标 commit / artifact、环境和结果；发布附件的既有结果见对应 [release evidence](../evidence/releases/README.md)。
 
 ## 1. 安全护栏
 
-- Acceptance 编译期固定使用 `$HOME/.csswitch-acceptance`，正式 v0.7.0 使用 `$HOME/.csswitch`；即使都从 Finder 启动也不得互相迁移、覆盖或读取配置。自动验收仍使用每次全新的独立 `HOME`、独立 Science data-dir 和动态测试端口，形成第二层隔离。
+- Test 编译期固定使用 `$HOME/.csswitch-acceptance`，正式构建使用 `$HOME/.csswitch`；即使都从 Finder 启动也不得互相迁移、覆盖或读取配置。自动验收仍使用每次全新的独立 `HOME`、独立 Science data-dir 和动态测试端口，形成第二层隔离。
 - 准备环境时不读取、修改或删除真实 `~/.claude-science`、任何 Keychain / OAuth、SSH 私钥或真实 `~/.csswitch`。
 - Codex OAuth 只写入 Acceptance data root 下的 `codex-oauth.v1.json` 与 `codex-thinking.v1.json`；guard 不创建、不选择、不解锁任何 Keychain。只有用户在 Acceptance app 中明确点击 Codex 登录 / 退出后，才允许写入或删除这些文件；不得读取、覆盖或删除正式 CSSwitch、原生 Codex 的 `~/.codex` 会话或任何 macOS Keychain 项。
 - 真实 Science 的 `8765` 端口只用 `lsof` 观察基线 PID，不停止或接管。
@@ -19,7 +19,7 @@
 bash test/run_all.sh
 ```
 
-记录五层状态和 `current-env clean` / `release-ready green`，不要记录过期的固定 pass 数。构建发布候选前另跑 `--require-release-ready`。Python 仅供测试与 mock 使用；v0.7.0 runtime proxy 是 Rust sidecar。
+记录五层状态和 `current-env clean` / `release-ready green`，不要记录过期的固定 pass 数。构建发布候选前另跑 `--require-release-ready`。Python 仅供测试与 mock 使用；v0.8.0 runtime proxy 是 Rust sidecar。
 
 ## 3. 先在开发 HOME 构建
 
@@ -32,7 +32,7 @@ DEV_HOME="$HOME"
 )
 ```
 
-目标为 `desktop/src-tauri/target/release/bundle/macos/CSSwitch Acceptance.app`。`acceptance-build` 是编译期 Acceptance data-root feature：Desktop 与 Gateway 分别固定 `$HOME/.csswitch-acceptance`，build script 用同一 feature 重建并打包 Gateway sidecar。构建、Codex 登录和本机 Acceptance 验收均不要求 Apple Development、Developer ID、Team ID 或正式签名。
+目标为 `desktop/src-tauri/target/release/bundle/macos/CSSwitch Test.app`。`acceptance-build` 是编译期 Test data-root feature：Desktop 与 Gateway 分别固定 `$HOME/.csswitch-acceptance`，build script 用同一 feature 重建并打包 Gateway sidecar。
 
 任何构建只要存在 `CSSWITCH_SKIP_GATEWAY_STAGE` 都会直接失败；普通构建也不得复用 Acceptance 残留，Desktop 与 Gateway 必须由同一次同 feature 构建产生。artifact 验收要核对包内 Gateway 存在、可执行、与 Desktop 同次构建，并验证 `status` 在空 data root 返回 `state_missing`，不能只证明文件存在。正常构建不启用 Acceptance feature，固定 `$HOME/.csswitch`；Acceptance 固定 `$HOME/.csswitch-acceptance`，两种构建都没有运行时改写入口。必须在导出隔离 `HOME` **之前**构建；否则 `$HOME/.rustup` 会指向空的测试 HOME。
 
@@ -78,11 +78,11 @@ install -d -m 700 "$HOME/.ssh"
 install -m 600 /dev/null "$HOME/.ssh/config"
 ```
 
-启动独立 Acceptance app：
+启动独立 Test app：
 
 ```bash
 HOME="$HOME" CSSWITCH_REPO="$CSSWITCH_REPO" \
-  "$CSSWITCH_REPO/desktop/src-tauri/target/release/bundle/macos/CSSwitch Acceptance.app/Contents/MacOS/desktop"
+  "$CSSWITCH_REPO/desktop/src-tauri/target/release/bundle/macos/CSSwitch Test.app/Contents/MacOS/desktop"
 ```
 
 ### 4.1 Codex 的停线点
@@ -103,7 +103,7 @@ bash test/real_machine_guard.sh guard
 
 ## 5. 当前验收矩阵
 
-RM-01～RM-34 保留历史编号；Codex v0.7.0 场景从 RM-35 继续，避免源码注释和旧证据错指。矩阵是执行清单，不表示最终公开 DMG 已逐项全部通过。
+RM-01～RM-34 保留历史编号；Codex v0.8.0 场景从 RM-35 继续，避免源码注释和旧证据错指。矩阵是执行清单，不表示最终公开 DMG 已逐项全部通过。
 
 | ID | 场景 | 操作 | 必须满足 |
 |---|---|---|---|

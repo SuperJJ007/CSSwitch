@@ -68,7 +68,7 @@ class CodexBrowserAuthContractTest(unittest.TestCase):
 
         self.assertIn('active && isCodexSource(active)', js)
         self.assertIn('受管 Science/Gateway 已停止且未自动重启；请点击“一键开始”', js)
-        self.assertIn('下一步可在“我的配置”中设为当前', js)
+        self.assertIn('下一步可在“模型连接 > 配置方案”中设为当前', js)
 
     def test_ui_defers_codex_preflight_to_one_typed_backend_operation(self):
         js = (ROOT / "desktop/src/main.js").read_text()

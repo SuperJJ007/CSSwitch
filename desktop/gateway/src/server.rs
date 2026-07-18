@@ -252,6 +252,10 @@ fn invalid_request_json(stream: &mut TcpStream, detail: &str) {
     typed_error_json(stream, 400, "Bad Request", "invalid_request_error", detail);
 }
 
+fn route_unknown_json(stream: &mut TcpStream, detail: &str) {
+    typed_error_json(stream, 400, "Bad Request", "route_unknown", detail);
+}
+
 fn request_too_large_json(stream: &mut TcpStream) {
     typed_error_json(
         stream,
@@ -322,7 +326,11 @@ fn handle_get(
                 "provider": cfg.provider,
                 "shim": cfg.shim_mode,
                 "launch_id": cfg.launch_id,
+                "intent": cfg.intent.as_str(),
             });
+            if let Some(resolver) = cfg.static_model_resolver.as_ref() {
+                health["catalog_fp"] = Value::String(resolver.catalog_fp().to_string());
+            }
             if let Some(contract) = cfg.codex_contract.as_ref() {
                 let object = health
                     .as_object_mut()
@@ -337,6 +345,22 @@ fn handle_get(
                 );
             }
             write_json(stream, 200, "OK", health)
+        }
+        "/v1/models"
+            if cfg.provider != "codex"
+                && cfg.intent != crate::config::GatewayIntent::ScratchModels =>
+        {
+            let Some(resolver) = cfg.static_model_resolver.as_ref() else {
+                typed_error_json(
+                    stream,
+                    503,
+                    "Service Unavailable",
+                    "catalog_unavailable",
+                    "static model catalog is unavailable",
+                );
+                return;
+            };
+            write_json(stream, 200, "OK", resolver.models_response())
         }
         "/v1/models" if cfg.provider == "qwen" => {
             write_json(stream, 200, "OK", models::qwen_models_response())
@@ -365,7 +389,12 @@ fn handle_get(
                     return;
                 }
             };
-            match catalog.list(&secrets) {
+            let snapshot = if cfg.intent == crate::config::GatewayIntent::ScratchModels {
+                catalog.refresh_published_snapshot(&secrets)
+            } else {
+                catalog.published_snapshot(&secrets)
+            };
+            match snapshot {
                 Ok(snapshot) => write_codex_models_response(stream, &snapshot),
                 Err(error) => {
                     if error.upstream_status == Some(401) {
@@ -391,10 +420,6 @@ fn handle_get(
                 || cfg.provider == "openai-responses"
                 || cfg.provider == "relay" =>
         {
-            if let Some(model) = cfg.forced_model.as_deref() {
-                write_json(stream, 200, "OK", models::force_shell_response(model));
-                return;
-            }
             let Some(models_url) = cfg.models_url.as_deref() else {
                 models_error_json(stream, 502, "network", None, "missing models URL");
                 return;
@@ -1162,11 +1187,11 @@ fn handle_codex_messages_with_catalog(
     let requested_model = match raw.get("model").and_then(Value::as_str) {
         Some(model) if !model.trim().is_empty() => model,
         _ => {
-            invalid_request_json(stream, "model is required for Codex");
+            route_unknown_json(stream, "model selector is required for Codex");
             return;
         }
     };
-    let snapshot = match catalog.list(&secrets) {
+    let snapshot = match catalog.published_snapshot(&secrets) {
         Ok(snapshot) => snapshot,
         Err(error) => {
             if error.upstream_status == Some(401) {
@@ -1183,7 +1208,10 @@ fn handle_codex_messages_with_catalog(
         }
     };
     let Some(target_model) = snapshot.resolve_science_model(requested_model) else {
-        invalid_request_json(stream, "model is not available for this Codex account");
+        route_unknown_json(
+            stream,
+            "model selector is not available for this Codex account",
+        );
         return;
     };
     let mut mapped_request = raw.clone();
@@ -1209,7 +1237,7 @@ fn handle_messages(
     cfg: &GatewayConfig,
     body: Vec<u8>,
     request_nonces: Option<&RequestNonceGenerator>,
-    relay_models: &models::RelayModelCache,
+    _relay_models: &models::RelayModelCache,
     codex: CodexComponents<'_>,
 ) {
     let raw: Value = match serde_json::from_slice(&body) {
@@ -1219,6 +1247,10 @@ fn handle_messages(
             return;
         }
     };
+    if !raw.is_object() {
+        invalid_request_json(stream, "request body must be a JSON object");
+        return;
+    }
     let known_tools = known_tools_from_request(&raw);
     let is_stream = raw.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if cfg.provider == "codex" {
@@ -1233,6 +1265,29 @@ fn handle_messages(
         handle_codex_messages(stream, cfg, &raw, is_stream, transport, catalog);
         return;
     }
+    if cfg.intent == crate::config::GatewayIntent::ScratchModels {
+        route_unknown_json(stream, "scratch-models does not accept inference requests");
+        return;
+    }
+    let requested_model = match raw.get("model").and_then(Value::as_str) {
+        Some(model) if !model.trim().is_empty() => model,
+        _ => {
+            route_unknown_json(stream, "model selector is required");
+            return;
+        }
+    };
+    let Some(resolver) = cfg.static_model_resolver.as_ref() else {
+        route_unknown_json(stream, "static model catalog is unavailable");
+        return;
+    };
+    let Some(resolved_route) = resolver.resolve(requested_model) else {
+        route_unknown_json(
+            stream,
+            "model selector is not present in the active profile",
+        );
+        return;
+    };
+    let target_model = resolved_route.upstream_model().to_string();
     let dsml_request_nonce =
         (cfg.provider == "deepseek" && cfg.shim_mode == "rewrite" && !known_tools.is_empty())
             .then(|| request_nonces.map(RequestNonceGenerator::next_nonce))
@@ -1249,15 +1304,14 @@ fn handle_messages(
         let transformed = if cfg.provider == "openai-responses" {
             openai_responses::anthropic_to_openai(
                 &raw,
-                cfg.forced_model.as_deref(),
+                &target_model,
                 openai_responses::is_dashscope_responses_endpoint(&cfg.provider, &cfg.upstream_url),
             )
             .map(|(body, metadata)| (body, Some(metadata)))
         } else if cfg.provider == "openai-custom" {
-            openai_chat::anthropic_to_openai_custom(&raw, cfg.forced_model.as_deref())
-                .map(|body| (body, None))
+            openai_chat::anthropic_to_openai_custom(&raw, &target_model).map(|body| (body, None))
         } else {
-            openai_chat::anthropic_to_openai(&raw).map(|body| (body, None))
+            openai_chat::anthropic_to_openai(&raw, &target_model).map(|body| (body, None))
         };
         let (transformed, responses_metadata) = match transformed {
             Ok(result) => result,
@@ -1311,11 +1365,9 @@ fn handle_messages(
         return;
     }
     if cfg.provider == "relay" {
-        let relay_models = relay_models.snapshot();
         let (transformed, metadata) = match anthropic_compat::transform_relay_request(
             raw,
-            cfg.forced_model.as_deref(),
-            &relay_models,
+            &target_model,
             cfg.relay_thinking.as_deref(),
             &cfg.upstream_url,
         ) {
@@ -1359,7 +1411,7 @@ fn handle_messages(
         }
         return;
     }
-    let transformed = match policy::transform_request(raw) {
+    let transformed = match policy::transform_request(raw, &target_model) {
         Ok(body) => body,
         Err(e) => {
             invalid_request_json(stream, &e);
@@ -2513,8 +2565,9 @@ mod tests {
         });
         models_server.join().unwrap();
         assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
-        assert!(String::from_utf8_lossy(&response)
-            .contains("model is not available for this Codex account"));
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.contains("\"type\":\"route_unknown\""));
+        assert!(response.contains("model selector is not available for this Codex account"));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -2889,8 +2942,9 @@ mod tests {
             api_key: None,
             upstream_url: DEFAULT_CODEX_UPSTREAM_URL.into(),
             models_url: None,
-            forced_model: None,
             relay_thinking: None,
+            intent: crate::config::GatewayIntent::Formal,
+            static_model_resolver: None,
             shim_mode: "off".into(),
             codex_state_root: None,
             codex_contract: None,

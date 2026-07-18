@@ -4,6 +4,7 @@ pub(crate) struct StatusProbeInput {
     pub(crate) proxy_ok: bool,
     pub(crate) sandbox_ok: bool,
     pub(crate) upstream_ok: bool,
+    pub(crate) upstream_applicable: bool,
 }
 
 pub(crate) struct ScienceDiagnosticsInput {
@@ -26,12 +27,17 @@ fn light(ok: bool) -> &'static str {
     }
 }
 
-/// Preserve the current status contract: each light is either `green` or `amber`.
+/// Runtime layers use green/amber; a provider without an independent upstream
+/// probe reports gray so callers do not treat "not applicable" as a failure.
 pub(crate) fn status_lights(input: StatusProbeInput) -> StatusLights {
     StatusLights {
         proxy: light(input.proxy_ok),
         sandbox: light(input.sandbox_ok),
-        upstream: light(input.upstream_ok),
+        upstream: if input.upstream_applicable {
+            light(input.upstream_ok)
+        } else {
+            "gray"
+        },
     }
 }
 
@@ -53,7 +59,7 @@ pub(crate) fn proxy_status_last_error(
     if secret_present && !proxy_ok {
         Some(json!({
             "type": "proxy_unhealthy",
-            "message": "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。",
+            "message": "代理进程不可达或已退出，请点击「一键开始」恢复。",
             "port": proxy_port,
         }))
     } else {
@@ -112,6 +118,7 @@ mod tests {
             proxy_ok: true,
             sandbox_ok: true,
             upstream_ok: true,
+            upstream_applicable: true,
         });
         assert_eq!(all_green.proxy, "green");
         assert_eq!(all_green.sandbox, "green");
@@ -121,10 +128,19 @@ mod tests {
             proxy_ok: false,
             sandbox_ok: false,
             upstream_ok: false,
+            upstream_applicable: true,
         });
         assert_eq!(all_amber.proxy, "amber");
         assert_eq!(all_amber.sandbox, "amber");
         assert_eq!(all_amber.upstream, "amber");
+
+        let no_independent_upstream = status_lights(StatusProbeInput {
+            proxy_ok: true,
+            sandbox_ok: true,
+            upstream_ok: false,
+            upstream_applicable: false,
+        });
+        assert_eq!(no_independent_upstream.upstream, "gray");
     }
 
     #[test]
@@ -133,6 +149,7 @@ mod tests {
             proxy_ok: true,
             sandbox_ok: false,
             upstream_ok: true,
+            upstream_applicable: true,
         });
         let v = build_status_response(
             lights,
@@ -178,6 +195,7 @@ mod tests {
                 proxy_ok: true,
                 sandbox_ok: true,
                 upstream_ok: true,
+                upstream_applicable: true,
             }),
             json!({
                 "id": "p1",
@@ -251,6 +269,7 @@ mod tests {
                 proxy_ok: false,
                 sandbox_ok: false,
                 upstream_ok: false,
+                upstream_applicable: true,
             }),
             Value::Null,
             "",
@@ -290,6 +309,7 @@ mod tests {
                 proxy_ok: false,
                 sandbox_ok: false,
                 upstream_ok: false,
+                upstream_applicable: true,
             }),
             serde_json::Value::Null,
             "rust",
@@ -329,6 +349,7 @@ mod tests {
                 proxy_ok: false,
                 sandbox_ok: true,
                 upstream_ok: true,
+                upstream_applicable: true,
             }),
             serde_json::Value::Null,
             "rust",
@@ -354,6 +375,7 @@ mod tests {
                 proxy_ok: false,
                 sandbox_ok: true,
                 upstream_ok: true,
+                upstream_applicable: true,
             }),
             Value::Null,
             "rust",

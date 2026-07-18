@@ -1,8 +1,10 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 #[cfg(unix)]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -449,13 +451,20 @@ fn read_and_validate_marker(skill_dir: &Path, skill_name: &str) -> Result<Value,
     reject_symlink_path(skill_dir)?;
     let marker_path = skill_dir.join(IMPORT_ORIGIN_FILE);
     reject_symlink_path(&marker_path)?;
-    let metadata = fs::metadata(&marker_path).map_err(|_| {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut marker_file = options.open(&marker_path).map_err(|_| {
         error(
             "SKILL_NAME_CONFLICT",
             format!("Skill '{skill_name}' 没有 CSSwitch marker"),
             "recovery",
         )
     })?;
+    let metadata = marker_file
+        .metadata()
+        .map_err(|_| error("INVALID_IMPORT_ORIGIN", "无法检查 Skill marker", "recovery"))?;
     if !metadata.is_file() || metadata.len() as usize > MAX_IMPORT_ORIGIN_BYTES {
         return Err(error(
             "INVALID_IMPORT_ORIGIN",
@@ -463,13 +472,24 @@ fn read_and_validate_marker(skill_dir: &Path, skill_name: &str) -> Result<Value,
             "recovery",
         ));
     }
-    let body = fs::read(&marker_path).map_err(|_| {
-        error(
+    let mut body = Vec::new();
+    Read::by_ref(&mut marker_file)
+        .take((MAX_IMPORT_ORIGIN_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| {
+            error(
+                "INVALID_IMPORT_ORIGIN",
+                "读取 Skill marker 失败",
+                "recovery",
+            )
+        })?;
+    if body.len() > MAX_IMPORT_ORIGIN_BYTES {
+        return Err(error(
             "INVALID_IMPORT_ORIGIN",
-            "读取 Skill marker 失败",
+            "Skill marker 超过大小限制",
             "recovery",
-        )
-    })?;
+        ));
+    }
     let marker: Value = serde_json::from_slice(&body).map_err(|_| {
         error(
             "INVALID_IMPORT_ORIGIN",
@@ -740,6 +760,7 @@ pub(crate) fn scan_installed_payload_with_limits(
 }
 
 pub fn active_org(data_dir: &Path) -> Result<String, InstallError> {
+    const MAX_ACTIVE_ORG_BYTES: usize = 16 * 1024;
     if !data_dir.is_absolute() {
         return Err(error(
             "SCIENCE_DATA_DIR_INVALID",
@@ -750,7 +771,11 @@ pub fn active_org(data_dir: &Path) -> Result<String, InstallError> {
     reject_symlink_path(data_dir)?;
     let active = data_dir.join("active-org.json");
     reject_symlink_path(&active)?;
-    let body = fs::read(&active).map_err(|_| {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut active_file = options.open(&active).map_err(|_| {
         error(
             "SCIENCE_NOT_READY",
             "读取 Science active-org.json 失败",
@@ -758,6 +783,42 @@ pub fn active_org(data_dir: &Path) -> Result<String, InstallError> {
         )
         .retryable(true)
     })?;
+    let metadata = active_file.metadata().map_err(|_| {
+        error(
+            "SCIENCE_NOT_READY",
+            "无法检查 Science active-org.json",
+            "science_state",
+        )
+        .retryable(true)
+    })?;
+    if !metadata.is_file() || metadata.len() as usize > MAX_ACTIVE_ORG_BYTES {
+        return Err(error(
+            "SCIENCE_NOT_READY",
+            "Science active-org.json 超过大小限制或不是普通文件",
+            "science_state",
+        )
+        .retryable(true));
+    }
+    let mut body = Vec::new();
+    Read::by_ref(&mut active_file)
+        .take((MAX_ACTIVE_ORG_BYTES + 1) as u64)
+        .read_to_end(&mut body)
+        .map_err(|_| {
+            error(
+                "SCIENCE_NOT_READY",
+                "读取 Science active-org.json 失败",
+                "science_state",
+            )
+            .retryable(true)
+        })?;
+    if body.len() > MAX_ACTIVE_ORG_BYTES {
+        return Err(error(
+            "SCIENCE_NOT_READY",
+            "Science active-org.json 超过大小限制",
+            "science_state",
+        )
+        .retryable(true));
+    }
     let value: Value = serde_json::from_slice(&body).map_err(|_| {
         error(
             "SCIENCE_NOT_READY",
@@ -1069,6 +1130,16 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         fs::write(data.join("active-org.json"), br#"{"org_uuid":"org-test"}"#).unwrap();
         data
+    }
+
+    #[test]
+    fn active_org_rejects_oversized_file_during_bounded_read() {
+        let root = test_root("active-org-limit");
+        let data = root.join("home/.claude-science");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("active-org.json"), vec![b'x'; 16 * 1024 + 1]).unwrap();
+        assert_eq!(active_org(&data).unwrap_err().code, "SCIENCE_NOT_READY");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

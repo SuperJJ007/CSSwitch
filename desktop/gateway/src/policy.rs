@@ -1,26 +1,5 @@
 use serde_json::Value;
 
-const DEFAULT_MODEL: &str = "deepseek-v4-flash";
-
-pub fn resolve_model(name: Option<&str>) -> &'static str {
-    let name = name.unwrap_or("");
-    match name {
-        "" => DEFAULT_MODEL,
-        "claude-opus-4-8" => "deepseek-v4-pro",
-        "claude-sonnet-5" | "claude-sonnet-4-6" | "claude-haiku-4-5" => "deepseek-v4-flash",
-        "deepseek-v4-pro" => "deepseek-v4-pro",
-        "deepseek-v4-flash" => "deepseek-v4-flash",
-        _ if name.starts_with("claude-opus-4-8") => "deepseek-v4-pro",
-        _ if name.starts_with("claude-sonnet-5")
-            || name.starts_with("claude-sonnet-4-6")
-            || name.starts_with("claude-haiku-4-5") =>
-        {
-            "deepseek-v4-flash"
-        }
-        _ => DEFAULT_MODEL,
-    }
-}
-
 pub fn clamp_max_tokens(value: Option<u64>, model: &str) -> Option<u64> {
     let cap = match model {
         "deepseek-v4-pro" => 65_536,
@@ -55,20 +34,19 @@ pub fn normalize_thinking(body: &mut Value) {
     }
 }
 
-pub fn transform_request(mut body: Value) -> Result<Vec<u8>, String> {
+pub fn transform_request(mut body: Value, target_model: &str) -> Result<Vec<u8>, String> {
     let obj = body
         .as_object_mut()
         .ok_or("request body must be a JSON object with a 'messages' array")?;
     if !obj.get("messages").map(Value::is_array).unwrap_or(false) {
         return Err("request body must be a JSON object with a 'messages' array".to_string());
     }
-    let model = resolve_model(obj.get("model").and_then(Value::as_str));
-    obj.insert("model".to_string(), Value::String(model.to_string()));
+    obj.insert("model".to_string(), Value::String(target_model.to_string()));
     if let Some(max_tokens) = obj.get("max_tokens").and_then(Value::as_u64) {
         obj.insert(
             "max_tokens".to_string(),
             Value::Number(serde_json::Number::from(
-                clamp_max_tokens(Some(max_tokens), model).unwrap_or(max_tokens),
+                clamp_max_tokens(Some(max_tokens), target_model).unwrap_or(max_tokens),
             )),
         );
     }
@@ -78,15 +56,8 @@ pub fn transform_request(mut body: Value) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_max_tokens, resolve_model, transform_request};
+    use super::{clamp_max_tokens, transform_request};
     use serde_json::json;
-
-    #[test]
-    fn resolves_deepseek_shell_models() {
-        assert_eq!(resolve_model(Some("claude-opus-4-8")), "deepseek-v4-pro");
-        assert_eq!(resolve_model(Some("claude-haiku-4-5")), "deepseek-v4-flash");
-        assert_eq!(resolve_model(Some("")), "deepseek-v4-flash");
-    }
 
     #[test]
     fn clamps_deepseek_max_tokens() {
@@ -105,7 +76,7 @@ mod tests {
             "thinking": {"type": "auto"},
             "messages": [{"role": "user", "content": "hi"}]
         });
-        let bytes = transform_request(raw).unwrap();
+        let bytes = transform_request(raw, "deepseek-v4-pro").unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["model"], "deepseek-v4-pro");
         assert_eq!(v["max_tokens"], 65536);
@@ -120,7 +91,7 @@ mod tests {
             "thinking": {"type": "auto"},
             "messages": []
         });
-        let bytes = transform_request(raw).unwrap();
+        let bytes = transform_request(raw, "deepseek-v4-pro").unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["thinking"]["type"], "disabled");
     }

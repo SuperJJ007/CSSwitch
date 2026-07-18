@@ -1,42 +1,5 @@
 use serde_json::{json, Map, Value};
 
-const DEFAULT_QWEN_MODEL: &str = "qwen-plus-latest";
-
-fn strip_date_suffix(name: &str) -> &str {
-    let Some((prefix, suffix)) = name.rsplit_once('-') else {
-        return name;
-    };
-    if suffix.len() == 8 && suffix.chars().all(|ch| ch.is_ascii_digit()) {
-        prefix
-    } else {
-        name
-    }
-}
-
-pub fn resolve_qwen_model(name: Option<&str>) -> &'static str {
-    let raw = name.unwrap_or("");
-    let stripped = strip_date_suffix(raw);
-    match raw {
-        "" => DEFAULT_QWEN_MODEL,
-        "claude-opus-4-8" => "qwen3.7-max",
-        "claude-sonnet-5" | "claude-sonnet-4-6" => "qwen-plus-latest",
-        "claude-haiku-4-5" => "qwen-turbo",
-        "qwen3.7-max" => "qwen3.7-max",
-        "qwen-plus-latest" => "qwen-plus-latest",
-        "qwen-turbo" => "qwen-turbo",
-        _ if stripped == "claude-opus-4-8" || raw.starts_with("claude-opus-4-8") => "qwen3.7-max",
-        _ if stripped == "claude-sonnet-5"
-            || stripped == "claude-sonnet-4-6"
-            || raw.starts_with("claude-sonnet-5")
-            || raw.starts_with("claude-sonnet-4-6") =>
-        {
-            "qwen-plus-latest"
-        }
-        _ if stripped == "claude-haiku-4-5" || raw.starts_with("claude-haiku-4-5") => "qwen-turbo",
-        _ => DEFAULT_QWEN_MODEL,
-    }
-}
-
 pub fn clamp_qwen_max_tokens(value: Option<u64>) -> Option<u64> {
     value.map(|v| v.min(8192))
 }
@@ -106,19 +69,12 @@ fn tool_result_content(value: Option<&Value>) -> String {
     }
 }
 
-pub fn anthropic_to_openai(req: &Value) -> Result<Value, String> {
-    anthropic_to_openai_with_model(
-        req,
-        resolve_qwen_model(req.get("model").and_then(Value::as_str)).to_string(),
-        Some(8192),
-    )
+pub fn anthropic_to_openai(req: &Value, target_model: &str) -> Result<Value, String> {
+    anthropic_to_openai_with_model(req, target_model.to_string(), Some(8192))
 }
 
-pub fn anthropic_to_openai_custom(
-    req: &Value,
-    forced_model: Option<&str>,
-) -> Result<Value, String> {
-    anthropic_to_openai_with_model(req, forced_model.unwrap_or("").to_string(), None)
+pub fn anthropic_to_openai_custom(req: &Value, target_model: &str) -> Result<Value, String> {
+    anthropic_to_openai_with_model(req, target_model.to_string(), None)
 }
 
 fn anthropic_to_openai_with_model(
@@ -395,7 +351,7 @@ pub fn replay_as_sse_events(aresp: &Value) -> Vec<(String, Value)> {
 mod tests {
     use super::{
         anthropic_to_openai, anthropic_to_openai_custom, map_tool_choice, openai_to_anthropic,
-        replay_as_sse_events, resolve_qwen_model,
+        replay_as_sse_events,
     };
     use serde_json::{json, Value};
 
@@ -406,7 +362,7 @@ mod tests {
     #[test]
     fn qwen_transform_matches_python_fixture() {
         let fx = fixture();
-        let got = anthropic_to_openai(&fx["request"]).unwrap();
+        let got = anthropic_to_openai(&fx["request"], "qwen-turbo").unwrap();
         assert_eq!(got, fx["openai_request"]);
     }
 
@@ -440,23 +396,17 @@ mod tests {
     }
 
     #[test]
-    fn qwen_models_and_token_cap_match_python_policy() {
-        assert_eq!(resolve_qwen_model(Some("claude-opus-4-8")), "qwen3.7-max");
-        assert_eq!(
-            resolve_qwen_model(Some("claude-sonnet-5")),
-            "qwen-plus-latest"
-        );
-        assert_eq!(resolve_qwen_model(Some("claude-haiku-4-5")), "qwen-turbo");
-        assert_eq!(
-            resolve_qwen_model(Some("claude-haiku-4-5-20250514")),
-            "qwen-turbo"
-        );
-        let got = anthropic_to_openai(&json!({
-            "model": "claude-opus-4-8",
-            "max_tokens": 100000,
-            "messages": [{"role": "user", "content": "hi"}]
-        }))
+    fn qwen_token_cap_preserves_resolved_target() {
+        let got = anthropic_to_openai(
+            &json!({
+                "model": "claude-opus-4-8",
+                "max_tokens": 100000,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            "qwen3.7-max",
+        )
         .unwrap();
+        assert_eq!(got["model"], "qwen3.7-max");
         assert_eq!(got["max_tokens"], 8192);
     }
 
@@ -468,7 +418,7 @@ mod tests {
                 "max_tokens": 1000000,
                 "messages": [{"role": "user", "content": "hi"}]
             }),
-            Some("glm-4.5"),
+            "glm-4.5",
         )
         .unwrap();
         assert_eq!(got["model"], "glm-4.5");

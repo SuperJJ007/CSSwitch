@@ -4,13 +4,48 @@ use serde_json::json;
 use tauri::State;
 
 use crate::runtime::profile::{
-    build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
-    delete_profile_inner, update_profile_connection_inner, update_profile_metadata_inner,
-    ConnectionEdit,
+    build_get_config, build_list_templates, build_preset_sync_preview, clear_profile_key_inner,
+    create_profile_with_catalog_inner, delete_profile_inner, persist_profile_candidate_inner,
+    update_profile_metadata_inner, CatalogEdit, ConnectionEdit,
 };
 use crate::runtime::profile_switch::{scratch_validate_candidate, set_active_profile_txn};
 use crate::runtime::provider::{reject_openai_custom_anthropic_base, resolve_launch_plan};
 use crate::{config, lifecycle, lock, run_blocking_typed, SharedAppState, SharedLifecycle};
+
+fn catalog_edit_from_parts(
+    legacy_model_present: bool,
+    model_catalog: Option<Vec<crate::model_catalog::ModelRoute>>,
+    default_model_route_id: Option<String>,
+    role_bindings: Option<crate::model_catalog::RoleBindings>,
+) -> Result<Option<CatalogEdit>, String> {
+    let catalog_edit = match (model_catalog, default_model_route_id, role_bindings) {
+        (None, None, None) => None,
+        (Some(routes), Some(default_model_route_id), Some(role_bindings)) => Some(CatalogEdit {
+            routes,
+            default_model_route_id,
+            role_bindings,
+        }),
+        _ => {
+            return Err("model_catalog 必须与 default_model_route_id/role_bindings 一起提交".into())
+        }
+    };
+    if legacy_model_present && catalog_edit.is_some() {
+        return Err("legacy model 与完整 model_catalog 不能同时提交".into());
+    }
+    Ok(catalog_edit)
+}
+
+fn require_preview_fingerprint(preview: &serde_json::Value, expected: &str) -> Result<(), String> {
+    if preview
+        .get("preview_fingerprint")
+        .and_then(serde_json::Value::as_str)
+        == Some(expected)
+    {
+        Ok(())
+    } else {
+        Err("推荐目录预览已过期；配置或内置推荐已变化，请重新预览后确认。".into())
+    }
+}
 
 #[tauri::command]
 pub(crate) fn get_config() -> Result<serde_json::Value, String> {
@@ -24,8 +59,74 @@ pub(crate) fn list_templates() -> Result<Vec<serde_json::Value>, String> {
     Ok(build_list_templates(cfg.experimental_codex_enabled))
 }
 
+#[tauri::command]
+pub(crate) fn preview_profile_preset_sync(id: String) -> Result<serde_json::Value, String> {
+    build_preset_sync_preview(&config::default_dir(), &id)
+}
+
+#[tauri::command]
+pub(crate) async fn apply_profile_preset_sync(
+    app: tauri::AppHandle,
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+    id: String,
+    expected_preview_fingerprint: String,
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking_typed(move || {
+        lifecycle.with_serialized(|| {
+            let dir = config::default_dir();
+            let preview = build_preset_sync_preview(&dir, &id)?;
+            require_preview_fingerprint(&preview, &expected_preview_fingerprint)
+                .map_err(crate::commands::codex::RuntimeCommandError::from)?;
+            let edit = CatalogEdit {
+                routes: serde_json::from_value(preview["model_catalog"].clone())
+                    .map_err(|error| error.to_string())?,
+                default_model_route_id: preview["default_model_route_id"]
+                    .as_str()
+                    .ok_or("推荐目录缺少默认 selector")?
+                    .to_string(),
+                role_bindings: serde_json::from_value(preview["role_bindings"].clone())
+                    .map_err(|error| error.to_string())?,
+            };
+            let cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+            if cfg.active_id == id {
+                set_active_profile_txn(
+                    &app,
+                    &state,
+                    lifecycle.as_ref(),
+                    &id,
+                    false,
+                    Some(&ConnectionEdit::default().with_catalog(Some(edit))),
+                    None,
+                )
+                .map_err(crate::commands::codex::RuntimeCommandError::from)
+            } else {
+                let mut candidate = cfg
+                    .profile_by_id(&id)
+                    .cloned()
+                    .ok_or_else(|| format!("找不到 profile：{id}"))?;
+                ConnectionEdit::default()
+                    .with_catalog(Some(edit))
+                    .apply(&mut candidate)?;
+                persist_profile_candidate_inner(&dir, &id, &candidate)?;
+                Ok(json!({
+                    "committed": true,
+                    "status": "ok",
+                    "stage": "complete",
+                    "recovery_status": "not_needed",
+                    "message": "已同步最新推荐；下次激活时会验证默认模型。",
+                }))
+            }
+        })
+    })
+    .await
+}
+
 // ---------- profile CRUD 命令（薄包装 *_inner，统一经串行器） ----------
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_profile(
     lifecycle: State<'_, SharedLifecycle>,
     template_id: String,
@@ -33,15 +134,25 @@ pub(crate) fn create_profile(
     key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
+    model_catalog: Option<Vec<crate::model_catalog::ModelRoute>>,
+    default_model_route_id: Option<String>,
+    role_bindings: Option<crate::model_catalog::RoleBindings>,
 ) -> Result<String, String> {
+    let catalog_edit = catalog_edit_from_parts(
+        model.is_some(),
+        model_catalog,
+        default_model_route_id,
+        role_bindings,
+    )?;
     lifecycle.with_serialized(|| {
-        create_profile_inner(
+        create_profile_with_catalog_inner(
             &config::default_dir(),
             &template_id,
             &name,
             key.as_deref(),
             base_url.as_deref(),
             model.as_deref(),
+            catalog_edit,
         )
     })
 }
@@ -140,13 +251,74 @@ pub(crate) async fn update_profile_connection(
     api_format: Option<String>,
     model: Option<String>,
     key: Option<String>,
+    model_catalog: Option<Vec<crate::model_catalog::ModelRoute>>,
+    default_model_route_id: Option<String>,
+    role_bindings: Option<crate::model_catalog::RoleBindings>,
 ) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
     run_blocking_typed(move || {
         update_profile_connection_inner_cmd(
-            app, state, lifecycle, id, base_url, api_format, model, key,
+            app,
+            state,
+            lifecycle,
+            id,
+            base_url,
+            api_format,
+            model,
+            key,
+            model_catalog,
+            default_model_route_id,
+            role_bindings,
         )
+    })
+    .await
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn validate_profile_catalog_model(
+    app: tauri::AppHandle,
+    lifecycle: State<'_, SharedLifecycle>,
+    id: String,
+    model_reference: String,
+    base_url: Option<String>,
+    key: Option<String>,
+    model_catalog: Vec<crate::model_catalog::ModelRoute>,
+    role_bindings: crate::model_catalog::RoleBindings,
+) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking_typed(move || {
+        lifecycle.with_serialized(|| {
+            let cfg =
+                config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+            let mut candidate = cfg
+                .profile_by_id(&id)
+                .cloned()
+                .ok_or_else(|| format!("找不到 profile：{id}"))?;
+            if candidate.model_policy != crate::provider_contracts::ModelPolicy::SavedCatalog {
+                return Err(crate::commands::codex::RuntimeCommandError::from(
+                    "动态 Codex 目录不支持静态逐模型验证".to_string(),
+                ));
+            }
+            ConnectionEdit::new(base_url, None, None, key)
+                .with_catalog(Some(CatalogEdit {
+                    routes: model_catalog,
+                    default_model_route_id: model_reference,
+                    role_bindings,
+                }))
+                .apply(&mut candidate)?;
+            let validated = scratch_validate_candidate(&app, &candidate, None)?;
+            Ok(json!({
+                "validated": validated,
+                "status": if validated { "ok" } else { "unknown" },
+                "message": if validated {
+                    "该模型已通过隔离 scratch 请求验证。"
+                } else {
+                    "未能确认该模型；未修改配置。"
+                },
+            }))
+        })
     })
     .await
 }
@@ -161,7 +333,17 @@ fn update_profile_connection_inner_cmd(
     api_format: Option<String>,
     model: Option<String>,
     key: Option<String>,
+    model_catalog: Option<Vec<crate::model_catalog::ModelRoute>>,
+    default_model_route_id: Option<String>,
+    role_bindings: Option<crate::model_catalog::RoleBindings>,
 ) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
+    let catalog_edit = catalog_edit_from_parts(
+        model.is_some(),
+        model_catalog,
+        default_model_route_id,
+        role_bindings,
+    )
+    .map_err(crate::commands::codex::RuntimeCommandError::from)?;
     let preflight_cfg = config::load_from(&config::default_dir()).map_err(|e| e.to_string())?;
     let mut preflight_candidate = preflight_cfg
         .profile_by_id(&id)
@@ -172,8 +354,9 @@ fn update_profile_connection_inner_cmd(
         api_format.clone(),
         model.clone(),
         key.clone(),
-    );
-    preflight_edit.apply(&mut preflight_candidate);
+    )
+    .with_catalog(catalog_edit.clone());
+    preflight_edit.apply(&mut preflight_candidate)?;
     let target_adapter = resolve_launch_plan(&preflight_candidate)?.adapter;
     let active_adapter = preflight_cfg
         .active_profile()
@@ -217,8 +400,9 @@ fn update_profile_connection_inner_cmd(
                 api_format.clone(),
                 model.clone(),
                 key.clone(),
-            );
-            edit.apply(&mut candidate);
+            )
+            .with_catalog(catalog_edit.clone());
+            edit.apply(&mut candidate)?;
             let resolved = resolve_launch_plan(&candidate)?;
             reject_openai_custom_anthropic_base(&resolved.adapter, &candidate.base_url)?;
             // 保存前守卫（修 P2）：relay/自定义端点清空 base_url → 不可用连接（激活必失败）。
@@ -232,7 +416,7 @@ fn update_profile_connection_inner_cmd(
                 );
             }
             // 保存前守卫（修 #9 P1-a）：relay/自定义端点空 model → 无 force → 退回 passthrough（显示 claude）。
-            if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+            if resolved.model_policy == crate::provider_contracts::ModelPolicy::SavedCatalog
                 && candidate.model.trim().is_empty()
             {
                 return Err("中转 / 自定义端点必须选择或填写一个模型，连接未保存。".to_string());
@@ -250,17 +434,10 @@ fn update_profile_connection_inner_cmd(
                     Some(&edit),
                     prepared.as_ref().map(|prepared| prepared.proof()),
                 )?;
-                // 连接编辑：committed:false（scratch 分类失败）也如实作为错误上抛（磁盘未改、代理仍跑旧的）。
-                if v.get("committed").and_then(|b| b.as_bool()) == Some(false) {
-                    let hint = v
-                        .get("hint")
-                        .and_then(|h| h.as_str())
-                        .unwrap_or("连接校验未通过，连接未保存。")
-                        .to_string();
-                    return Err(hint);
-                }
-                // active：已连同起正式代理探活并落盘，视为已校验。
-                Ok(json!({ "validated": true }))
+                // Preserve the transaction's structured stage and recovery
+                // result. The UI must be able to distinguish restored from
+                // degraded instead of receiving a downgraded string error.
+                Ok(v)
             } else {
                 // 非 active：无正在服务的代理。先对候选做上游 scratch 校验（仅明确拒绝才拦，其余
                 // best-effort 落盘并如实标记「未校验」，修 P2-d：贴合设计「校验候选后提交」+ 如实报告），
@@ -270,14 +447,7 @@ fn update_profile_connection_inner_cmd(
                     &candidate,
                     prepared.as_ref().map(|prepared| prepared.proof()),
                 )?;
-                update_profile_connection_inner(
-                    &dir,
-                    &id,
-                    base_url.as_deref(),
-                    api_format.as_deref(),
-                    model.as_deref(),
-                    key.as_deref(),
-                )?;
+                persist_profile_candidate_inner(&dir, &id, &candidate)?;
                 Ok(json!({ "validated": validated }))
             }
         })
@@ -361,7 +531,10 @@ fn activation_preflight(
 
 #[cfg(test)]
 mod tests {
-    use super::{activation_preflight, clear_profile_key_cmd, delete_profile_cmd};
+    use super::{
+        activation_preflight, catalog_edit_from_parts, clear_profile_key_cmd, delete_profile_cmd,
+        require_preview_fingerprint,
+    };
     use crate::{
         config::{self, Config, Profile},
         lifecycle, lock, AppState, SharedAppState,
@@ -381,6 +554,14 @@ mod tests {
     }
 
     fn profile(id: &str, key: &str) -> Profile {
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog("deepseek", "anthropic", None).unwrap();
+        let model = model_catalog
+            .iter()
+            .find(|route| route.selector_id == default_model_route_id)
+            .unwrap()
+            .upstream_model
+            .clone();
         Profile {
             id: id.into(),
             name: id.into(),
@@ -389,6 +570,11 @@ mod tests {
             api_format: "anthropic".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             api_key: key.into(),
+            model,
+            model_catalog,
+            default_model_route_id,
+            role_bindings,
+            model_policy: crate::provider_contracts::ModelPolicy::SavedCatalog,
             ..Default::default()
         }
     }
@@ -503,5 +689,50 @@ mod tests {
             target,
             crate::commands::codex::CodexPreflightTarget::Profile(id) if id == "codex-profile"
         ));
+    }
+
+    #[test]
+    fn catalog_edit_requires_all_three_fields_and_rejects_legacy_mix() {
+        let route = crate::model_catalog::ModelRoute {
+            selector_id: "claude-csswitch-test-model-123456789abc".into(),
+            display_name: "Model".into(),
+            upstream_model: "model-upstream".into(),
+            supports_tools: Some(true),
+            ..Default::default()
+        };
+        let roles = crate::model_catalog::RoleBindings {
+            sonnet: route.selector_id.clone(),
+            opus: route.selector_id.clone(),
+            haiku: route.selector_id.clone(),
+            fable: route.selector_id.clone(),
+            ..Default::default()
+        };
+        assert!(catalog_edit_from_parts(false, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(catalog_edit_from_parts(
+            false,
+            Some(vec![route.clone()]),
+            Some(route.selector_id.clone()),
+            Some(roles.clone()),
+        )
+        .unwrap()
+        .is_some());
+        assert!(catalog_edit_from_parts(false, Some(vec![route.clone()]), None, None).is_err());
+        assert!(catalog_edit_from_parts(
+            true,
+            Some(vec![route]),
+            Some("claude-csswitch-test-model-123456789abc".into()),
+            Some(roles),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_preset_preview_fingerprint_is_rejected() {
+        let preview = serde_json::json!({ "preview_fingerprint": "fingerprint-a" });
+        assert!(require_preview_fingerprint(&preview, "fingerprint-a").is_ok());
+        assert!(require_preview_fingerprint(&preview, "fingerprint-b").is_err());
+        assert!(require_preview_fingerprint(&serde_json::json!({}), "fingerprint-a").is_err());
     }
 }

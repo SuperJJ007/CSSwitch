@@ -10,6 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock as mocklib
 
+import test.installed_provider_matrix as controller_module
 from test.installed_provider_matrix import (
     CASE_DEFINITIONS,
     CONTROLLER_SCHEMA,
@@ -29,6 +30,7 @@ from test.installed_provider_matrix import (
     _scrub_error,
     build_case_scenario,
 )
+from test.model_catalog_coverage_acceptance import strict_route_checks
 
 
 class FakeInspector:
@@ -53,6 +55,17 @@ class FakeInspector:
 
     def children(self, parent_pid):
         return [record for record in self.records if record.ppid == parent_pid]
+
+
+class FakePortReservation:
+    next_port = 43100
+
+    def __init__(self):
+        self.port = type(self).next_port
+        type(self).next_port += 1
+
+    def release(self):
+        return None
 
 
 class InstalledProviderMatrixTests(unittest.TestCase):
@@ -125,6 +138,40 @@ class InstalledProviderMatrixTests(unittest.TestCase):
                 for step in silicon.steps[1:]
             )
         )
+
+    def test_acceptance_bundle_and_data_root_can_be_selected_explicitly(self):
+        info_path = self.app_bundle / "Contents/Info.plist"
+        with info_path.open("rb") as handle:
+            info = plistlib.load(handle)
+        info["CFBundleIdentifier"] = "com.csswitch.test"
+        with info_path.open("wb") as handle:
+            plistlib.dump(info, handle)
+        with mocklib.patch.object(controller_module, "LoopbackPortReservation", FakePortReservation):
+            session = InstalledProviderSession(
+                "qwen-chat",
+                root=self.base / "acceptance-root",
+                app_bundle=self.app_bundle,
+                allow_test_bundle=True,
+                expected_bundle_id="com.csswitch.test",
+                config_dir_name=".csswitch-acceptance",
+                inspector=FakeInspector(),
+                scenario_control=InProcessScenarioControl(
+                    build_case_scenario(CASE_DEFINITIONS["qwen-chat"])
+                ),
+            )
+        self.addCleanup(session.close)
+        self.assertEqual(session.csswitch_dir, session.home / ".csswitch-acceptance")
+
+    def test_controller_rejects_arbitrary_data_root_names(self):
+        with self.assertRaisesRegex(ControllerError, "unsupported config data root"):
+            InstalledProviderSession(
+                "qwen-chat",
+                root=self.base / "unsafe-root",
+                app_bundle=self.app_bundle,
+                allow_test_bundle=True,
+                config_dir_name=".somewhere-else",
+                inspector=FakeInspector(),
+            )
 
     def test_workspace_config_and_wrappers_are_private_and_redacted_from_plan(self):
         with self._session("custom-chat") as session:
@@ -592,6 +639,55 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             ["enter_phase", "status", "wait", "stop"],
         )
         self.assertFalse((evidence / "ready-token.json").exists())
+
+    def test_coverage_strict_routes_consume_phases_and_send_exact_selector(self):
+        class FakeMock:
+            def __init__(self):
+                self.requests = []
+
+            def status(self):
+                return {"requests": list(self.requests)}
+
+        class FakeCoverageSession:
+            def __init__(self):
+                self._mock = FakeMock()
+                self.phases = []
+                self.models = []
+
+            def enter_phase(self, phase):
+                self.phases.append(phase)
+
+            def finish_phase(self, phase):
+                return {"phase": phase, "ok": True}
+
+            def send_formal(self):
+                self._mock.requests.append({"model": "qwen3.7-max"})
+                return {"status": 200}
+
+            def _http_request(self, method, path, *, body=None, headers=None, timeout=4.0):
+                del method, path, headers, timeout
+                payload = json.loads(body or b"{}")
+                model = payload.get("model")
+                self.models.append(model)
+                if model == "claude-csswitch-codex-stale-should-fail":
+                    return 400, {}, b'{"error":{"type":"route_unknown"}}'
+                self._mock.requests.append({"model": "qwen3.7-max"})
+                return 200, {}, b"{}"
+
+        session = FakeCoverageSession()
+        selector = "claude-csswitch-qwen-qwen3-7-max-0123456789ab"
+        result = strict_route_checks(
+            session,
+            exact_selector=selector,
+            expected_upstream="qwen3.7-max",
+        )
+        self.assertEqual(
+            session.phases,
+            ["discovery", "scratch", "formal", "reuse", "restart"],
+        )
+        self.assertEqual(session.models.count(selector), 4)
+        self.assertEqual(result["unknown_status"], 400)
+        self.assertEqual(result["unknown_upstream_requests"], 0)
 
 
 if __name__ == "__main__":

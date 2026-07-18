@@ -6,8 +6,10 @@ pub struct GatewayConfig {
     pub api_key: Option<String>,
     pub upstream_url: String,
     pub models_url: Option<String>,
-    pub forced_model: Option<String>,
     pub relay_thinking: Option<String>,
+    pub intent: GatewayIntent,
+    /// Non-Codex profiles receive a validated, non-sensitive selector snapshot.
+    pub static_model_resolver: Option<crate::static_profile::StaticProfileResolver>,
     pub shim_mode: String,
     /// CSSwitch-owned auth state root. Present only for Codex; OAuth secrets
     /// themselves remain in CSSwitch private auth files.
@@ -28,6 +30,34 @@ pub struct GatewayConfig {
     /// plane. A gateway without this context still serves inference traffic but
     /// does not install Skills.
     pub science_host_context: Option<csswitch_skill_install_core::ScienceHostContext>,
+}
+
+pub const GATEWAY_INTENT_ENV: &str = "CSSWITCH_GATEWAY_INTENT";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GatewayIntent {
+    Formal,
+    ScratchModels,
+    ScratchMessage,
+}
+
+impl GatewayIntent {
+    fn from_env() -> Result<Self, String> {
+        match std::env::var(GATEWAY_INTENT_ENV).ok().as_deref() {
+            None | Some("") | Some("formal") => Ok(Self::Formal),
+            Some("scratch-models") => Ok(Self::ScratchModels),
+            Some("scratch-message") => Ok(Self::ScratchMessage),
+            Some(_) => Err(format!("{GATEWAY_INTENT_ENV} 非法")),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Formal => "formal",
+            Self::ScratchModels => "scratch-models",
+            Self::ScratchMessage => "scratch-message",
+        }
+    }
 }
 
 pub const UPSTREAM_UA: &str = "CSSwitch/0.2 (+https://github.com/SuperJJ007/CSSwitch)";
@@ -192,7 +222,6 @@ impl GatewayConfig {
             .or(auth_token_arg)
             .filter(|v| !v.is_empty());
         let mut models_url = None;
-        let mut forced_model = None;
         let mut relay_thinking = None;
         let default_upstream = if provider == "openai-custom" || provider == "openai-responses" {
             let base = std::env::var("CSSWITCH_OPENAI_BASE_URL")
@@ -203,10 +232,6 @@ impl GatewayConfig {
                 })
                 .ok_or_else(|| format!("{provider} 需要 CSSWITCH_OPENAI_BASE_URL=http(s)://..."))?;
             models_url = Some(openai_endpoint(&base, "/models"));
-            forced_model = std::env::var("CSSWITCH_OPENAI_MODEL")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
             let suffix = if provider == "openai-responses" {
                 "/responses"
             } else {
@@ -222,10 +247,6 @@ impl GatewayConfig {
                 })
                 .ok_or("relay 需要 CSSWITCH_RELAY_BASE_URL=http(s)://...")?;
             models_url = Some(format!("{base}/v1/models"));
-            forced_model = std::env::var("CSSWITCH_RELAY_MODEL")
-                .ok()
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty());
             relay_thinking = std::env::var("CSSWITCH_RELAY_THINKING")
                 .ok()
                 .map(|v| v.trim().to_string())
@@ -301,6 +322,32 @@ impl GatewayConfig {
         {
             return Err("Science host context 与 Skill data-dir 不一致".into());
         }
+        let static_model_resolver = std::env::var(crate::static_profile::ENV_NAME)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| crate::static_profile::StaticProfileResolver::from_json(&value))
+            .transpose()?;
+        let intent = GatewayIntent::from_env()?;
+        if provider == "codex" {
+            if static_model_resolver.is_some() {
+                return Err("Codex 禁止注入静态模型目录".into());
+            }
+        } else {
+            match intent {
+                GatewayIntent::Formal | GatewayIntent::ScratchMessage => {
+                    let resolver = static_model_resolver.as_ref().ok_or_else(|| {
+                        format!("{provider} 缺少 {}", crate::static_profile::ENV_NAME)
+                    })?;
+                    if resolver.adapter() != provider {
+                        return Err("静态模型目录 adapter 与 gateway provider 不一致".into());
+                    }
+                }
+                GatewayIntent::ScratchModels if static_model_resolver.is_some() => {
+                    return Err("scratch-models 禁止注入静态模型目录".into());
+                }
+                GatewayIntent::ScratchModels => {}
+            }
+        }
         Ok(Self {
             provider,
             port: port.ok_or("--port 必填")?,
@@ -308,8 +355,9 @@ impl GatewayConfig {
             api_key,
             upstream_url,
             models_url,
-            forced_model,
             relay_thinking,
+            intent,
+            static_model_resolver,
             shim_mode: shim.to_string(),
             codex_state_root,
             codex_contract,

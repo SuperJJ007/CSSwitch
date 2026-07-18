@@ -1,4 +1,10 @@
 import { CODEX_AUTH_REASONS, formatCodexAuthCommandError, parseCodexAuthCommandError } from "./codex-auth-protocol.js";
+import { RUNTIME_STATUS_LABELS, aggregateRuntimeStatus, normalizeRuntimeLight } from "./runtime-status-state.js";
+import {
+  buildSimpleModelSubmission,
+  mergeCatalogCandidates,
+  projectSimpleModelFields,
+} from "./model-catalog-state.js";
 
 // CSSwitch 桌面面板前端。只调用后端 Tauri command，绝不碰任何密钥落盘逻辑。
 // 后端只把 key 的【掩码】回显给这里；完整 key 永不进前端。
@@ -15,13 +21,15 @@ import { CODEX_AUTH_REASONS, formatCodexAuthCommandError, parseCodexAuthCommandE
 // 让界面能完整渲染。真实 app 里 window.__TAURI__ 存在，走真后端，此兜底不生效。
 const PREVIEW = !window.__TAURI__;
 const QUERY = new URLSearchParams(window.location.search);
-const PROTOTYPE_ENABLED = QUERY.get("prototype") === "skills-mcp";
+const SKILLS_PREVIEW = PREVIEW && QUERY.get("page") === "skills";
+const PROFILE_INTERACTIVE_PREVIEW = PREVIEW && QUERY.get("profile_preview") === "1";
 const PREVIEW_CODEX = PREVIEW && QUERY.get("codex") === "1";
 const PREVIEW_CODEX_STALE = PREVIEW && QUERY.get("catalog") === "stale";
 const PREVIEW_CODEX_NETWORK = PREVIEW && QUERY.get("catalog") === "network";
 const PREVIEW_CONFIG_REFRESH_FAIL = PREVIEW && QUERY.get("config_refresh") === "fail";
 const PREVIEW_SLOW_ACTIVATION = PREVIEW && QUERY.get("activation") === "slow";
 const PREVIEW_RUNTIME_CACHE = PREVIEW && QUERY.get("runtime") === "cache";
+const PREVIEW_BROWSER_FAIL = PREVIEW && QUERY.get("browser") === "fail";
 const invoke = PREVIEW
   ? (cmd, args) => mockInvoke(cmd, args)
   : window.__TAURI__.core.invoke;
@@ -47,6 +55,20 @@ const MOCK_TEMPLATES = [
   { id: "custom-openai-responses", name: "自定义 OpenAI Responses", category: "custom", api_format: "openai_responses", adapter: "openai-responses", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], icon: "custom", icon_color: "#0F766E", website_url: "" },
   { id: "custom", name: "自定义 Anthropic", category: "custom", api_format: "anthropic", adapter: "relay", base_url: "", base_url_editable: true, requires_model_override: true, builtin_models: [], icon: "custom", icon_color: "#6B7280", website_url: "" },
 ];
+for (const template of MOCK_TEMPLATES) {
+  if (!template.recommended_catalog && template.builtin_models?.length) {
+    template.preset_catalog_id = template.id;
+    template.model_catalog_source = "preset";
+    template.recommended_catalog = template.builtin_models.map((id) => ({
+      selector_id: "", display_name: id, upstream_model: id, supports_tools: null,
+    }));
+    template.recommended_default_model_route_id = template.builtin_models[0];
+    template.recommended_role_bindings = {
+      sonnet: template.builtin_models[0], opus: template.builtin_models[0],
+      haiku: template.builtin_models.at(-1), fable: template.builtin_models[0],
+    };
+  }
+}
 const mockStore = {
   schema_version: 3,
   active_id: PREVIEW_CODEX ? "p-codex" : "p-demo1",
@@ -65,6 +87,33 @@ const mockStore = {
     ...(PREVIEW_CODEX ? [{ id: "p-codex", name: "我的 Codex", template_id: "codex", category: "experimental", api_format: "openai_responses", base_url: "", model: "", key: "", has_key: false, has_credential: true, credential_source: "csswitch_oauth", model_policy: "dynamic_catalog", capabilities: MOCK_CODEX_CAPABILITIES, icon: "custom", icon_color: "#111827", website_url: "https://developers.openai.com/codex/", sort_index: 4, notes: "" }] : []),
   ],
 };
+const MOCK_SKILLS = [
+  { skill_id: "csswitch-external-skill-tools", display_name: "CSSwitch external Skill tools", description: "外部 Skill 安装与卸载的 CSSwitch 系统路由。", source_kind: "csswitch_system", bundle_name: null, attachment_state: "attached" },
+  { skill_id: "internal-comms", display_name: "Internal communications", description: "从 GitHub 安装的团队沟通写作 Skill。", source_kind: "csswitch_github", bundle_name: null, attachment_state: "attached" },
+  { skill_id: "research-workflow", display_name: "Research workflow", description: "从本地 Skill 包导入的研究流程。", source_kind: "csswitch_local", bundle_name: "research-kit", attachment_state: "detached" },
+  { skill_id: "pdf", display_name: "PDF", description: "当前 Science 组织中发现的文档处理 Skill。", source_kind: "science_local", bundle_name: null, attachment_state: "attached" },
+  { skill_id: "legacy-notes", display_name: "Legacy notes", description: "来源标记不完整，因此 CSSwitch 不推断分发方。", source_kind: "unverified", bundle_name: null, attachment_state: "detached" },
+];
+const mockImportedSkills = [];
+function mockSkillListEnvelope() {
+  const scenario = QUERY.get("skills") || "healthy";
+  const stopped = scenario === "stopped";
+  const unverified = scenario === "unverified";
+  const empty = scenario === "empty";
+  const items = empty ? [] : [...MOCK_SKILLS, ...mockImportedSkills].map((item) => ({
+    ...item,
+    attachment_state: stopped || unverified ? "unknown" : item.attachment_state,
+  }));
+  return {
+    schema_version: 1,
+    science_state: stopped ? "stopped" : unverified ? "unverified" : "running_healthy",
+    active_org_state: "ready",
+    attachment_readback: stopped ? "unavailable" : unverified ? "failed" : "verified",
+    agent_name: "OPERON",
+    items,
+    warnings: scenario === "warning" ? [{ code: "SKILL_SOURCE_UNVERIFIED", skill_id: "legacy-notes", message: "一个 Skill 的来源标记无法验证" }] : [],
+  };
+}
 let mockCodexAuth = {
   authenticated: PREVIEW_CODEX, account_hash: PREVIEW_CODEX ? "0123456789abcdef0123456789abcdef" : null,
   expiry_state: PREVIEW_CODEX ? "valid" : "missing", expires_at: PREVIEW_CODEX ? 1893456000 : null,
@@ -105,7 +154,17 @@ function mockInvoke(cmd, args) {
         codex_network: { ...mockStore.codex_network },
         codex_network_resolved: { ...mockStore.codex_network_resolved },
         mode: mockStore.mode, templates: MOCK_TEMPLATES.filter((t) => t.id !== "codex" || mockStore.experimental_codex_enabled),
-        profiles: mockStore.profiles.map((p) => ({ ...p })),
+        profiles: mockStore.profiles.map((p) => {
+          const template = MOCK_TEMPLATES.find((item) => item.id === p.template_id) || {};
+          const modelCatalog = p.model_catalog || (template.recommended_catalog || []).map((route) => ({ ...route }));
+          return {
+            ...p,
+            model_catalog: modelCatalog,
+            model_count: modelCatalog.length,
+            default_model_route_id: p.default_model_route_id || p.model || modelCatalog[0]?.upstream_model || "",
+            role_bindings: p.role_bindings || { ...(template.recommended_role_bindings || {}) },
+          };
+        }),
       });
     case "list_templates":
       return Promise.resolve(MOCK_TEMPLATES.filter((t) => t.id !== "codex" || mockStore.experimental_codex_enabled));
@@ -115,7 +174,10 @@ function mockInvoke(cmd, args) {
       mockStore.profiles.push({
         id, name: args.name || t.name || "新配置", template_id: args.templateId,
         category: t.category || "custom", api_format: t.api_format || "anthropic",
-        base_url: args.baseUrl || t.base_url || "", model: args.model || "",
+        base_url: args.baseUrl || t.base_url || "", model: args.model || args.modelCatalog?.[0]?.upstream_model || "",
+        model_catalog: (args.modelCatalog || t.recommended_catalog || []).map((route) => ({ ...route })),
+        default_model_route_id: args.defaultModelRouteId || args.model || "",
+        role_bindings: args.roleBindings || { ...(t.recommended_role_bindings || {}) },
         key: mockMask(args.key || ""), model_options: [...(t.builtin_models || [])], icon: t.icon, icon_color: t.icon_color,
         website_url: t.website_url, sort_index: mockStore.profiles.length + 1, notes: "",
       });
@@ -132,6 +194,13 @@ function mockInvoke(cmd, args) {
       if (!p) return Promise.reject("找不到 profile：" + args.id);
       if (args.baseUrl != null) p.base_url = args.baseUrl;
       if (args.model != null) p.model = args.model;
+      if (args.modelCatalog) {
+        p.model_catalog = args.modelCatalog.map((route) => ({ ...route }));
+        p.default_model_route_id = args.defaultModelRouteId;
+        p.role_bindings = { ...args.roleBindings };
+        const selected = p.model_catalog.find((route) => route.selector_id === args.defaultModelRouteId || route.upstream_model === args.defaultModelRouteId);
+        p.model = selected?.upstream_model || p.model_catalog[0]?.upstream_model || "";
+      }
       if (args.key) p.key = mockMask(args.key);
       return Promise.resolve({ validated: true });
     }
@@ -169,7 +238,25 @@ function mockInvoke(cmd, args) {
           age_seconds: PREVIEW_CODEX_STALE ? 7420 : 0,
         });
       }
-      return Promise.resolve({ models: [{ id: "glm-4.6", supports_tools: true }, { id: "glm-5", supports_tools: null }], source: "live", error_kind: null, upstream_status: 200 });
+      return Promise.resolve({ models: [{ id: "glm-4.6", display_name: "GLM 4.6", supports_tools: true, origin: "discovered", availability: "available" }, { id: "glm-5", display_name: "GLM 5", supports_tools: null, origin: "discovered", availability: "available" }], source: "live", error_kind: null, upstream_status: 200 });
+    case "preview_profile_preset_sync": {
+      const p = mockStore.profiles.find((x) => x.id === args.id);
+      const t = MOCK_TEMPLATES.find((x) => x.id === p?.template_id);
+      if (!p || !t?.recommended_catalog) return Promise.reject("该配置没有推荐目录");
+      return Promise.resolve({
+        profile_id: p.id, preset_catalog_id: t.id,
+        additions: t.recommended_catalog.map((r) => r.upstream_model).filter((id) => !(p.model_catalog || []).some((r) => r.upstream_model === id)),
+        removals: (p.model_catalog || []).map((r) => r.upstream_model).filter((id) => !t.recommended_catalog.some((r) => r.upstream_model === id)),
+        model_catalog: t.recommended_catalog.map((r) => ({ ...r })),
+        default_model_route_id: t.recommended_default_model_route_id,
+        role_bindings: { ...t.recommended_role_bindings },
+        preview_fingerprint: "a".repeat(64), requires_confirmation: true,
+      });
+    }
+    case "apply_profile_preset_sync":
+      return Promise.resolve({ committed: true, status: "ok", message: "已同步最新推荐。" });
+    case "validate_profile_catalog_model":
+      return Promise.resolve({ validated: true, status: "ok", message: "该模型已通过隔离 scratch 请求验证。" });
     case "set_experimental_codex_enabled":
       mockStore.experimental_codex_enabled = !!args.enabled;
       if (PREVIEW_CONFIG_REFRESH_FAIL) mockStore.fail_next_get_config = true;
@@ -209,7 +296,7 @@ function mockInvoke(cmd, args) {
     }
     case "codex_downgrade_preview": {
       const profiles = mockStore.profiles.filter((p) => p.credential_source === "csswitch_oauth");
-      return Promise.resolve({ schema_version: 1, action: "export_then_remove_all", profile_count: profiles.length, profiles: profiles.map((p) => ({ id: p.id, name: p.name })), active_will_clear: profiles.some((p) => p.id === mockStore.active_id), credentials_unchanged: true, app_exit_required: true });
+      return Promise.resolve({ schema_version: 1, action: "export_then_remove_all", profile_count: profiles.length, profiles: profiles.map((p) => ({ id: p.id, name: p.name })), active_will_clear: profiles.some((p) => p.id === mockStore.active_id), catalog_export_count: 0, preview_fingerprint: "preview-mock-v1", credentials_unchanged: true, app_exit_required: true });
     }
     case "codex_downgrade_export_all":
       return Promise.resolve({ schema_version: 1, status: "CANCELLED", credentials_unchanged: true });
@@ -224,17 +311,32 @@ function mockInvoke(cmd, args) {
       mockStore.mode = args.mode;
       return Promise.resolve(null);
     case "one_click_login":
-      return Promise.resolve({ msg: "（预览模式：假装已就绪）", action: "started" });
+      return Promise.resolve(PREVIEW_BROWSER_FAIL
+        ? {
+            msg: "（预览模式：服务已就绪；自动打开失败。）",
+            action: "started", stage: "complete", status: "ok", recovery_status: "not_needed",
+            fallback_url: "http://127.0.0.1:8990/?nonce=preview-fallback",
+          }
+        : { msg: "（预览模式：假装已就绪）", action: "started", stage: "complete", status: "ok", recovery_status: "not_needed", fallback_url: null });
     case "science_runtime_preflight":
       return Promise.resolve(PREVIEW_RUNTIME_CACHE
         ? { status: "cached_choice_required", selected_source: null, selected_version: null, cached_version: "0.0.0-preview-cache", download_url: "https://claude.com/download" }
         : { status: "installed_ready", selected_source: "installed_app", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
     case "install_local_skill_package":
-      return Promise.resolve({ schema_version: 2, status: "BUNDLE_INSTALLED_ATTACHED", package_kind: "bundle", bundle_name: "demo-bundle", skill_names: ["demo-skill", "demo-reader"], attach_verified: true, message: "bundle 文件已安装并绑定 OPERON。" });
+      if (!mockImportedSkills.some((item) => item.skill_id === "demo-reader")) {
+        mockImportedSkills.push({ skill_id: "demo-reader", display_name: "Demo reader", description: "刚刚从本地包导入的示例 Skill。", source_kind: "csswitch_local", bundle_name: "demo-bundle", attachment_state: "attached" });
+      }
+      return Promise.resolve({ schema_version: 2, status: "BUNDLE_INSTALLED_ATTACHED", package_kind: "bundle", bundle_name: "demo-bundle", skill_names: ["demo-reader"], attach_verified: true, directory_commit: true, message: "bundle 文件已安装并绑定 OPERON。" });
+    case "list_installed_skills":
+      if (QUERY.get("skills") === "error") return Promise.reject("预览注入：Skill 列表读取失败");
+      return Promise.resolve(mockSkillListEnvelope());
     case "open_science_download_page":
       return Promise.resolve(null);
     case "status":
-      return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
+      if (QUERY.get("status") === "error") return Promise.reject(new Error("预览注入：运行状态查询失败"));
+      if (QUERY.get("status") === "partial") return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "amber" });
+      if (QUERY.get("status") === "stopped") return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
+      return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "green" });
     case "boot_error":
       return Promise.resolve(null);
     case "app_version":
@@ -254,10 +356,13 @@ let busyOp = null;
 let activationInFlight = false;
 let activationOp = null;
 let busyMsgTimers = [];
+let browserOpenInFlight = false;
 let doctorInFlight = false;
 let statusRecoveryMsg = "";
+let skillPage = null;
 let runtimeChoiceActiveId = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
+let officialRuntimeState = "gray";
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
 let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
 let codexAuthState = null;          // 仅保存后端脱敏状态；绝不包含 token / email
@@ -267,6 +372,10 @@ let codexProfileRepairNeeded = false;
 let codexNetworkSaving = false;
 let pendingSkipActivateId = null;   // set_active 校验含糊时，允许「跳过验证」再切
 let pendingConfirm = null;          // 危险操作（清 key / 删除）的「再点一次确认」态
+let wizardCatalog = [];
+let connectionCatalog = [];
+let wizardRoleRefs = { quality: "", balanced: "", fast: "" };
+let connectionRoleRefs = { quality: "", balanced: "", fast: "" };
 
 const CAT_LABELS = { official: "官方", cn_official: "国内", custom: "自定义", experimental: "实验" };
 const MODEL_FAMILY_ICONS = {
@@ -338,22 +447,34 @@ const PAGE_META = {
   settings: ["", "设置", ""],
 };
 
-function applyTheme(theme) {
+const THEME_STORAGE_KEY = "csswitch-theme";
+
+function savedTheme() {
+  try {
+    return window.localStorage?.getItem(THEME_STORAGE_KEY) || "";
+  } catch (_) {
+    return "";
+  }
+}
+
+function applyTheme(theme, { persist = true } = {}) {
   const value = theme === "dark" ? "dark" : "light";
   document.documentElement.dataset.theme = value;
   if (els.themeBtn) els.themeBtn.textContent = value === "dark" ? "切换浅色主题" : "切换深色主题";
-  try { localStorage.setItem("csswitch-theme", value); } catch (_) {}
+  if (persist) {
+    try { window.localStorage?.setItem(THEME_STORAGE_KEY, value); } catch (_) {}
+  }
 }
 
 function setPage(page) {
   if (page === "profiles") page = "switch";
-  if (page === "skills" && !PROTOTYPE_ENABLED) page = "switch";
   const meta = PAGE_META[page] || PAGE_META.switch;
   document.querySelectorAll("[data-page]").forEach((node) => node.classList.toggle("active", node.dataset.page === page));
   document.querySelectorAll("[data-page-target]").forEach((node) => node.classList.toggle("active", node.dataset.pageTarget === page));
   if (els.pageEyebrow) els.pageEyebrow.textContent = meta[0];
   if (els.pageTitle) els.pageTitle.textContent = meta[1];
   if (els.pageSubtitle) els.pageSubtitle.textContent = meta[2];
+  if (page === "skills") skillPage?.ensureLoaded();
 }
 
 async function configureDesktopWindow() {
@@ -373,9 +494,9 @@ function renderCurrentSummary() {
   if (mode === "official") {
     updateModelIcon(els.currentProfileIcon, { template_id: "anthropic" });
     els.currentProfileName.textContent = "官方 Claude";
-    els.currentProfileState.textContent = "官方订阅";
-    els.currentProfileState.className = "state-pill success";
-    els.currentRouteMode.textContent = "官方直连";
+    els.currentProfileState.textContent = "官方模式";
+    els.currentProfileState.className = "state-pill neutral";
+    els.currentRouteMode.textContent = "由 Science 管理";
     els.currentProfileModel.textContent = "Claude Science";
     els.currentProfileMeta.textContent = "订阅与登录由 Claude Science 管理";
     return;
@@ -394,10 +515,13 @@ function renderCurrentSummary() {
   const hasKey = typeof profile.has_key === "boolean" ? profile.has_key : !!profile.key;
   updateModelIcon(els.currentProfileIcon, profile);
   els.currentProfileName.textContent = profile.name || "未命名配置";
-  els.currentProfileState.textContent = "当前生效";
-  els.currentProfileState.className = "state-pill success";
+  const codexDisabled = isCodexSource(profile) && !configState.experimental_codex_enabled;
+  els.currentProfileState.textContent = codexDisabled ? "入口已关闭" : "当前配置";
+  els.currentProfileState.className = "state-pill neutral";
   els.currentProfileModel.textContent = profile.model || modelSummary(profile);
-  els.currentProfileMeta.textContent = profile.base_url || (hasKey ? "Key 已保存" : "未填写端点");
+  els.currentProfileMeta.textContent = isCodexSource(profile)
+    ? "CSSwitch OAuth · 账号动态模型目录"
+    : (profile.base_url || (hasKey ? "Key 已保存" : "未填写端点"));
 }
 
 // ── 模型能力（纯函数，无 DOM）：native 映射 / relay 跟随 / relay 固定 / 账号动态目录。──
@@ -445,8 +569,7 @@ function profileCapabilitySource(p, t) {
     capabilities: p.capabilities,
   };
 }
-// 来源提示：据「地址是否可编辑 + 模型能力」生成，不能只看 category
-// （OpenRouter 的 category 是 custom，但地址只读、模型可跟随；只看 category 会误导）。
+// 来源提示：据「地址是否可编辑 + 模型能力」生成，不能只看 category。
 function sourceHint(t) {
   if (!t) return "选择来源后按提示填写。";
   if (isCodexSource(t)) {
@@ -454,34 +577,33 @@ function sourceHint(t) {
   }
   // 真·自定义（可编辑且无预设地址）才叫「自定义端点」；预设虽可编辑但有官方默认，另行描述。
   if (t.base_url_editable && !t.base_url && t.api_format === "openai_chat") {
-    return "自定义 OpenAI Chat Completions 兼容端点：填 base root、key 与模型，经代理转换协议。";
+    return "自定义 OpenAI Chat Completions 兼容端点：填 base root、key 与模型名称，经代理转换协议。";
   }
   if (t.base_url_editable && !t.base_url && t.api_format === "openai_responses") {
-    return "自定义 OpenAI Responses 兼容端点：填 base root、key 与模型，经代理转换协议。";
+    return "自定义 OpenAI Responses 兼容端点：填 base root、key 与模型名称，经代理转换协议。";
   }
-  if (t.base_url_editable && !t.base_url) return "自定义 Anthropic 兼容端点：填地址与 key，用「获取模型」列出并选一个。";
+  if (t.base_url_editable && !t.base_url) return "自定义 Anthropic 兼容端点：填写地址、key 和供应商提供的精确模型 ID。";
   const cap = modelCapability(t);
   if (cap === CAP.NATIVE) {
     // deepseek 是原生 Anthropic 透传；qwen 经代理做 Anthropic↔OpenAI 转换，别都叫「直连」。
     return t.api_format === "openai_chat" || t.api_format === "openai_responses"
-      ? "官方端点（经代理转换协议）：填 API Key 即可，地址与模型都已内置。"
-      : "官方原生端点（无需转换）：填 API Key 即可，地址与模型都已内置。";
+      ? "官方端点（经代理转换协议）：填 API Key 即可，地址与推荐模型已内置。"
+      : "官方原生端点（无需转换）：填 API Key 即可，地址与推荐模型已内置。";
   }
   // 预设地址可编辑：默认已填好官方地址，套餐/区域端点可改（如小米 token plan）。
   const addr = t.base_url_editable ? "地址已预填官方默认（套餐 / 区域端点可改）" : "地址已预设";
-  if (cap === CAP.FOLLOW) return `填 API Key 即可，${addr}，模型默认跟随 Science。`;
-  return `填 API Key 并选一个模型，${addr}。`;
+  if (cap === CAP.FOLLOW) return `填 API Key 即可，${addr}；模型可从推荐中选择或自由填写。`;
+  return `填 API Key 和精确模型 ID，${addr}。`;
 }
 const MODEL_HINT = {
-  native: "由 Science 选择器 + 内置映射自动选择（opus 深度 / haiku 快速）。",
-  follow: "留空＝跟随 Science 选择器（保留 opus/haiku 各档）；选一个＝固定用于所有请求。",
-  fixed: "该来源需选一个模型（不认 claude-*，将用于所有请求含后台任务）。",
+  native: "推荐模型只是初始建议；四个模型框都允许自由填写精确模型 ID。",
+  follow: "可以选择推荐模型，也可以直接填写供应商或中转站提供的精确模型 ID。",
+  fixed: "默认模型必填；质量、快速与 Fable 留空时自动继承。",
   dynamic: "这里只读取账号目录，不保存固定模型。启动 Science 后请在 More models 选择 Codex / …。",
 };
-const PROXY_UNHEALTHY_MSG = "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。";
+const PROXY_UNHEALTHY_MSG = "代理进程不可达或已退出，请点击「一键开始」恢复。";
 
-// 据能力渲染模型字段。native：只读信息 + 隐藏下拉/获取按钮，但把既有 model 留在隐藏下拉里
-// （避免保存时被空值覆盖，守「零运行语义变化」）；relay：走下拉。
+// 静态 provider 展示四个自由模型输入；Codex 动态账号目录保持只读。
 function applyModelCapability(t, ui, currentModel) {
   const cap = modelCapability(t);
   const listId = ui.sel.getAttribute("list");
@@ -496,21 +618,13 @@ function applyModelCapability(t, ui, currentModel) {
     ui.hint.textContent = "模型选择权保留给 Science；CSSwitch 不会静默固定某一个 Codex 模型。";
     return cap;
   }
-  if (cap === CAP.NATIVE) {
-    // native：控件隐藏，保留 profile 既有 model（connSave/wizSave 读回原值不清空），不写回任何默认/壳。
-    ui.info.textContent = MODEL_HINT.native;
-    ui.info.hidden = false;
-    ui.sel.hidden = true;
-    ui.sel.value = currentModel || "";
-    if (dl) dl.innerHTML = "";
-    if (ui.fetchBtn) { ui.fetchBtn.hidden = true; ui.fetchBtn.textContent = "获取模型"; }
-    ui.hint.textContent = "";
-    return cap;
-  }
-  // relay（FIXED）：input + datalist 候选（内置精选 + 可自填）；预填旗舰默认或既有值。
-  ui.info.hidden = true;
+  // 静态 provider 统一使用四个自由输入框；推荐项只作为 datalist 建议。
+  ui.info.textContent = cap === CAP.NATIVE ? MODEL_HINT.native : "";
+  ui.info.hidden = cap !== CAP.NATIVE;
   ui.sel.hidden = false;
-  if (ui.fetchBtn) { ui.fetchBtn.hidden = false; ui.fetchBtn.textContent = "获取模型"; }
+  if (ui.fetchBtn) {
+    ui.fetchBtn.hidden = true;
+  }
   const builtin = ((t && t.builtin_models) || []).slice();
   if (currentModel && !builtin.includes(currentModel)) builtin.unshift(currentModel);
   const models = builtin.map((id) => ({ id, supports_tools: null }));
@@ -525,28 +639,30 @@ function setMsg(text, kind) {
   const t = text && text !== "就绪。" ? text : "";
   els.msg.textContent = t;
   els.msg.className = "msg" + (kind ? " " + kind : "");
-  els.msg.parentElement.hidden = !t;
-  // 表单视图里反馈区可能落在折叠线以下：给出结果（ok/err）时滚到可见；
-  // 中性提示（无 kind，多为打开表单时）不滚，避免把页面拽到底部。
-  if (t && kind && els.panel && els.panel.classList.contains("view-form")) {
-    els.msg.scrollIntoView({ block: "nearest" });
-  }
+  els.msg.parentElement.hidden = !t && (!els.browserFallback || els.browserFallback.hidden);
+}
+
+function setBrowserFallback(url) {
+  const value = typeof url === "string" ? url.trim() : "";
+  els.browserFallbackUrl.value = value;
+  els.browserFallback.hidden = !value;
+  els.msg.parentElement.hidden = !value && !els.msg.textContent;
 }
 
 function setLight(el, s) {
-  const cls = { green: "g", amber: "a", red: "r" }[s] || "a";
-  el.className = "lt " + cls;
+  const cls = { green: "g", amber: "a", red: "r", gray: "", unknown: "" }[normalizeRuntimeLight(s)];
+  el.className = "lt" + (cls ? " " + cls : "");
   document.querySelectorAll('[data-mirror-light="' + el.id + '"]').forEach((node) => {
-    node.className = "lt " + cls;
+    node.className = "lt" + (cls ? " " + cls : "");
   });
 }
 
 function setStatusText(id, status) {
-  const labels = { green: "运行正常", amber: "等待 / 未运行", red: "需要处理" };
+  const normalized = normalizeRuntimeLight(status);
   const node = $(id);
-  if (node) node.textContent = labels[status] || labels.amber;
+  if (node) node.textContent = RUNTIME_STATUS_LABELS[normalized];
   document.querySelectorAll('[data-mirror-text="' + id + '"]').forEach((mirror) => {
-    mirror.textContent = labels[status] || labels.amber;
+    mirror.textContent = RUNTIME_STATUS_LABELS[normalized];
   });
 }
 
@@ -593,7 +709,8 @@ function syncProfileBusyState() {
     row.classList.toggle("pworking", isTarget);
     row.querySelectorAll("button[data-act]").forEach((btn) => {
       const act = btn.getAttribute("data-act");
-      btn.disabled = busy || (activationInFlight && act === "activate");
+      const permanentlyDisabled = btn.dataset.permanentlyDisabled === "true";
+      btn.disabled = permanentlyDisabled || busy || (activationInFlight && act === "activate");
       if (act === "activate") {
         btn.textContent = isTarget ? "已提交" : "设为当前";
       }
@@ -612,18 +729,12 @@ function scheduleBusyMsg(ms, op, text) {
   busyMsgTimers.push(timer);
 }
 
-function startFetchModelsFeedback(id, codex) {
+function startFetchModelsFeedback(id) {
   clearBusyMsgTimers();
-  if (codex) {
-    setMsg("正在读取 CSSwitch Codex 账号模型目录；首次授权刷新可能需要约 2 分钟…");
-    scheduleBusyMsg(12000, { kind: "fetchModels", id }, "仍在等待 Codex 账号模型目录。不会修改模型选择、OAuth 或当前配置。");
-    scheduleBusyMsg(60000, { kind: "fetchModels", id }, "仍在等待官方目录响应；CSSwitch 不会把任意模型当作默认模型。");
-    scheduleBusyMsg(120000, { kind: "fetchModels", id }, "模型目录接近等待上限。若官方暂时不可达，可能返回带年龄标记的安全缓存。");
-    return;
-  }
-  setMsg("获取模型中：正在用临时代理探 /v1/models，网络慢时可能需要约 20 秒…");
-  scheduleBusyMsg(4500, { kind: "fetchModels", id }, "仍在等待上游模型列表响应。不会改动当前配置或正在运行的代理。");
-  scheduleBusyMsg(18000, { kind: "fetchModels", id }, "模型发现接近等待上限。若上游不支持或暂时不通，会回退到内置候选并据实提示。");
+  setMsg("正在读取 CSSwitch Codex 账号模型目录；首次授权刷新可能需要约 2 分钟…");
+  scheduleBusyMsg(12000, { kind: "fetchModels", id }, "仍在等待 Codex 账号模型目录。不会修改模型选择、OAuth 或当前配置。");
+  scheduleBusyMsg(60000, { kind: "fetchModels", id }, "仍在等待官方目录响应；CSSwitch 不会把任意模型当作默认模型。");
+  scheduleBusyMsg(120000, { kind: "fetchModels", id }, "模型目录接近等待上限。若官方暂时不可达，可能返回带年龄标记的安全缓存。");
 }
 
 function startActivateFeedback(id, skipVerify) {
@@ -691,6 +802,8 @@ function setBusy(on, op) {
     els.runtimeUseCacheBtn, els.runtimeDownloadBtn, els.runtimeChoiceCancelBtn,
     els.wizSaveBtn, els.wizFetchBtn, els.wizCancelBtn,
     els.connSaveBtn, els.connFetchBtn, els.connClearBtn, els.connCancelBtn,
+    els.wizModel, els.wizRoleQuality, els.wizRoleFast, els.wizRoleFable,
+    els.connModel, els.connRoleQuality, els.connRoleFast, els.connRoleFable,
     els.metaSaveBtn, els.metaCancelBtn, els.skipActivateBtn,
     els.codexEnabled, els.codexStatusBtn, els.codexLoginBtn, els.codexRepairProfileBtn,
     els.codexCancelBtn, els.codexLogoutBtn, els.codexNetworkMode, els.codexProxyUrl,
@@ -698,6 +811,8 @@ function setBusy(on, op) {
     // 端口输入也纳入忙碌禁用：忙碌中改端口会与在途操作竞态（修 P1-c 前端侧）。
     els.proxyPort, els.sandboxPort, els.reuseSystemSsh,
   ].forEach((b) => b && (b.disabled = on));
+  syncOpenBrowserControl();
+  if (skillPage) skillPage.setGlobalBusy(on);
   if (els.doctorBtn) els.doctorBtn.disabled = on && !activationBusy;
   // 模式切换按钮同样禁用：忙碌中切官方会与「一键开始」竞态（修 P1-b 前端侧）。
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = on));
@@ -706,6 +821,12 @@ function setBusy(on, op) {
   if (!on) { refreshWizGate(); refreshConnGate(); }
   syncActivationControls();
   syncCodexControls();
+}
+
+function syncOpenBrowserControl() {
+  if (!els.openBrowserBtn) return;
+  els.openBrowserBtn.disabled = busy || browserOpenInFlight;
+  els.openBrowserBtn.textContent = browserOpenInFlight ? "打开中…" : "浏览器打开";
 }
 
 function syncActivationControls() {
@@ -977,7 +1098,7 @@ function acceptCodexOperationSnapshot(raw, allowReplacement) {
         if (active && isCodexSource(active)) {
           setMsg("CSSwitch Codex 登录完成，Codex 配置已就绪。它仍是当前配置，但登录期间受管 Science/Gateway 已停止且未自动重启；请点击“一键开始”。原生 Codex OAuth 未被读取或改动。", "ok");
         } else {
-          setMsg("CSSwitch Codex 登录完成，Codex 配置已就绪。下一步可在“我的配置”中设为当前；原生 Codex OAuth 未被读取或改动。", "ok");
+          setMsg("CSSwitch Codex 登录完成，Codex 配置已就绪。下一步可在“模型连接 > 配置方案”中设为当前；原生 Codex OAuth 未被读取或改动。", "ok");
         }
       }).catch((error) => {
         refreshCodexProfileRepairState();
@@ -1144,7 +1265,7 @@ async function toggleCodexFeature() {
     syncCodexControls();
     await loadConfig({ throwOnError: true });
     setMsg(desired
-      ? "Codex 实验入口已启用。下一步请在高级设置登录 CSSwitch Codex。"
+      ? "Codex 实验入口已启用。下一步请在“设置 > Codex 账号与连接”登录 CSSwitch Codex。"
       : "Codex 实验入口已关闭；CSSwitch 自有 OAuth 凭据仍保留，可在此处检查或退出。", "ok");
   } catch (e) {
     if (backendChanged) {
@@ -1234,7 +1355,7 @@ async function repairCodexProfile() {
     codexProfileRepairNeeded = false;
     syncCodexControls();
     setMsg(result.disposition === "created"
-      ? "Codex 配置已补建。下一步可在“我的配置”中设为当前。"
+      ? "Codex 配置已补建。下一步可在“模型连接 > 配置方案”中设为当前。"
       : "Codex 配置已存在并确认就绪。下一步可设为当前。", "ok");
   } catch (e) {
     refreshCodexProfileRepairState();
@@ -1274,7 +1395,7 @@ async function requestCodexDowngrade() {
   try {
     const preview = await call("codex_downgrade_preview");
     const profiles = preview && Array.isArray(preview.profiles) ? preview.profiles : [];
-    if (preview.schema_version !== 1 || preview.action !== "export_then_remove_all" || !preview.credentials_unchanged || profiles.length < 1) {
+    if (preview.schema_version !== 1 || preview.action !== "export_then_remove_all" || !preview.credentials_unchanged || profiles.length < 1 || !preview.preview_fingerprint) {
       throw new Error("后端没有返回可执行的完整 Codex 降级预览。");
     }
     const ids = profiles.map((profile) => String(profile.id || ""));
@@ -1286,7 +1407,7 @@ async function requestCodexDowngrade() {
     confirmAction(
       "codex-downgrade:" + ids.join(","),
       "将导出并移除全部 " + profiles.length + " 个 Codex 配置（" + names + "），原子降为 v2 后立即退出；CSSwitch 本地 OAuth 保留",
-      () => doCodexDowngrade(ids)
+      () => doCodexDowngrade(ids, String(preview.preview_fingerprint))
     );
   } catch (e) {
     setBusy(false);
@@ -1294,7 +1415,7 @@ async function requestCodexDowngrade() {
   }
 }
 
-async function doCodexDowngrade(expectedProfileIds) {
+async function doCodexDowngrade(expectedProfileIds, expectedPreviewFingerprint) {
   let downgradeCommitted = false;
   setBusy(true, { kind: "codexDowngrade" });
   setMsg("请选择 Codex profile 元数据导出文件。取消选择不会修改配置…");
@@ -1303,7 +1424,7 @@ async function doCodexDowngrade(expectedProfileIds) {
     statusTimer = null;
   }
   try {
-    const result = await call("codex_downgrade_export_all", { expectedProfileIds });
+    const result = await call("codex_downgrade_export_all", { expectedProfileIds, expectedPreviewFingerprint });
     if (result && result.status === "CANCELLED") {
       setMsg("已取消导出与降级；配置和本地认证文件均未修改。");
       if (!PREVIEW) statusTimer = setInterval(refreshStatus, 2500);
@@ -1361,20 +1482,24 @@ async function loadConfig(options) {
   return true;
 }
 
-// 列表里模型摘要：无显式 model 时按三能力给准确措辞（native 内置映射 / relay 跟随 / 需指定），
-// 取代旧「（透传）」字样（三能力语义下不再有「透传」）。
+// 列表优先展示默认 route；静态目录未配置时明确提示，Codex 仍由 Science 选择。
 function modelSummary(p) {
-  if (p.model) return escapeHtml(p.model);
+  const route = (p.model_catalog || []).find((item) =>
+    item.selector_id === p.default_model_route_id || item.upstream_model === p.model
+  );
+  if (route) return route.display_name || route.upstream_model;
+  if (p.model) return p.model;
   const cap = modelCapability(p.capabilities ? p : tplById(p.template_id));
   if (cap === CAP.DYNAMIC) return "在 Science 中选择";
-  if (cap === CAP.NATIVE) return "内置映射";
-  if (cap === CAP.FOLLOW) return "跟随 Science";
-  return "未选模型";
+  return "目录未配置";
 }
 
 function profileModelOptions(p) {
   const template = tplById(p.template_id);
-  const available = (p.model_options || []).length
+  const catalogModels = (p.model_catalog || []).map((route) => route.upstream_model);
+  const available = catalogModels.length
+    ? catalogModels
+    : (p.model_options || []).length
     ? p.model_options
     : ((template && template.builtin_models) || []);
   const candidates = [p.model, ...available]
@@ -1384,8 +1509,13 @@ function profileModelOptions(p) {
 
 function profileModelControl(p) {
   const model = p.model || "";
-  if (!(PREVIEW && PROTOTYPE_ENABLED)) {
-    return `<strong class="profile-model-text">${modelSummary(p)}</strong>`;
+  if (!PROFILE_INTERACTIVE_PREVIEW) {
+    const count = Number.isFinite(p.model_count) ? p.model_count : (p.model_catalog || []).length;
+    const route = (p.model_catalog || []).find((item) =>
+      item.selector_id === p.default_model_route_id || item.upstream_model === p.model
+    );
+    const upstream = route?.upstream_model || p.model || "";
+    return `<strong class="profile-model-text">${escapeHtml(modelSummary(p))}</strong><span class="profile-model-meta">${count ? `${count} 个模型` : "动态目录"}${upstream ? ` · ${escapeHtml(upstream)}` : ""}</span>`;
   }
   const options = profileModelOptions(p);
   return `<select class="profile-model-select" data-profile-model="${escapeHtml(p.id)}" aria-label="${escapeHtml(p.name)} 的模型">
@@ -1401,13 +1531,16 @@ function renderList() {
     list.innerHTML = '<div class="empty">还没有配置。使用“新建配置”添加一条第三方来源。</div>';
     return;
   }
-  const header = `<div class="profile-list-head" aria-hidden="true"><span>配置</span><span>模型</span><span>凭据</span><span>操作</span></div>`;
+  const header = `<div class="profile-list-head" aria-hidden="true"><span>配置</span><span>默认模型 / 目录</span><span>凭据</span><span>操作</span></div>`;
   list.innerHTML = header + ps.map((p) => {
     const active = p.id === configState.active_id;
     const codex = isCodexSource(p);
     const codexEnabled = !!configState.experimental_codex_enabled;
     const hasKey = typeof p.has_key === "boolean" ? p.has_key : !!p.key;
     const credential = codex ? "CSSwitch OAuth" : (hasKey ? escapeHtml(p.key_masked || p.key || "已保存") : "未填写");
+    const editAction = codex
+      ? '<button class="abtn" data-act="editconn" data-permanently-disabled="true" disabled aria-disabled="true" title="Codex 配置由 OAuth 与 Science 管理，无需编辑连接">编辑</button>'
+      : '<button class="abtn" data-act="editconn">编辑</button>';
     return (
       '<div class="prow' + (active ? " pactive" : "") + '" data-id="' + escapeHtml(p.id) + '">' +
         '<div class="profile-identity">' +
@@ -1422,7 +1555,7 @@ function renderList() {
         '<div class="profile-key-cell"><strong>' + credential + "</strong></div>" +
         '<div class="prow-acts">' +
           (active || (codex && !codexEnabled) ? "" : '<button class="abtn prim" data-act="activate">设为当前</button>') +
-          (codex && !codexEnabled ? "" : '<button class="abtn" data-act="editconn">' + (codex ? "查看模型" : "编辑") + "</button>") +
+          editAction +
           '<details class="profile-more"><summary>更多</summary><div class="profile-menu">' +
             '<button class="abtn" data-act="editmeta">名称与备注</button>' +
             (codex ? "" : '<button class="abtn" data-act="clearkey">清除 Key</button>') +
@@ -1437,7 +1570,9 @@ function renderList() {
 
 // ── 模式（第三方 / 官方）──
 function applyMode(m) {
-  mode = m === "official" ? "official" : "proxy";
+  const nextMode = m === "official" ? "official" : "proxy";
+  if (nextMode !== mode && nextMode === "official") officialRuntimeState = "gray";
+  mode = nextMode;
   els.panel.classList.toggle("mode-official", mode === "official");
   els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
     b.classList.toggle("active", b.dataset.mode === mode)
@@ -1450,6 +1585,7 @@ function applyMode(m) {
 async function switchMode(m) {
   if (m === mode) return;
   if (busy) return; // 忙碌中不切模式（防与「一键开始」竞态；按钮亦已禁用，此为双保险）。修 P1-b
+  skillPage?.invalidate();
   setBusy(true, { kind: "switchMode", id: m });
   startSwitchModeFeedback(m);
   try {
@@ -1457,6 +1593,7 @@ async function switchMode(m) {
   } catch (e) {
     setMsg("切换模式失败：" + e, "err");
     setBusy(false);
+    await skillPage?.refreshIfLoaded();
     return;
   }
   applyMode(m);
@@ -1468,6 +1605,7 @@ async function switchMode(m) {
       : "已切到第三方模式：选一条配置「设为当前」后点「一键开始」。"
   );
   await refreshStatus();
+  await skillPage?.refreshIfLoaded();
 }
 
 async function openOfficial() {
@@ -1475,8 +1613,12 @@ async function openOfficial() {
   setMsg("正在打开官方 Claude Science…");
   try {
     await call("open_official");
-    setMsg("已打开官方 Claude Science（走你自己的官方登录与订阅）。", "ok");
+    officialRuntimeState = "gray";
+    els.brandDot.className = "dot gray";
+    setMsg("已发起打开官方 Claude Science；运行、登录与订阅状态由 Science 管理。", "ok");
   } catch (e) {
+    officialRuntimeState = "gray";
+    els.brandDot.className = "dot gray";
     setMsg("打开失败：" + e, "err");
   } finally {
     setBusy(false);
@@ -1492,6 +1634,7 @@ async function heroClick() {
 // ── 运行设置（端口 + 系统 SSH 配置授权；不含 provider/连接）──
 async function persistRuntimeSettings() {
   if (busy) return; // 忙碌中不改端口（防与在途操作竞态；输入亦已禁用，此为双保险）。修 P1-c
+  skillPage?.invalidate();
   const p = parseInt(els.proxyPort.value, 10) || 18991;
   const s = parseInt(els.sandboxPort.value, 10) || 8990;
   const reuseSystemSsh = !!els.reuseSystemSsh.checked;
@@ -1513,6 +1656,7 @@ async function persistRuntimeSettings() {
         ? "SSH 授权设置已保存。正在运行的代理/沙箱已重置，请重新「一键开始」。"
         : "端口已保存。改端口会重置正在运行的代理/沙箱，请重新「一键开始」。", "ok");
       await refreshStatus();
+      await skillPage?.refreshIfLoaded();
     } else {
       setMsg("端口未变化。", "ok");
     }
@@ -1524,11 +1668,12 @@ async function persistRuntimeSettings() {
     setMsg(String(e), "err");
   } finally {
     setBusy(false);
+    await skillPage?.refreshIfLoaded();
   }
 }
 
-// ── 模型下拉渲染（requires_override=false 时首项「跟随 Science 选择器」；按 supports_tools 标注）──
-// 候选填进 input 关联的 <datalist>（下拉建议）；input 的值由调用方另设，用户可自由改。
+// ── 模型候选渲染：填进 input 关联的 <datalist>，并按 supports_tools 标注。──
+// input 的值由调用方另设，用户可自由编辑精确 upstream ID。
 function renderModelOptions(sel, models, sourceLabel) {
   const listId = sel.getAttribute("list");
   const dl = listId && document.getElementById(listId);
@@ -1551,6 +1696,84 @@ const MODEL_SOURCE_LABELS = {
 
 function modelSourceLabel(source) {
   return MODEL_SOURCE_LABELS[source] || "未验证";
+}
+
+function editorState(kind) {
+  const wizard = kind === "wizard";
+  return {
+    model: wizard ? els.wizModel : els.connModel,
+    staticRoot: wizard ? els.wizStaticCatalog : els.connStaticCatalog,
+    warning: wizard ? els.wizCatalogWarning : els.connCatalogWarning,
+    quality: wizard ? els.wizRoleQuality : els.connRoleQuality,
+    fast: wizard ? els.wizRoleFast : els.connRoleFast,
+    fable: wizard ? els.wizRoleFable : els.connRoleFable,
+    get catalog() { return wizard ? wizardCatalog : connectionCatalog; },
+    set catalog(value) { if (wizard) wizardCatalog = value; else connectionCatalog = value; },
+    get refs() { return wizard ? wizardRoleRefs : connectionRoleRefs; },
+    set refs(value) { if (wizard) wizardRoleRefs = value; else connectionRoleRefs = value; },
+  };
+}
+
+function selectedReference(route) {
+  return route.selector_id || route.upstream_model;
+}
+
+function roleReferences(bindings, fallback, defaultReference = fallback) {
+  const roles = bindings || {};
+  return {
+    default: defaultReference || fallback || "",
+    balanced: roles.sonnet || defaultReference || fallback || "",
+    quality: roles.opus || roles.fable || fallback || "",
+    fast: roles.haiku || fallback || "",
+    fable: roles.fable || roles.opus || fallback || "",
+  };
+}
+
+function initializeCatalogEditor(kind, routes, defaultRef, bindings, { dynamic = false } = {}) {
+  const editor = editorState(kind);
+  editor.staticRoot.hidden = dynamic;
+  if (dynamic) {
+    editor.catalog = [];
+    editor.model.value = "";
+    editor.quality.value = "";
+    editor.fast.value = "";
+    editor.fable.value = "";
+    return;
+  }
+  editor.catalog = mergeCatalogCandidates([], (routes || []).map((route) => ({ ...route, enabled: true })), { enableNew: true });
+  const fallback = defaultRef || selectedReference(editor.catalog[0] || {});
+  editor.refs = roleReferences(bindings, fallback, defaultRef || fallback);
+  const fields = projectSimpleModelFields(editor.catalog, editor.refs.default, bindings);
+  editor.model.value = fields.default_model;
+  editor.quality.value = fields.quality_model;
+  editor.fast.value = fields.fast_model;
+  editor.fable.value = fields.fable_model;
+  renderModelOptions(editor.model, editor.catalog.map((item) => ({
+    id: item.upstream_model,
+    supports_tools: item.supports_tools,
+  })), "推荐");
+  const preservesLegacyBalanced = kind === "connection" && editor.refs.balanced !== editor.refs.default;
+  editor.warning.textContent = preservesLegacyBalanced
+    ? "这个旧配置曾单独保存均衡映射：不修改默认模型时会原样保留；修改默认模型后，均衡会随默认更新。"
+    : "可以选择推荐模型，也可以直接填写供应商或中转站提供的精确模型 ID。";
+}
+
+function catalogSubmission(kind) {
+  const editor = editorState(kind);
+  return buildSimpleModelSubmission({
+    default_model: editor.model.value,
+    quality_model: editor.quality.value,
+    fast_model: editor.fast.value,
+    fable_model: editor.fable.value,
+  }, {
+    existing_routes: editor.catalog,
+    existing_references: editor.refs,
+    preserve_existing_sonnet: kind === "connection",
+  });
+}
+
+function catalogRolesChanged(kind) {
+  if (kind === "wizard") refreshWizGate(); else refreshConnGate();
 }
 
 function compactAge(seconds) {
@@ -1589,31 +1812,6 @@ function renderCodexCatalog(meta, list, r) {
     setMsg("官方 Codex 模型目录当前不可达，且没有可用缓存。没有模型被伪造或写入配置，请稍后重试。", "err");
   } else {
     setMsg("已读取 " + models.length + " 个 Codex 账号模型（" + sourceText + "）。模型不会写入配置，请在 Science 的 More models 中选择。", "ok");
-  }
-}
-
-// fetch_models 返回体 → 刷新 datalist 候选 + 提示（向导与连接编辑共用）。
-// requiresOverride 保留形参（调用点仍传），但 datalist 无「跟随」空项，故此处不用。
-function applyFetchResult(sel, requiresOverride, r) {
-  void requiresOverride;
-  const models = (r && r.models) || [];
-  const src = r && r.source;
-  // unsupported（端点不提供发现，4xx）与 builtin（200 但空）都铺内置，标「内置」；network/未知标「未验证」。
-  const srcLabel = modelSourceLabel(src);
-  const prev = sel.value;
-  renderModelOptions(sel, models, srcLabel);
-  if (prev) sel.value = prev; // 保留用户已填/已选值，拉列表只刷新候选、绝不清空输入
-  if (src === "unsupported") {
-    // 端点未提供 /v1/models（如 Kimi）：内置模型可直接选，绝不表述成 key 无效。
-    setMsg("该端点未提供模型列表，已用内置模型（可直接选择保存）。", "ok");
-  } else if (src === "stale-cache" || (r && r.stale)) {
-    setMsg("模型目录来自过期缓存（年龄 " + compactAge(r && r.age_seconds) + "），请稍后刷新确认。", "err");
-  } else if (r && r.error_kind === "protocol") {
-    setMsg("模型目录响应与当前 CSSwitch 兼容基线不一致；这不是网络繁忙。请更新兼容版本后重试。", "err");
-  } else if (r && r.error_kind === "network") {
-    setMsg("未能连上上游验证，已铺内置模型（标「未验证」）。可仍试保存或重试。", "err");
-  } else {
-    setMsg("已获取 " + models.length + " 个模型（工具✓ 优先）。", "ok");
   }
 }
 
@@ -1661,7 +1859,7 @@ function onWizTemplate() {
   els.wizBaseGroup.hidden = codex;
   els.wizKeyGroup.hidden = codex;
   els.wizCodexCatalog.hidden = !codex;
-  els.wizModelLabel.textContent = codex ? "账号模型目录" : "模型";
+  els.wizModelLabel.textContent = codex ? "账号模型目录" : "模型配置";
   els.wizCodexCatalogMeta.textContent = "尚未读取账号模型目录。";
   els.wizCodexCatalogList.innerHTML = "";
   if (codex) {
@@ -1680,7 +1878,7 @@ function onWizTemplate() {
         ? "OpenAI 兼容 base root，代理自动补 /chat/completions 与 /models。"
         : t.api_format === "openai_responses"
         ? "OpenAI 兼容 base root，代理自动补 /responses 与 /models。"
-        : "自定义端点根地址（自动补 /v1/messages 与 /v1/models）。");
+          : "自定义端点根地址（自动补 /v1/messages）。");
   } else {
     els.wizBase.value = t.base_url;
     els.wizBase.readOnly = true;
@@ -1689,6 +1887,12 @@ function onWizTemplate() {
   applyModelCapability(t, {
     info: els.wizModelInfo, sel: els.wizModel, hint: els.wizModelHint, fetchBtn: els.wizFetchBtn,
   }, "");
+  const recommended = (t.recommended_catalog || (t.builtin_models || []).map((id) => ({
+    selector_id: "", display_name: id, upstream_model: id,
+    supports_tools: null, origin: "preset", availability: "unknown",
+  }))).map((route) => ({ origin: "preset", availability: "unknown", ...route }));
+  const defaultReference = t.recommended_default_model_route_id || recommended[0]?.selector_id || recommended[0]?.upstream_model || "";
+  initializeCatalogEditor("wizard", recommended, defaultReference, t.recommended_role_bindings, { dynamic: codex });
   refreshWizGate();
   setMsg(codex
     ? "Codex 无需填写 Key 或地址。正常浏览器登录后会自动创建一条配置；此向导仅用于手工添加额外配置。"
@@ -1697,8 +1901,11 @@ function onWizTemplate() {
 
 function refreshWizGate() {
   const t = tplById(els.wizTemplate ? els.wizTemplate.value : "");
-  const need = t && modelRequired(t);
-  els.wizSaveBtn.disabled = busy || !!(need && !els.wizModel.value.trim());
+  let invalidCatalog = false;
+  if (t && !isCodexSource(t)) {
+    try { catalogSubmission("wizard"); } catch (_) { invalidCatalog = true; }
+  }
+  els.wizSaveBtn.disabled = busy || !t || invalidCatalog;
 }
 
 function openaiCustomAnthropicBaseMessage(t, base) {
@@ -1710,20 +1917,12 @@ function openaiCustomAnthropicBaseMessage(t, base) {
 
 async function wizFetch() {
   const t = tplById(els.wizTemplate.value);
-  if (!t) return;
-  const codex = isCodexSource(t);
-  const base = t.base_url_editable ? els.wizBase.value.trim() : t.base_url;
-  if (!codex && !base) { setMsg("请先填写 base_url。", "err"); return; }
-  const baseErr = openaiCustomAnthropicBaseMessage(t, base);
-  if (baseErr) { setMsg(baseErr, "err"); return; }
-  const key = els.wizKey.value.trim();
-  if (!codex && !key) { setMsg("请先填 key 再获取模型。", "err"); return; }
+  if (!t || !isCodexSource(t)) return;
   setBusy(true, { kind: "fetchModels", id: "wizard" });
-  startFetchModelsFeedback("wizard", codex);
+  startFetchModelsFeedback("wizard");
   try {
-    const r = await call("fetch_models", { req: { template_id: t.id, base_url: base, key } });
-    if (codex) renderCodexCatalog(els.wizCodexCatalogMeta, els.wizCodexCatalogList, r);
-    else applyFetchResult(els.wizModel, modelRequired(t), r);
+    const r = await call("fetch_models", { req: { template_id: t.id, base_url: "", key: "" } });
+    renderCodexCatalog(els.wizCodexCatalogMeta, els.wizCodexCatalogList, r);
   } catch (e) {
     setMsg("获取模型失败：" + runtimeCommandErrorText(e), "err");
   } finally {
@@ -1737,12 +1936,17 @@ async function wizSave() {
   if (!t) { setMsg("模板未加载。", "err"); return; }
   const name = els.wizName.value.trim() || t.name;
   const codex = isCodexSource(t);
-  const model = codex ? "" : els.wizModel.value.trim();
-  if (modelRequired(t) && !model) {
-    setMsg("该来源需要选一个模型才能创建。", "err");
-    return;
+  let catalogPayload = null;
+  if (!codex) {
+    try { catalogPayload = catalogSubmission("wizard"); }
+    catch (error) { setMsg(String(error.message || error), "err"); return; }
   }
-  const args = { templateId: t.id, name, key: codex ? "" : els.wizKey.value.trim(), model };
+  const args = { templateId: t.id, name, key: codex ? "" : els.wizKey.value.trim() };
+  if (catalogPayload) {
+    args.modelCatalog = catalogPayload.model_catalog;
+    args.defaultModelRouteId = catalogPayload.default_model_route_id;
+    args.roleBindings = catalogPayload.role_bindings;
+  }
   if (t.base_url_editable) {
     const base = els.wizBase.value.trim();
     if (baseUrlRequired(t) && !base) { setMsg("请先填写 base_url。", "err"); return; }
@@ -1779,7 +1983,7 @@ function openConn(id) {
   const capSrc = profileCapabilitySource(p, t);
   const codex = isCodexSource(capSrc || p);
   if (codex && !configState.experimental_codex_enabled) {
-    setMsg("Codex 实验入口已关闭；仍可改名或删除配置，也可在高级设置检查/退出 OAuth。", "err");
+    setMsg("Codex 实验入口已关闭；仍可改名或删除配置，也可在“设置 > Codex 账号与连接”检查/退出 OAuth。", "err");
     return;
   }
   const editable = t ? t.base_url_editable : true;
@@ -1789,7 +1993,7 @@ function openConn(id) {
   els.connBaseGroup.hidden = codex;
   els.connKeyGroup.hidden = codex;
   els.connCodexCatalog.hidden = !codex;
-  els.connModelLabel.textContent = codex ? "账号模型目录" : "模型";
+  els.connModelLabel.textContent = codex ? "账号模型目录" : "模型配置";
   els.connSaveBtn.hidden = codex;
   els.connClearBtn.hidden = codex;
   els.connCancelBtn.textContent = codex ? "返回" : "取消";
@@ -1800,7 +2004,6 @@ function openConn(id) {
   els.connBase.placeholder = capSrc && (capSrc.api_format === "openai_chat" || capSrc.api_format === "openai_responses")
     ? "https://open.bigmodel.cn/api/paas/v4"
     : "https://your-relay/claude";
-  // native 来源隐藏「获取模型」按钮，别再提示一个不存在的操作（修 #5）。
   els.connBaseHint.textContent = editable
     ? (t && t.base_url
         ? "官方默认地址，可改到 token 套餐 / 区域端点。"
@@ -1810,11 +2013,22 @@ function openConn(id) {
           ? "OpenAI 兼容 base root，代理自动补 /responses。"
           : "自定义端点根地址。"))
     : (modelCapability(capSrc) === CAP.NATIVE
-        ? "模板地址（只读），模型由内置映射自动选择。"
-        : "模板地址（只读）。填 key 后可「获取模型」。");
+        ? "模板地址（只读）；模型名称可从推荐中选择或自由填写。"
+        : "模板地址（只读）。模型名称可自由填写。");
   applyModelCapability(capSrc, {
     info: els.connModelInfo, sel: els.connModel, hint: els.connModelHint, fetchBtn: els.connFetchBtn,
   }, p.model || "");
+  initializeCatalogEditor(
+    "connection",
+    (p.model_catalog || []).map((route) => ({
+      origin: (t?.recommended_catalog || []).some((recommended) => recommended.upstream_model === route.upstream_model) ? "preset" : "manual",
+      availability: "unknown",
+      ...route,
+    })),
+    p.default_model_route_id || p.model,
+    p.role_bindings,
+    { dynamic: codex },
+  );
   els.connKey.value = "";
   els.connKey.placeholder = p.key ? "已存：" + p.key + "（留空＝不改）" : "粘贴 key（只存本地）";
   showView("conn");
@@ -1828,30 +2042,25 @@ function openConn(id) {
 
 function refreshConnGate() {
   const p = currentConn();
-  const t = p ? tplById(p.template_id) : null;
-  const need = p ? modelRequired(p.capabilities ? p : t) : false;
-  els.connSaveBtn.disabled = busy || !!(need && !els.connModel.value.trim());
+  let invalidCatalog = false;
+  if (p && !isCodexSource(p)) {
+    try { catalogSubmission("connection"); } catch (_) { invalidCatalog = true; }
+  }
+  els.connSaveBtn.disabled = busy || !p || invalidCatalog;
 }
 
 async function connFetch() {
   const p = currentConn();
   if (!p) return;
   const t = tplById(p.template_id);
-  const codex = isCodexSource(p.capabilities ? p : t);
-  const editable = t ? t.base_url_editable : true;
-  const base = editable ? els.connBase.value.trim() : (t ? t.base_url : els.connBase.value.trim());
-  if (!codex && !base) { setMsg("请先填写 base_url。", "err"); return; }
-  const baseErr = openaiCustomAnthropicBaseMessage(t, base);
-  if (baseErr) { setMsg(baseErr, "err"); return; }
+  if (!isCodexSource(p.capabilities ? p : t)) return;
   setBusy(true, { kind: "fetchModels", id: p.id });
-  startFetchModelsFeedback(p.id, codex);
+  startFetchModelsFeedback(p.id);
   try {
-    const key = els.connKey.value.trim(); // 有新 key 带上；空则后端用已存 key（profileId）
     const r = await call("fetch_models", {
-      req: { template_id: p.template_id, api_format: p.api_format || (t ? t.api_format : ""), base_url: base, key, profile_id: p.id },
+      req: { template_id: p.template_id, api_format: p.api_format || (t ? t.api_format : ""), base_url: "", key: "", profile_id: p.id },
     });
-    if (codex) renderCodexCatalog(els.connCodexCatalogMeta, els.connCodexCatalogList, r);
-    else applyFetchResult(els.connModel, p.capabilities ? modelRequired(p) : (t ? modelRequired(t) : true), r);
+    renderCodexCatalog(els.connCodexCatalogMeta, els.connCodexCatalogList, r);
   } catch (e) {
     setMsg("获取模型失败：" + runtimeCommandErrorText(e), "err");
   } finally {
@@ -1869,9 +2078,9 @@ async function connSave() {
   }
   const t = tplById(p.template_id);
   const capSrc = profileCapabilitySource(p, t);
-  const req = modelRequired(capSrc);
-  const model = els.connModel.value.trim();
-  if (req && !model) { setMsg("该来源需要选一个模型才能保存。", "err"); return; }
+  let catalogPayload;
+  try { catalogPayload = catalogSubmission("connection"); }
+  catch (error) { setMsg(String(error.message || error), "err"); return; }
   const editable = t ? t.base_url_editable : true;
   const base = editable ? els.connBase.value.trim() : (t ? t.base_url : els.connBase.value.trim());
   // base_url 是否必填由后端 capabilities 决定；旧后端无字段时才按可编辑地址保守兜底。
@@ -1879,17 +2088,26 @@ async function connSave() {
   const baseErr = openaiCustomAnthropicBaseMessage(t, base);
   if (baseErr) { setMsg(baseErr, "err"); return; }
   const active = p.id === configState.active_id;
-  // key 留空＝不改（后端语义）；base_url/model 照传。api_format 不在此改（保留模板值）。
-  const args = { id: p.id, baseUrl: base, model, key: els.connKey.value.trim() };
+  // key 留空＝不改；目录三件套必须一起提交，避免漏字段被解释为重置默认/roles。
+  const args = {
+    id: p.id,
+    baseUrl: base,
+    key: els.connKey.value.trim(),
+    modelCatalog: catalogPayload.model_catalog,
+    defaultModelRouteId: catalogPayload.default_model_route_id,
+    roleBindings: catalogPayload.role_bindings,
+  };
   setBusy(true, { kind: "saveConnection", id: p.id });
   startSaveConnectionFeedback(p.id, active);
   try {
     const r = await call("update_profile_connection", args);
     els.connKey.value = "";
     await loadConfig();
-    // 非 active：后端如实回传 validated，连不通/native 也保存，但据实说明未校验（修 P2-d truthful-save）。
-    if (active) {
-      setMsg("已保存并应用新连接。", "ok");
+    if (r && (r.status === "error" || (active && r.committed === false))) {
+      const recovery = r.recovery_status === "degraded" ? "；恢复也未完全成功，请先全部停止后检查" : r.recovery_status === "restored" ? "；旧配置已恢复" : "";
+      setMsg((r.message || "连接未应用") + recovery + "（阶段：" + (r.stage || "unknown") + "）", "err");
+    } else if (active) {
+      setMsg((r && (r.message || r.hint)) || "已保存并应用新连接。", "ok");
     } else if (r && r.validated) {
       setMsg("已保存连接（已通过上游校验）。", "ok");
     } else {
@@ -1902,6 +2120,7 @@ async function connSave() {
   } finally {
     setBusy(false);
     await refreshStatus();
+    await skillPage?.refreshIfLoaded();
   }
 }
 
@@ -1996,10 +2215,11 @@ async function activate(id, skipVerify) {
   const target = (configState.profiles || []).find((p) => p.id === id);
   const codex = isCodexSource(target);
   if (codex && !configState.experimental_codex_enabled) {
-    setMsg("Codex 实验入口已关闭。请先在高级设置重新启用。", "err");
+    setMsg("Codex 实验入口已关闭。请先在“设置 > Codex 账号与连接”重新启用。", "err");
     return;
   }
   hideSkip();
+  setBrowserFallback("");
   setActivationInFlight(true, { kind: "activate", id });
   startActivateFeedback(id, !!skipVerify);
   try {
@@ -2011,7 +2231,9 @@ async function activate(id, skipVerify) {
         : ""), "ok");
     } else {
       await loadConfig(); // 反映未变（仍是原 active）
-      setMsg((r && r.hint) || "校验未通过，未切换。", "err");
+      const recovery = r && r.recovery_status === "degraded" ? "；恢复未完全成功" : r && r.recovery_status === "restored" ? "；旧链路已恢复" : "";
+      setMsg((r && (r.message || r.hint) || "校验未通过，未切换。") + recovery + (r && r.stage ? "（阶段：" + r.stage + "）" : ""), "err");
+      setBrowserFallback(r && r.fallback_url);
       if (r && r.can_skip) { pendingSkipActivateId = id; showSkip(); }
     }
   } catch (e) {
@@ -2046,13 +2268,13 @@ async function checkOneClickBoundary() {
     return false;
   }
   if (!configState.active_id) {
-    setMsg("还没有「当前生效」的配置。请先「＋ 新建」或在列表点「设为当前」选一条，再一键开始。", "err");
+    setMsg("还没有「当前生效」的配置。请先点「新建配置」或在列表点「设为当前」选一条，再一键开始。", "err");
     return false;
   }
   const active = (configState.profiles || []).find((p) => p.id === configState.active_id);
   if (isCodexSource(active)) {
     if (!configState.experimental_codex_enabled) {
-      setMsg("当前是 Codex 配置，但实验入口已关闭。请先在高级设置重新启用。", "err");
+      setMsg("当前是 Codex 配置，但实验入口已关闭。请先在“设置 > Codex 账号与连接”重新启用。", "err");
       return false;
     }
   }
@@ -2068,22 +2290,35 @@ async function runOneClick(runtimeChoice) {
     }
   }
   if (!(await checkOneClickBoundary())) return;
+  skillPage?.invalidate();
   hideRuntimeChoice();
   setBusy(true, { kind: "oneClick" });
+  setBrowserFallback("");
   startOneClickFeedback();
   try {
     const r = await call("one_click_login", { runtimeChoice: runtimeChoice || null });
+    if (r && r.status === "error") {
+      const recovery = r.recovery_status === "degraded"
+        ? "；刷新未完成，安全事务记录已保留，可修正问题后重试"
+        : "";
+      setMsg((r.message || "一键开始未完成") + recovery + "（阶段：" + (r.stage || "unknown") + "）", "err");
+      setBrowserFallback(r.fallback_url);
+      await refreshStatus();
+      return;
+    }
     // 透传后端据实回传的 msg（已重开 / 已用新配置重启 / 沿用原对话 / 已启动 / 打开失败请手动打开）。
     const active = (configState.profiles || []).find((p) => p.id === configState.active_id);
-    const message = (r.msg || "已就绪，正在打开面板…").replace("打开 Science", "浏览器打开");
+    const message = r.msg || "已就绪，正在打开面板…";
     setMsg(message + (isCodexSource(active)
       ? " 请在 Science 的 More models 中选择 Codex / … 后再发第一条消息；默认 Claude 壳会被明确拒绝。"
       : ""), "ok");
+    setBrowserFallback(r.fallback_url);
     await refreshStatus();
   } catch (e) {
     setMsg("一键开始失败：" + runtimeCommandErrorText(e), "err");
   } finally {
     setBusy(false);
+    await skillPage?.refreshIfLoaded();
   }
 }
 
@@ -2104,8 +2339,12 @@ async function importLocalSkill() {
     } else {
       setMsg((result.message || "Skill 包导入未完成") + " [" + result.status + "]", "err");
     }
+    if (result && result.directory_commit === true && skillPage) {
+      await skillPage.refresh();
+    }
   } catch (e) {
     setMsg("导入 Skill 包失败：" + e, "err");
+    await skillPage?.refreshIfLoaded();
   } finally {
     setBusy(false);
   }
@@ -2149,6 +2388,7 @@ function cancelRuntimeChoice() {
 }
 
 async function stopAll() {
+  skillPage?.invalidate();
   setBusy(true);
   setMsg("停止中…");
   try {
@@ -2159,14 +2399,29 @@ async function stopAll() {
     setMsg("停止失败：" + e, "err");
   } finally {
     setBusy(false);
+    await skillPage?.refreshIfLoaded();
   }
 }
 
 async function openBrowser() {
+  if (busy || browserOpenInFlight) return;
+  browserOpenInFlight = true;
+  syncOpenBrowserControl();
+  setMsg("正在获取新的 Science 地址并交给默认浏览器打开…");
   try {
-    await call("open_url");
+    const result = await call("open_url");
+    if (result && result.status === "error") {
+      setBrowserFallback(result.fallback_url);
+      setMsg(result.message || "打开浏览器失败；请复制 URL 手动打开。", "err");
+    } else {
+      setBrowserFallback("");
+      setMsg((result && result.message) || "已向默认浏览器发出打开 Science 的请求；若窗口没有切到前台，请从 Dock 或其他桌面切回默认浏览器。", "ok");
+    }
   } catch (e) {
     setMsg("打开浏览器失败：" + e, "err");
+  } finally {
+    browserOpenInFlight = false;
+    syncOpenBrowserControl();
   }
 }
 
@@ -2238,29 +2493,30 @@ async function refreshStatus() {
     setStatusText("proxyStateText", s.proxy);
     setStatusText("sandboxStateText", s.sandbox);
     setStatusText("upstreamStateText", s.upstream);
-    els.brandDot.className = "dot" + (s.proxy === "green" ? "" : " amber");
+    els.brandDot.className = "dot " + aggregateRuntimeStatus(s, { mode, officialState: officialRuntimeState });
     setStatusRecoveryMsg(proxyRecoveryMessage(s));
   } catch (e) {
-    [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "amber"));
-    ["proxyStateText", "sandboxStateText", "upstreamStateText"].forEach((id) => setStatusText(id, "amber"));
+    [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "unknown"));
+    ["proxyStateText", "sandboxStateText", "upstreamStateText"].forEach((id) => setStatusText(id, "unknown"));
+    els.brandDot.className = "dot gray";
   }
 }
 
 function wire() {
   [
-    "oneClickBtn", "stopBtn", "importSkillBtn", "ltProxy", "ltSandbox", "ltUpstream",
+    "oneClickBtn", "stopBtn", "importSkillBtn", "refreshSkillsBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
-    "msg", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
+    "msg", "browserFallback", "browserFallbackUrl", "browserFallbackCopyBtn", "browserFallbackRetryBtn", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexLoginBtn", "codexCancelBtn", "codexLogoutBtn", "codexProfileRepairBox", "codexRepairProfileBtn",
     "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
     "connectionOverview", "listSec", "profileList", "newBtn", "skipActivateBtn",
     "wizSec", "wizTemplate", "wizTemplateChips", "wizTplLabel", "wizTplHint", "wizName", "wizBaseGroup", "wizBase", "wizBaseHint",
-    "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
+    "wizModelGroup", "wizModelLabel", "wizFetchBtn", "wizModelInfo", "wizModel", "wizModelHint", "wizCodexCatalog", "wizCodexCatalogMeta", "wizCodexCatalogList", "wizStaticCatalog", "wizRoleQuality", "wizRoleFast", "wizRoleFable", "wizCatalogWarning", "wizKeyGroup", "wizKey", "wizSaveBtn", "wizCancelBtn",
     "connSec", "connTitle", "connBaseGroup", "connBase", "connBaseHint", "connFetchBtn",
-    "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
+    "connModelGroup", "connModelLabel", "connModelInfo", "connModel", "connModelHint", "connCodexCatalog", "connCodexCatalogMeta", "connCodexCatalogList", "connStaticCatalog", "connRoleQuality", "connRoleFast", "connRoleFable", "connCatalogWarning", "connKeyGroup", "connKey", "connSaveBtn", "connClearBtn", "connCancelBtn",
     "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn",
-    "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle", "prototypeFlag",
+    "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle",
     "currentProfileIcon", "currentProfileName", "currentProfileState", "currentRouteMode", "currentProfileModel", "currentProfileMeta",
     "proxyStateText", "sandboxStateText", "upstreamStateText",
   ].forEach((id) => (els[id] = $(id)));
@@ -2272,9 +2528,7 @@ function wire() {
       setPage(button.dataset.pageTarget);
     });
   });
-  let savedTheme = "light";
-  try { savedTheme = localStorage.getItem("csswitch-theme") || "light"; } catch (_) {}
-  applyTheme(savedTheme);
+  applyTheme(savedTheme() || document.documentElement.dataset.theme || "light", { persist: false });
   els.themeBtn.addEventListener("click", () => applyTheme(document.documentElement.dataset.theme === "dark" ? "light" : "dark"));
 
   els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
@@ -2299,7 +2553,7 @@ function wire() {
     if (busy) return;
     const btn = e.target.closest("[data-act]");
     const row = e.target.closest("[data-id]");
-    if (!btn || !row) return;
+    if (!btn || !row || btn.disabled || btn.dataset.permanentlyDisabled === "true") return;
     const id = row.getAttribute("data-id");
     const act = btn.getAttribute("data-act");
     if (act === "activate") activate(id, false);
@@ -2309,10 +2563,10 @@ function wire() {
     else if (act === "delete") del(id);
   });
 
-  // 模型下拉只在显式 UI 原型中启用；不新增 Tauri command，也不改真实配置。
+  // 浏览器交互预览可单独启用模型下拉；真实 App 始终使用后端已保存模型。
   els.profileList.addEventListener("change", (e) => {
     const select = e.target.closest("[data-profile-model]");
-    if (!select || !(PREVIEW && PROTOTYPE_ENABLED)) return;
+    if (!select || !PROFILE_INTERACTIVE_PREVIEW) return;
     const id = select.getAttribute("data-profile-model");
     const model = select.value;
     const profile = (configState.profiles || []).find((item) => item.id === id);
@@ -2321,7 +2575,7 @@ function wire() {
     profile.model = model;
     stored.model = model;
     renderList();
-    setMsg(`原型：已将「${profile.name}」的模型设为 ${model}。`, "ok");
+    setMsg(`预览：已将「${profile.name}」的模型设为 ${model}。`, "ok");
   });
 
   els.newBtn.addEventListener("click", openWizard);
@@ -2335,12 +2589,14 @@ function wire() {
     const chip = e.target.closest(".chip");
     if (chip) selectWizTemplate(chip.getAttribute("data-tid"));
   });
-  els.wizModel.addEventListener("input", refreshWizGate); // input：键入即刷新保存门（#9 P1-b）
+  [els.wizModel, els.wizRoleQuality, els.wizRoleFast, els.wizRoleFable]
+    .forEach((input) => input.addEventListener("input", () => catalogRolesChanged("wizard")));
   els.wizFetchBtn.addEventListener("click", wizFetch);
   els.wizSaveBtn.addEventListener("click", wizSave);
   els.wizCancelBtn.addEventListener("click", cancelForm);
 
-  els.connModel.addEventListener("input", refreshConnGate); // input：键入即刷新保存门（#9 P1-b）
+  [els.connModel, els.connRoleQuality, els.connRoleFast, els.connRoleFable]
+    .forEach((input) => input.addEventListener("input", () => catalogRolesChanged("connection")));
   els.connFetchBtn.addEventListener("click", connFetch);
   els.connSaveBtn.addEventListener("click", connSave);
   els.connClearBtn.addEventListener("click", () => clearKey(els.connSec.dataset.id));
@@ -2356,6 +2612,16 @@ function wire() {
   els.stopBtn.addEventListener("click", stopAll);
   els.importSkillBtn.addEventListener("click", importLocalSkill);
   els.openBrowserBtn.addEventListener("click", openBrowser);
+  els.browserFallbackRetryBtn.addEventListener("click", openBrowser);
+  els.browserFallbackCopyBtn.addEventListener("click", async () => {
+    try {
+      await navigator.clipboard.writeText(els.browserFallbackUrl.value);
+      setMsg("Science URL 已复制。", "ok");
+    } catch (_) {
+      els.browserFallbackUrl.select();
+      setMsg("无法自动写入剪贴板；已选中 URL，请手动复制。", "err");
+    }
+  });
   els.doctorBtn.addEventListener("click", runDoctor);
   els.updateBtn.addEventListener("click", checkUpdate);
   els.reportBtn.addEventListener("click", () =>
@@ -2378,19 +2644,17 @@ window.addEventListener("DOMContentLoaded", async () => {
   wire();
   try { await registerCodexAuthEvents(); } catch (e) { setMsg("无法订阅 Codex 登录状态：" + e, "err"); }
   await configureDesktopWindow();
-  if (PROTOTYPE_ENABLED) {
-    document.querySelectorAll(".prototype-nav").forEach((node) => { node.hidden = false; });
-    els.prototypeFlag.hidden = false;
-    setPage("skills");
-    try {
-      const { mountSkillMcpPrototype } = await import("./skill-mcp-prototype.js");
-      mountSkillMcpPrototype($("skillMcpPrototypeRoot"), QUERY.get("fixture") || "healthy");
-    } catch (e) {
-      $("skillMcpPrototypeRoot").innerHTML = '<div class="prototype-loading">原型载入失败：' + escapeHtml(e) + "</div>";
-    }
-  } else {
-    setPage("switch");
+  try {
+    const { mountSkillPage } = await import("./skill-page.js");
+    skillPage = mountSkillPage($("skillPageRoot"), {
+      call,
+      refreshButton: els.refreshSkillsBtn,
+      importButton: els.importSkillBtn,
+    });
+  } catch (e) {
+    $("skillPageRoot").innerHTML = '<div class="skill-loading">Skill 页面载入失败：' + escapeHtml(e) + "</div>";
   }
+  setPage(SKILLS_PREVIEW ? "skills" : "switch");
   await loadConfig();
   if (!PREVIEW && window.__TAURI__.event) {
     window.__TAURI__.event.listen("boot://failed", (e) => {
@@ -2404,10 +2668,5 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (e) {}
   try { els.verLabel.textContent = "v" + (await call("app_version")); } catch (e) {}
   await refreshStatus();
-  if (PREVIEW && !PROTOTYPE_ENABLED) {
-    els.prototypeFlag.textContent = "浏览器预览 · 不连后端";
-    els.prototypeFlag.hidden = false;
-  } else {
-    if (!PREVIEW) statusTimer = setInterval(refreshStatus, 2500);
-  }
+  if (!PREVIEW) statusTimer = setInterval(refreshStatus, 2500);
 });

@@ -65,6 +65,8 @@ pub struct GatewayHealth {
     pub launch_id: String,
     pub provider_contract_id: String,
     pub provider_contract_digest: String,
+    pub catalog_fp: String,
+    pub intent: String,
 }
 
 /// 读取 Rust gateway 声明的运行身份。
@@ -197,6 +199,8 @@ fn gateway_health_from_response(resp: &str) -> Option<GatewayHealth> {
         launch_id: string_field("launch_id"),
         provider_contract_id: string_field("provider_contract_id"),
         provider_contract_digest: string_field("provider_contract_digest"),
+        catalog_fp: string_field("catalog_fp"),
+        intent: string_field("intent"),
     })
 }
 
@@ -489,6 +493,8 @@ mod tests {
                 launch_id: "launch-new".into(),
                 provider_contract_id: "".into(),
                 provider_contract_digest: "".into(),
+                catalog_fp: "".into(),
+                intent: "".into(),
             })
         );
     }
@@ -510,6 +516,8 @@ mod tests {
             launch_id: "old-launch".into(),
             provider_contract_id: "".into(),
             provider_contract_digest: "".into(),
+            catalog_fp: "".into(),
+            intent: "".into(),
         };
         assert!(!gateway_health_matches(
             &old,
@@ -546,6 +554,8 @@ mod tests {
             launch_id: "launch".into(),
             provider_contract_id: identity.contract_id,
             provider_contract_digest: identity.catalog_digest,
+            catalog_fp: "".into(),
+            intent: "formal".into(),
         };
         assert!(gateway_health_matches(
             &health,

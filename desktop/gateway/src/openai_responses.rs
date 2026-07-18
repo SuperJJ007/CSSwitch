@@ -165,7 +165,7 @@ fn max_output_tokens(
 
 pub fn anthropic_to_openai(
     req: &Value,
-    forced_model: Option<&str>,
+    target_model: &str,
     is_dashscope: bool,
 ) -> Result<(Value, ResponsesMetadata), String> {
     let obj = req
@@ -226,10 +226,7 @@ pub fn anthropic_to_openai(
     let tools = map_tools(obj.get("tools"), is_dashscope, &mut rule_ids);
     let has_tools = !tools.is_empty();
     let mut out = Map::new();
-    out.insert(
-        "model".to_string(),
-        Value::String(forced_model.unwrap_or("").to_string()),
-    );
+    out.insert("model".to_string(), Value::String(target_model.to_string()));
     out.insert("input".to_string(), Value::Array(items));
     out.insert("stream".to_string(), Value::Bool(false));
     if let Some(prompt) = system_prompt(obj.get("system")) {
@@ -359,7 +356,7 @@ mod tests {
     fn responses_transform_matches_python_fixture() {
         let fixture = fixture();
         let (mapped, metadata) =
-            anthropic_to_openai(&fixture["request"], Some("gpt-5.2"), false).unwrap();
+            anthropic_to_openai(&fixture["request"], "gpt-5.2", false).unwrap();
         assert_eq!(mapped, fixture["mapped"]);
         assert_eq!(metadata.rule_ids, Vec::<String>::new());
     }
@@ -368,7 +365,7 @@ mod tests {
     fn responses_dashscope_rules_match_python_fixture() {
         let fixture = fixture();
         let (mapped, metadata) =
-            anthropic_to_openai(&fixture["dashscope_request"], Some("gpt-5.2"), true).unwrap();
+            anthropic_to_openai(&fixture["dashscope_request"], "gpt-5.2", true).unwrap();
         assert_eq!(mapped, fixture["dashscope_mapped"]);
         assert_eq!(
             metadata.rule_ids,
@@ -435,7 +432,7 @@ mod tests {
                     }],
                 }],
             }),
-            Some("gpt-5.2"),
+            "gpt-5.2",
             false,
         )
         .unwrap();

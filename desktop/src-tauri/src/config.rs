@@ -1,5 +1,5 @@
 //! 本地配置读写：正式构建使用 `~/.csswitch/config.json`，Acceptance 构建使用
-//! `~/.csswitch-acceptance/config.json`。多 profile 形态（schema v3）。
+//! `~/.csswitch-acceptance/config.json`。多 profile + 多模型目录形态（schema v4）。
 //!
 //! 安全要求（对齐 spec §3 / §5.1，参考 CC Switch 的明文本地存储但加严文件安全）：
 //!   - 目录 0700，文件 0600。
@@ -7,8 +7,8 @@
 //!   - 写用「临时文件（O_CREAT|O_EXCL, 0600）+ 原子 rename」，避免半写与竞态。
 //!   - profile key 明文存盘（用户已知悉），但**绝不进日志**；回显给前端只给掩码（末 4 位）。
 //!
-//! 存储升级：schema_version 探测 + v1（旧固定槽）→ canonical v2 → v3，
-//! 迁移留不可覆盖的 `config.json.v1.bak` / `config.json.v2.bak`，普通覆盖前留滚动 `config.json.bak`，
+//! 存储升级：schema_version 探测 + v1（旧固定槽）→ canonical v2 → v3 → v4，
+//! 迁移留不可覆盖的版本备份，普通覆盖前留滚动 `config.json.bak`，
 //! 清 key / 删 profile 后净化滚动备份（旧明文 key 不可从 .bak 恢复）。
 //!
 //! 所有函数以显式 `dir` 参数工作，便于用临时目录做无副作用的单元测试；
@@ -23,6 +23,7 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
+use crate::model_catalog::{ModelRoute, RoleBindings};
 use crate::provider_contracts::{CredentialSource, ModelPolicy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -75,8 +76,37 @@ pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Resu
     Ok(())
 }
 
-/// 当前配置 schema 版本。>3 的文件由更新版本 app 写入，本版本拒绝启动（不误改）。
-pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+/// 当前配置 schema 版本。>4 的文件由更新版本 app 写入，本版本拒绝启动（不误改）。
+pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeBindingCommit {
+    pub profile_id: String,
+    pub route_fp: String,
+    pub catalog_fp: String,
+    pub binding_fp: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GatewayRuntimeJournalIdentity {
+    pub provider: String,
+    pub shim: String,
+    pub launch_id: String,
+    pub catalog_fp: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Default, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RuntimeTransactionJournal {
+    pub transaction_id: String,
+    pub target_profile_id: String,
+    pub stage: String,
+    pub previous_binding: Option<RuntimeBindingCommit>,
+    #[serde(default)]
+    pub previous_gateway: Option<GatewayRuntimeJournalIdentity>,
+}
 
 fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
@@ -94,8 +124,16 @@ pub struct Profile {
     pub base_url: String,
     #[serde(default)]
     pub api_key: String,
-    #[serde(default)]
+    /// v3 单模型的进程内兼容影子。v4 canonical 配置不再序列化该字段；
+    /// load/normalize 从 default_model_route_id 回填，旧调用点在分模块迁移期间仍可读。
+    #[serde(default, skip_serializing)]
     pub model: String,
+    #[serde(default)]
+    pub model_catalog: Vec<ModelRoute>,
+    #[serde(default)]
+    pub default_model_route_id: String,
+    #[serde(default)]
+    pub role_bindings: RoleBindings,
     #[serde(default)]
     pub credential_source: CredentialSource,
     #[serde(default)]
@@ -114,6 +152,8 @@ pub struct Profile {
     pub created_at: Option<i64>,
     #[serde(default)]
     pub notes: Option<String>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 /// 顶层配置。字段都有默认值，缺字段的旧文件也能读。
@@ -151,6 +191,14 @@ pub struct Config {
     /// 一次性迁移提示（#9 甲：回填默认模型后告知用户）。get_config 读后清空。
     #[serde(default)]
     pub pending_notice: Option<String>,
+    /// Last fully healthy gateway + isolated Science binding. Contains hashes
+    /// and public identities only; never credentials, endpoints, URLs or prompts.
+    #[serde(default)]
+    pub runtime_binding: Option<RuntimeBindingCommit>,
+    #[serde(default)]
+    pub runtime_transaction: Option<RuntimeTransactionJournal>,
+    #[serde(flatten, default)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Config {
@@ -167,13 +215,18 @@ impl Default for Config {
             secret: String::new(),
             mode: default_mode(),
             pending_notice: None,
+            runtime_binding: None,
+            runtime_transaction: None,
+            extra: BTreeMap::new(),
         }
     }
 }
 
 pub(crate) fn require_template_enabled(cfg: &Config, template_id: &str) -> Result<(), String> {
     if template_id == "codex" && !cfg.experimental_codex_enabled {
-        return Err("Codex 桥接是实验功能，当前未启用。请先在高级设置中显式开启。".into());
+        return Err(
+            "Codex 桥接是实验功能，当前未启用。请先在“设置 > Codex 账号与连接”中显式开启。".into(),
+        );
     }
     Ok(())
 }
@@ -224,6 +277,7 @@ pub enum VersionKind {
     Legacy,
     V2,
     V3,
+    V4,
     TooNew(u32),
 }
 
@@ -234,7 +288,7 @@ struct VersionProbe {
 }
 
 /// 先只解析 schema_version 判版本，避免用「必填字段缺失」误判旧文件。
-/// <2（含缺失=0）→ Legacy；==2 → V2；==3 → V3；>3 → TooNew（拒绝启动）。
+/// <2（含缺失=0）→ Legacy；==2 → V2；==3 → V3；==4 → V4；>4 → TooNew。
 pub fn detect_version(data: &[u8]) -> io::Result<VersionKind> {
     let probe: VersionProbe = serde_json::from_slice(data).map_err(|e| {
         io::Error::new(
@@ -245,7 +299,8 @@ pub fn detect_version(data: &[u8]) -> io::Result<VersionKind> {
     Ok(match probe.schema_version {
         v if v < 2 => VersionKind::Legacy,
         2 => VersionKind::V2,
-        v if v == CURRENT_SCHEMA_VERSION => VersionKind::V3,
+        3 => VersionKind::V3,
+        v if v == CURRENT_SCHEMA_VERSION => VersionKind::V4,
         v => VersionKind::TooNew(v),
     })
 }
@@ -311,7 +366,9 @@ pub fn migrate_v1_to_v2(
     }
 }
 
-pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config> {
+pub fn migrate_v2_to_v3(
+    v2: crate::config_legacy::ConfigV2,
+) -> io::Result<crate::config_legacy::ConfigV3> {
     let mut profiles = Vec::with_capacity(v2.profiles.len());
     for p in v2.profiles {
         let template_id = if crate::templates::by_id(&p.template_id).is_some() {
@@ -328,7 +385,14 @@ pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config
         };
         let contract = crate::provider_contracts::contract_for(&template_id, &api_format)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        profiles.push(Profile {
+        let model_policy = if contract.default_model_policy == ModelPolicy::DynamicCatalog {
+            crate::config_legacy::ModelPolicyV3::DynamicCatalog
+        } else if matches!(template_id.as_str(), "deepseek" | "qwen") {
+            crate::config_legacy::ModelPolicyV3::OptionalFixed
+        } else {
+            crate::config_legacy::ModelPolicyV3::RequiredFixed
+        };
+        profiles.push(crate::config_legacy::ProfileV3 {
             id: p.id,
             name: p.name,
             template_id,
@@ -339,17 +403,18 @@ pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config
             model: p.model,
             credential_source: contract.default_credential_source,
             credential_ref: None,
-            model_policy: contract.default_model_policy,
+            model_policy,
             website_url: p.website_url,
             icon: p.icon,
             icon_color: p.icon_color,
             sort_index: p.sort_index,
             created_at: p.created_at,
             notes: p.notes,
+            extra: BTreeMap::new(),
         });
     }
-    Ok(Config {
-        schema_version: CURRENT_SCHEMA_VERSION,
+    Ok(crate::config_legacy::ConfigV3 {
+        schema_version: 3,
         profiles,
         active_id: v2.active_id,
         proxy_port: v2.proxy_port,
@@ -360,6 +425,182 @@ pub fn migrate_v2_to_v3(v2: crate::config_legacy::ConfigV2) -> io::Result<Config
         secret: v2.secret,
         mode: v2.mode,
         pending_notice: v2.pending_notice,
+        extra: BTreeMap::new(),
+    })
+}
+
+fn legacy_native_model<'a>(template_id: &str, model: &'a str) -> Option<&'a str> {
+    match (template_id, model.trim()) {
+        ("deepseek", "claude-opus-4-8") => Some("deepseek-v4-pro"),
+        ("deepseek", "claude-sonnet-5" | "claude-sonnet-4-6" | "claude-haiku-4-5") => {
+            Some("deepseek-v4-flash")
+        }
+        ("qwen", "claude-opus-4-8") => Some("qwen3.7-max"),
+        ("qwen", "claude-sonnet-5" | "claude-sonnet-4-6") => Some("qwen-plus-latest"),
+        ("qwen", "claude-haiku-4-5") => Some("qwen-turbo"),
+        (_, "") => None,
+        (_, value) => Some(value),
+    }
+}
+
+fn set_catalog_default(
+    routes: &mut [ModelRoute],
+    default_selector: &mut String,
+    upstream_model: &str,
+) -> bool {
+    if let Some(index) = routes
+        .iter()
+        .position(|route| route.upstream_model == upstream_model)
+    {
+        routes.swap(0, index);
+        *default_selector = routes[0].selector_id.clone();
+        true
+    } else {
+        false
+    }
+}
+
+fn append_notice(existing: Option<String>, next: String) -> Option<String> {
+    Some(match existing {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing}\n{next}"),
+        _ => next,
+    })
+}
+
+pub fn migrate_v3_to_v4(v3: crate::config_legacy::ConfigV3) -> io::Result<Config> {
+    let mut profiles = Vec::with_capacity(v3.profiles.len());
+    let mut incomplete_ids = BTreeSet::new();
+    for mut p in v3.profiles {
+        if crate::templates::by_id(&p.template_id).is_none() {
+            p.template_id = "custom".into();
+        }
+        if p.api_format.trim().is_empty() {
+            p.api_format = crate::templates::by_id(&p.template_id)
+                .map(|template| template.api_format.to_string())
+                .unwrap_or_else(|| "anthropic".into());
+        }
+        let contract = crate::provider_contracts::contract_for(&p.template_id, &p.api_format)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let dynamic = contract.default_model_policy == ModelPolicy::DynamicCatalog;
+        if (p.model_policy == crate::config_legacy::ModelPolicyV3::DynamicCatalog) != dynamic {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "profile `{}` 的 v3 model_policy 与 provider contract 不一致",
+                    p.id
+                ),
+            ));
+        }
+        let (mut model_catalog, mut default_model_route_id, role_bindings) = if dynamic {
+            (Vec::new(), String::new(), RoleBindings::default())
+        } else if matches!(p.template_id.as_str(), "deepseek" | "qwen") {
+            let (mut routes, mut default, bindings) =
+                crate::model_catalog::preset_catalog(&p.template_id)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            let raw = p.model.trim();
+            if let Some(index) = routes
+                .iter()
+                .position(|route| !raw.is_empty() && route.selector_id == raw)
+            {
+                routes.swap(0, index);
+                default = routes[0].selector_id.clone();
+            } else if let Some(legacy) = legacy_native_model(&p.template_id, &p.model) {
+                if !set_catalog_default(&mut routes, &mut default, legacy) {
+                    let (manual, manual_default, _) = crate::model_catalog::single_route_catalog(
+                        &crate::model_catalog::namespace_for(&p.template_id, &p.api_format),
+                        legacy,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    routes.insert(0, manual.into_iter().next().expect("single route"));
+                    default = manual_default;
+                }
+            }
+            (routes, default, bindings)
+        } else {
+            if let Some(model) = legacy_native_model(&p.template_id, &p.model) {
+                crate::model_catalog::single_route_catalog(
+                    &crate::model_catalog::namespace_for(&p.template_id, &p.api_format),
+                    model,
+                    None,
+                    None,
+                )
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            } else {
+                incomplete_ids.insert(p.id.clone());
+                (Vec::new(), String::new(), RoleBindings::default())
+            }
+        };
+        let model = model_catalog
+            .iter()
+            .find(|route| route.selector_id == default_model_route_id)
+            .map(|route| route.upstream_model.clone())
+            .unwrap_or_default();
+        profiles.push(Profile {
+            id: p.id,
+            name: p.name,
+            template_id: p.template_id,
+            category: p.category,
+            api_format: p.api_format,
+            base_url: p.base_url,
+            api_key: p.api_key,
+            model,
+            model_catalog: std::mem::take(&mut model_catalog),
+            default_model_route_id: std::mem::take(&mut default_model_route_id),
+            role_bindings,
+            credential_source: p.credential_source,
+            credential_ref: p.credential_ref,
+            model_policy: if dynamic {
+                ModelPolicy::DynamicCatalog
+            } else {
+                ModelPolicy::SavedCatalog
+            },
+            website_url: p.website_url,
+            icon: p.icon,
+            icon_color: p.icon_color,
+            sort_index: p.sort_index,
+            created_at: p.created_at,
+            notes: p.notes,
+            extra: p.extra,
+        });
+    }
+    let incomplete_active = incomplete_ids.contains(&v3.active_id);
+    let pending_notice = if incomplete_ids.is_empty() {
+        v3.pending_notice
+    } else {
+        append_notice(
+            v3.pending_notice,
+            format!(
+                "{} 个旧静态配置缺少模型目录，已保留为未完成配置{}。",
+                incomplete_ids.len(),
+                if incomplete_active {
+                    "；原生效配置已安全取消激活"
+                } else {
+                    ""
+                }
+            ),
+        )
+    };
+    Ok(Config {
+        schema_version: CURRENT_SCHEMA_VERSION,
+        profiles,
+        active_id: if incomplete_active {
+            String::new()
+        } else {
+            v3.active_id
+        },
+        proxy_port: v3.proxy_port,
+        sandbox_port: v3.sandbox_port,
+        reuse_system_ssh: v3.reuse_system_ssh,
+        experimental_codex_enabled: v3.experimental_codex_enabled,
+        codex_network: v3.codex_network,
+        secret: v3.secret,
+        mode: v3.mode,
+        pending_notice,
+        runtime_binding: None,
+        runtime_transaction: None,
+        extra: v3.extra,
     })
 }
 
@@ -738,7 +979,9 @@ fn write_rolling_backup_unlocked(dir: &Path) -> io::Result<()> {
     let data = secure
         .read_regular("config.json")?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "config.json 不存在"))?;
-    atomic_write_named_bytes_in(&secure, "config.json.bak", &data, |secure| secure.sync())
+    atomic_write_named_bytes_in(&secure, "config.json.bak", &data, None, |secure| {
+        secure.sync()
+    })
 }
 
 /// 清 key / 删 profile 后净化滚动备份：直接删，避免旧明文 key 残留可恢复。
@@ -754,8 +997,8 @@ pub fn drop_rolling_backup(dir: &Path) {
 }
 
 /// 从 `dir/config.json` 读配置。文件不存在返回 [`Config::default`]。
-/// v1/v2 先完整解析、迁移、校验，再写不可覆盖的版本备份，最后只原子提交一次 v3。
-/// v3 悬空 active_id 归一化为空。文件/目录是符号链接则报错（不跟随读）。
+/// v1/v2/v3 先完整解析、迁移、校验，再写不可覆盖的版本备份，最后只原子提交一次 v4。
+/// v4 悬空 active_id 归一化为空。文件/目录是符号链接则报错（不跟随读）。
 pub fn load_from(dir: &Path) -> io::Result<Config> {
     let access = config_access();
     ensure_config_access_open(&access)?;
@@ -787,8 +1030,6 @@ fn load_from_unlocked(dir: &Path) -> io::Result<Config> {
                         format!("旧 config 解析失败：{e}"),
                     )
                 })?;
-            // 原始 v1 先留证；后续 canonical v2 / v3 校验失败也不改当前 config。
-            write_versioned_backup_bytes_in(&secure, 1, &data)?;
             let v2 = migrate_v1_to_v2(legacy);
             let canonical_v2 = serde_json::to_vec_pretty(&v2).map_err(|error| {
                 io::Error::new(
@@ -796,18 +1037,12 @@ fn load_from_unlocked(dir: &Path) -> io::Result<Config> {
                     format!("v2 备份序列化失败：{error}"),
                 )
             })?;
-            let mut cfg = normalize_active(migrate_v2_to_v3(v2)?);
-            let filled = backfill_relay_models(&mut cfg);
-            if !filled.is_empty() {
-                cfg.pending_notice = Some(format!(
-                    "已为 {} 个旧配置补上默认模型（可在连接编辑修改）。",
-                    filled.len()
-                ));
-            }
+            let cfg = normalize_active(migrate_v3_to_v4(migrate_v2_to_v3(v2)?)?);
             validate_loaded_ports(&cfg)?;
             validate_profile_contracts(&cfg)?;
+            write_versioned_backup_bytes_in(&secure, 1, &data)?;
             write_versioned_backup_bytes_in(&secure, 2, &canonical_v2)?;
-            save_to_secure(&secure, &cfg)?;
+            commit_migrated_config(&secure, &data, &cfg)?;
             Ok(cfg)
         }
         VersionKind::V2 => {
@@ -824,25 +1059,33 @@ fn load_from_unlocked(dir: &Path) -> io::Result<Config> {
                     format!("v2 备份序列化失败：{error}"),
                 )
             })?;
-            let mut cfg = normalize_active(migrate_v2_to_v3(v2)?);
-            let filled = backfill_relay_models(&mut cfg);
-            if !filled.is_empty() {
-                cfg.pending_notice = Some(format!(
-                    "已为 {} 个旧配置补上默认模型（可在连接编辑修改）。",
-                    filled.len()
-                ));
-            }
+            let cfg = normalize_active(migrate_v3_to_v4(migrate_v2_to_v3(v2)?)?);
             validate_loaded_ports(&cfg)?;
             validate_profile_contracts(&cfg)?;
             write_versioned_backup_bytes_in(&secure, 2, &canonical_v2)?;
-            save_to_secure(&secure, &cfg)?;
+            commit_migrated_config(&secure, &data, &cfg)?;
             Ok(cfg)
         }
         VersionKind::V3 => {
+            let v3: crate::config_legacy::ConfigV3 =
+                serde_json::from_slice(&data).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("v3 config.json 解析失败：{e}"),
+                    )
+                })?;
+            let cfg = normalize_active(migrate_v3_to_v4(v3)?);
+            validate_loaded_ports(&cfg)?;
+            validate_profile_contracts(&cfg)?;
+            write_versioned_backup_bytes_in(&secure, 3, &data)?;
+            commit_migrated_config(&secure, &data, &cfg)?;
+            Ok(cfg)
+        }
+        VersionKind::V4 => {
             let cfg: Config = serde_json::from_slice(&data).map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("config.json 解析失败：{e}"),
+                    format!("v4 config.json 解析失败：{e}"),
                 )
             })?;
             let cfg = normalize_active(cfg);
@@ -851,6 +1094,63 @@ fn load_from_unlocked(dir: &Path) -> io::Result<Config> {
             Ok(cfg)
         }
     }
+}
+
+fn commit_migrated_config(secure: &SecureDir, original: &[u8], cfg: &Config) -> io::Result<()> {
+    let json = serde_json::to_vec_pretty(cfg).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("v4 配置序列化失败：{error}"),
+        )
+    })?;
+    let decoded: Config = serde_json::from_slice(&json).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("v4 配置回读验证失败：{error}"),
+        )
+    })?;
+    let decoded = normalize_active(decoded);
+    validate_loaded_ports(&decoded)?;
+    validate_profile_contracts(&decoded)?;
+    atomic_write_named_bytes_in(secure, "config.json", &json, Some(original), |secure| {
+        secure.sync()
+    })?;
+
+    let published = secure
+        .read_regular("config.json")?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "v4 配置提交后消失"));
+    let post_check = published.and_then(|published| {
+        if published != json {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "v4 配置提交后字节校验不一致",
+            ));
+        }
+        let reread: Config = serde_json::from_slice(&published).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("v4 配置提交后解析失败：{error}"),
+            )
+        })?;
+        let reread = normalize_active(reread);
+        validate_loaded_ports(&reread)?;
+        validate_profile_contracts(&reread)
+    });
+    if let Err(post_error) = post_check {
+        return match atomic_write_named_bytes_in(
+            secure,
+            "config.json",
+            original,
+            Some(&json),
+            |secure| secure.sync(),
+        ) {
+            Ok(()) => Err(post_error),
+            Err(rollback_error) => Err(io::Error::other(format!(
+                "v4 配置提交后验证失败：{post_error}；恢复原配置也失败：{rollback_error}"
+            ))),
+        };
+    }
+    Ok(())
 }
 
 fn validate_loaded_ports(cfg: &Config) -> io::Result<()> {
@@ -877,6 +1177,12 @@ fn normalize_active(mut cfg: Config) -> Config {
         if crate::templates::by_id(&p.template_id).is_none() && !known_contract {
             p.template_id = "custom".to_string();
         }
+        p.model = p
+            .model_catalog
+            .iter()
+            .find(|route| route.selector_id == p.default_model_route_id)
+            .map(|route| route.upstream_model.clone())
+            .unwrap_or_default();
     }
     if !cfg.active_id.is_empty() && cfg.profile_by_id(&cfg.active_id).is_none() {
         cfg.active_id.clear();
@@ -885,8 +1191,76 @@ fn normalize_active(mut cfg: Config) -> Config {
 }
 
 fn validate_profile_contracts(cfg: &Config) -> io::Result<()> {
+    if cfg.schema_version != CURRENT_SCHEMA_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("只接受 canonical schema v{CURRENT_SCHEMA_VERSION}"),
+        ));
+    }
     let mut ids = BTreeSet::new();
+    for reserved in [
+        "schema_version",
+        "profiles",
+        "active_id",
+        "proxy_port",
+        "sandbox_port",
+        "reuse_system_ssh",
+        "experimental_codex_enabled",
+        "codex_network",
+        "secret",
+        "mode",
+        "pending_notice",
+        "runtime_binding",
+        "runtime_transaction",
+    ] {
+        if cfg.extra.contains_key(reserved) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("config extension 与 canonical 字段冲突：{reserved}"),
+            ));
+        }
+    }
+    for reserved in ["mode", "proxy_url"] {
+        if cfg.codex_network.extra.contains_key(reserved) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("codex_network extension 与 canonical 字段冲突：{reserved}"),
+            ));
+        }
+    }
     for profile in &cfg.profiles {
+        for reserved in [
+            "id",
+            "name",
+            "template_id",
+            "category",
+            "api_format",
+            "base_url",
+            "api_key",
+            "model",
+            "model_catalog",
+            "default_model_route_id",
+            "role_bindings",
+            "credential_source",
+            "credential_ref",
+            "model_policy",
+            "website_url",
+            "icon",
+            "icon_color",
+            "sort_index",
+            "created_at",
+            "notes",
+        ] {
+            if profile.extra.contains_key(reserved) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "profile `{}` extension 与 canonical 字段冲突：{reserved}",
+                        profile.id
+                    ),
+                ));
+            }
+        }
         if profile.id.trim().is_empty() || profile.id.len() > 256 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -914,6 +1288,44 @@ fn validate_profile_contracts(cfg: &Config) -> io::Result<()> {
                     profile.id
                 ),
             ));
+        }
+        match profile.model_policy {
+            ModelPolicy::DynamicCatalog => {
+                if profile.template_id != "codex"
+                    || !profile.model_catalog.is_empty()
+                    || !profile.default_model_route_id.is_empty()
+                    || !profile.role_bindings.all_empty()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("动态目录 profile `{}` 含静态目录或不是 Codex", profile.id),
+                    ));
+                }
+            }
+            ModelPolicy::SavedCatalog if profile.model_catalog.is_empty() => {
+                if cfg.active_id == profile.id
+                    || !profile.default_model_route_id.is_empty()
+                    || !profile.role_bindings.all_empty()
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("未完成静态 profile `{}` 不得激活或保存悬空绑定", profile.id),
+                    ));
+                }
+            }
+            ModelPolicy::SavedCatalog => {
+                crate::model_catalog::validate_saved_catalog(
+                    &profile.model_catalog,
+                    &profile.default_model_route_id,
+                    &profile.role_bindings,
+                )
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("profile `{}` 模型目录无效：{error}", profile.id),
+                    )
+                })?;
+            }
         }
         match profile.credential_source {
             CredentialSource::ApiKey if profile.credential_ref.is_some() => {
@@ -955,38 +1367,6 @@ fn validate_profile_contracts(cfg: &Config) -> io::Result<()> {
     Ok(())
 }
 
-/// 甲迁移（修 #9 P1-a）：relay 家族空 model → 回填模板 builtin_models 首项（旗舰默认）。
-/// native 与无默认的 custom（builtin 空）不动。返回被回填的 profile 名，供一次性提示。幂等。
-fn backfill_relay_models(cfg: &mut Config) -> Vec<String> {
-    let mut changed = Vec::new();
-    for p in cfg.profiles.iter_mut() {
-        if !p.model.trim().is_empty() {
-            continue;
-        }
-        let api_format = if p.api_format.trim().is_empty() {
-            crate::templates::by_id(&p.template_id)
-                .map(|template| template.api_format)
-                .unwrap_or("anthropic")
-        } else {
-            p.api_format.as_str()
-        };
-        let contract_requires_fixed =
-            crate::provider_contracts::contract_for(&p.template_id, api_format)
-                .map(|contract| contract.default_model_policy == ModelPolicy::RequiredFixed)
-                .unwrap_or(false);
-        if p.model_policy != ModelPolicy::RequiredFixed || !contract_requires_fixed {
-            continue; // native 不需要
-        }
-        if let Some(def) =
-            crate::templates::by_id(&p.template_id).and_then(|t| t.builtin_models.first())
-        {
-            p.model = (*def).to_string();
-            changed.push(p.name.clone());
-        }
-    }
-    changed
-}
-
 /// 原子写 `dir/config.json`（0600）。目录/目标文件是符号链接则拒绝。
 #[allow(dead_code)]
 pub fn save_to(dir: &Path, cfg: &Config) -> io::Result<()> {
@@ -1016,12 +1396,12 @@ fn save_to_secure(secure: &SecureDir, cfg: &Config) -> io::Result<()> {
         )
     })?;
 
-    atomic_write_named_bytes_in(secure, "config.json", &json, |secure| secure.sync())
+    atomic_write_named_bytes_in(secure, "config.json", &json, None, |secure| secure.sync())
 }
 
 fn atomic_write_config_bytes(dir: &Path, json: &[u8]) -> io::Result<()> {
     let secure = SecureDir::open(dir, true)?;
-    atomic_write_named_bytes_in(&secure, "config.json", json, |secure| secure.sync())
+    atomic_write_named_bytes_in(&secure, "config.json", json, None, |secure| secure.sync())
 }
 
 #[derive(Debug)]
@@ -1054,12 +1434,18 @@ fn atomic_write_named_bytes_in<F>(
     secure: &SecureDir,
     target: &str,
     bytes: &[u8],
+    expected_before: Option<&[u8]>,
     commit_sync: F,
 ) -> io::Result<()>
 where
     F: FnOnce(&SecureDir) -> io::Result<()>,
 {
     let before = secure.read_regular_snapshot(target)?;
+    if let Some(expected) = expected_before {
+        if before.as_ref().map(|(bytes, _)| bytes.as_slice()) != Some(expected) {
+            return Err(io::Error::other("配置在迁移提交前被外部进程修改"));
+        }
+    }
     let suffix = backup_suffix();
     let tmp = format!(".{target}.tmp-{}-{suffix}", std::process::id());
 
@@ -1130,6 +1516,7 @@ pub(crate) enum CodexDowngradeAction {
 pub(crate) struct DowngradePreview {
     pub(crate) v2: crate::config_legacy::ConfigV2,
     pub(crate) exports: Vec<serde_json::Value>,
+    pub(crate) fingerprint: String,
 }
 
 #[derive(Debug)]
@@ -1181,6 +1568,19 @@ pub(crate) fn prepare_downgrade_to_v2(
     actions: &BTreeMap<String, CodexDowngradeAction>,
 ) -> Result<DowngradePreview, String> {
     validate_profile_contracts(cfg).map_err(|error| error.to_string())?;
+    if !cfg.extra.is_empty()
+        || !cfg.codex_network.extra.is_empty()
+        || cfg.profiles.iter().any(|profile| {
+            !profile.extra.is_empty()
+                || !profile.role_bindings.extra.is_empty()
+                || profile
+                    .model_catalog
+                    .iter()
+                    .any(|route| !route.extra.is_empty())
+        })
+    {
+        return Err("配置含当前版本不理解的扩展字段；为避免静默丢失，拒绝降级到 v2。".into());
+    }
     let codex_ids: BTreeSet<String> = cfg
         .profiles
         .iter()
@@ -1219,6 +1619,46 @@ pub(crate) fn prepare_downgrade_to_v2(
             }
             continue;
         }
+        let default_upstream = profile
+            .model_catalog
+            .iter()
+            .find(|route| route.selector_id == profile.default_model_route_id)
+            .map(|route| route.upstream_model.clone())
+            .unwrap_or_default();
+        if !profile.model_catalog.is_empty() {
+            exports.push(serde_json::json!({
+                "schema_version": 1,
+                "kind": "saved_model_catalog",
+                "profile": {
+                    "id": profile.id,
+                    "name": profile.name,
+                    "template_id": profile.template_id,
+                    "category": profile.category,
+                    "api_format": profile.api_format,
+                    "model_policy": profile.model_policy,
+                    "default_model_route_id": profile.default_model_route_id,
+                    "default_upstream_model": default_upstream,
+                    "model_catalog": profile.model_catalog.iter().map(|route| serde_json::json!({
+                        "selector_id": route.selector_id,
+                        "display_name": route.display_name,
+                        "upstream_model": route.upstream_model,
+                        "supports_tools": route.supports_tools,
+                    })).collect::<Vec<_>>(),
+                    "role_bindings": {
+                        "sonnet": profile.role_bindings.sonnet,
+                        "opus": profile.role_bindings.opus,
+                        "haiku": profile.role_bindings.haiku,
+                        "fable": profile.role_bindings.fable,
+                    },
+                    "website_url": profile.website_url,
+                    "icon": profile.icon,
+                    "icon_color": profile.icon_color,
+                    "sort_index": profile.sort_index,
+                    "created_at": profile.created_at,
+                    "notes": profile.notes,
+                }
+            }));
+        }
         profiles.push(crate::config_legacy::ProfileV2 {
             id: profile.id.clone(),
             name: profile.name.clone(),
@@ -1227,7 +1667,7 @@ pub(crate) fn prepare_downgrade_to_v2(
             api_format: profile.api_format.clone(),
             base_url: profile.base_url.clone(),
             api_key: profile.api_key.clone(),
-            model: profile.model.clone(),
+            model: default_upstream,
             website_url: profile.website_url.clone(),
             icon: profile.icon.clone(),
             icon_color: profile.icon_color.clone(),
@@ -1241,6 +1681,11 @@ pub(crate) fn prepare_downgrade_to_v2(
     } else {
         cfg.active_id.clone()
     };
+    let fingerprint_bytes = serde_json::to_vec(cfg).map_err(|error| error.to_string())?;
+    let mut fingerprint_hasher = Sha256::new();
+    fingerprint_hasher.update(b"csswitch-v2-downgrade-preview-v1\0");
+    fingerprint_hasher.update(&fingerprint_bytes);
+    let fingerprint = format!("{:x}", fingerprint_hasher.finalize());
     Ok(DowngradePreview {
         v2: crate::config_legacy::ConfigV2 {
             schema_version: 2,
@@ -1254,6 +1699,7 @@ pub(crate) fn prepare_downgrade_to_v2(
             pending_notice: cfg.pending_notice.clone(),
         },
         exports,
+        fingerprint,
     })
 }
 
@@ -1269,7 +1715,7 @@ pub(crate) fn downgrade_to_v2(
 ) -> Result<Option<PathBuf>, String> {
     let access = config_access();
     ensure_config_access_open(&access).map_err(|error| error.to_string())?;
-    downgrade_to_v2_unlocked(dir, actions, export_destination).map_err(|error| error.message)
+    downgrade_to_v2_unlocked(dir, actions, export_destination, None).map_err(|error| error.message)
 }
 
 /// Production terminal variant. It serializes against every config read/write,
@@ -1280,10 +1726,12 @@ pub(crate) fn downgrade_to_v2_and_latch(
     dir: &Path,
     actions: &BTreeMap<String, CodexDowngradeAction>,
     export_destination: Option<&Path>,
+    expected_fingerprint: &str,
 ) -> Result<Option<PathBuf>, DowngradeError> {
     let mut access = config_access();
     ensure_config_access_open(&access).map_err(|error| DowngradeError::safe(error.to_string()))?;
-    let result = downgrade_to_v2_unlocked(dir, actions, export_destination);
+    let result =
+        downgrade_to_v2_unlocked(dir, actions, export_destination, Some(expected_fingerprint));
     latch_terminal_downgrade_outcome(&mut access, &result);
     result
 }
@@ -1292,9 +1740,15 @@ fn downgrade_to_v2_unlocked(
     dir: &Path,
     actions: &BTreeMap<String, CodexDowngradeAction>,
     export_destination: Option<&Path>,
+    expected_fingerprint: Option<&str>,
 ) -> Result<Option<PathBuf>, DowngradeError> {
     let cfg = load_from_unlocked(dir).map_err(|error| DowngradeError::safe(error.to_string()))?;
     let preview = prepare_downgrade_to_v2(&cfg, actions)?;
+    if expected_fingerprint
+        .is_some_and(|expected| expected.is_empty() || expected != preview.fingerprint)
+    {
+        return Err("配置在确认后发生变化；未导出、未降级，请重新预览并确认。".into());
+    }
     let v2_bytes = serde_json::to_vec_pretty(&preview.v2)
         .map_err(|error| format!("v2 配置序列化失败：{error}"))?;
     let export_bytes = if preview.exports.is_empty() {
@@ -1302,37 +1756,37 @@ fn downgrade_to_v2_unlocked(
     } else {
         Some(
             serde_json::to_vec_pretty(&serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "profiles": preview.exports
             }))
-            .map_err(|error| format!("Codex profile export 序列化失败：{error}"))?,
+            .map_err(|error| format!("兼容性元数据导出序列化失败：{error}"))?,
         )
     };
 
     let export_path = match (export_bytes, export_destination) {
         (Some(bytes), Some(path)) => {
             if path == config_path(dir) {
-                return Err("Codex export 目标不得覆盖 config.json".into());
+                return Err("兼容性导出目标不得覆盖 config.json".into());
             }
             let parent = path
                 .parent()
                 .filter(|parent| !parent.as_os_str().is_empty())
-                .ok_or("Codex export 目标缺少父目录")?;
+                .ok_or("兼容性导出目标缺少父目录")?;
             let name = path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .ok_or("Codex export 文件名必须是有效 UTF-8")?;
+                .ok_or("兼容性导出文件名必须是有效 UTF-8")?;
             let config_dir = SecureDir::open(dir, false)
                 .map_err(|error| format!("打开 CSSwitch 配置目录失败：{error}"))?;
             let export_dir = SecureDir::open_unmanaged(parent)
-                .map_err(|error| format!("打开 Codex export 父目录失败：{error}"))?;
+                .map_err(|error| format!("打开兼容性导出父目录失败：{error}"))?;
             if config_dir
                 .same_directory(&export_dir)
                 .map_err(|error| format!("比较 export 目录失败：{error}"))?
             {
-                return Err("Codex export 不得写入 CSSwitch 配置目录或其路径别名".into());
+                return Err("兼容性导出不得写入 CSSwitch 配置目录或其路径别名".into());
             }
-            atomic_write_named_bytes_in(&export_dir, name, &bytes, |secure| secure.sync())
+            atomic_write_named_bytes_in(&export_dir, name, &bytes, None, |secure| secure.sync())
                 .map_err(|error| format!("Codex profile export 写入失败：{error}"))?;
             Some(path.to_path_buf())
         }
@@ -1408,12 +1862,29 @@ mod tests {
         fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
+    fn saved_profile(id: &str, template_id: &str, api_format: &str, upstream: &str) -> Profile {
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog(template_id, api_format, Some(upstream))
+                .unwrap();
+        Profile {
+            id: id.into(),
+            template_id: template_id.into(),
+            api_format: api_format.into(),
+            model: upstream.into(),
+            model_catalog,
+            default_model_route_id,
+            role_bindings,
+            model_policy: ModelPolicy::SavedCatalog,
+            ..Default::default()
+        }
+    }
+
     // ---------- A1: 结构 + 访问器 + new_id/now_ms ----------
     #[test]
-    fn config_default_is_v3_empty() {
+    fn config_default_is_v4_empty() {
         let c = Config::default();
         assert_eq!(c.schema_version, CURRENT_SCHEMA_VERSION);
-        assert_eq!(c.schema_version, 3);
+        assert_eq!(c.schema_version, 4);
         assert!(c.profiles.is_empty());
         assert_eq!(c.active_id, "");
         assert_eq!(c.proxy_port, 18991);
@@ -1494,46 +1965,25 @@ mod tests {
     }
 
     #[test]
-    fn backfill_fills_empty_relay_model_from_template_default() {
-        let mut cfg = Config {
-            profiles: vec![
-                Profile {
-                    id: "p1".into(),
-                    name: "我的GLM".into(),
-                    template_id: "glm".into(),
-                    model: String::new(), // 空 → 回填旗舰默认
-                    ..Default::default()
-                },
-                Profile {
-                    id: "p2".into(),
-                    name: "已选".into(),
-                    template_id: "glm".into(),
-                    model: "glm-4.6".into(), // 非空 → 不动
-                    ..Default::default()
-                },
-                Profile {
-                    id: "p3".into(),
-                    name: "自定义空".into(),
-                    template_id: "custom".into(),
-                    model: String::new(), // custom 无默认 → 不回填（激活时另拦）
-                    ..Default::default()
-                },
-                Profile {
-                    id: "p4".into(),
-                    name: "DS".into(),
-                    template_id: "deepseek".into(),
-                    model: String::new(), // native → 不回填
-                    ..Default::default()
-                },
-            ],
-            ..Default::default()
+    fn v3_empty_static_profile_is_preserved_incomplete_and_deactivated() {
+        let v3 = crate::config_legacy::ConfigV3 {
+            profiles: vec![crate::config_legacy::ProfileV3 {
+                id: "p1".into(),
+                name: "我的 GLM".into(),
+                template_id: "glm".into(),
+                category: "cn_official".into(),
+                api_format: "anthropic".into(),
+                model_policy: crate::config_legacy::ModelPolicyV3::RequiredFixed,
+                ..Default::default()
+            }],
+            active_id: "p1".into(),
+            schema_version: 3,
+            ..crate::config_legacy::ConfigV3::default()
         };
-        let changed = backfill_relay_models(&mut cfg);
-        assert_eq!(changed, vec!["我的GLM".to_string()]);
-        assert_eq!(cfg.profile_by_id("p1").unwrap().model, "glm-5.2");
-        assert_eq!(cfg.profile_by_id("p2").unwrap().model, "glm-4.6");
-        assert_eq!(cfg.profile_by_id("p3").unwrap().model, "");
-        assert_eq!(cfg.profile_by_id("p4").unwrap().model, "");
+        let cfg = migrate_v3_to_v4(v3).unwrap();
+        assert!(cfg.profiles[0].model_catalog.is_empty());
+        assert!(cfg.active_id.is_empty());
+        assert!(cfg.pending_notice.unwrap().contains("取消激活"));
     }
 
     #[test]
@@ -1550,15 +2000,11 @@ mod tests {
     fn save_then_load_roundtrips() {
         let d = tmpdir().join(".csswitch");
         let p = Profile {
-            id: "id1".into(),
             name: "DeepSeek".into(),
-            template_id: "deepseek".into(),
             category: "cn_official".into(),
-            api_format: "anthropic".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             api_key: "sk-abcdef1234".into(),
-            model: String::new(),
-            ..Default::default()
+            ..saved_profile("id1", "deepseek", "anthropic", "deepseek-v4-pro")
         };
         let cfg = Config {
             profiles: vec![p],
@@ -1620,7 +2066,10 @@ mod tests {
             !after.contains("\"schema_version\""),
             "invalid legacy config should not be saved as v2: {after}"
         );
-        assert!(d.join("config.json.v1.bak").is_file());
+        assert!(
+            !d.join("config.json.v1.bak").exists(),
+            "旧配置未通过完整校验时不得发布迁移备份"
+        );
     }
 
     // ---------- A2: 版本探测 ----------
@@ -1638,6 +2087,11 @@ mod tests {
     fn detect_version_three_is_v3() {
         let d = br#"{"schema_version":3}"#;
         assert!(matches!(detect_version(d).unwrap(), VersionKind::V3));
+    }
+    #[test]
+    fn detect_version_four_is_v4() {
+        let d = br#"{"schema_version":4}"#;
+        assert!(matches!(detect_version(d).unwrap(), VersionKind::V4));
     }
     #[test]
     fn detect_version_garbage_errors() {
@@ -1811,7 +2265,7 @@ mod tests {
         )
         .unwrap();
         let cfg = load_from(&d).unwrap();
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, 4);
         assert_eq!(cfg.profiles.len(), 1);
         assert_eq!(cfg.active_profile().unwrap().api_key, "sk-x");
         assert!(d.join("config.json.v1.bak").exists(), "迁移必须留 v1 备份");
@@ -1819,10 +2273,10 @@ mod tests {
             d.join("config.json.v2.bak").exists(),
             "迁移必须留 canonical v2 备份"
         );
-        // 落盘后再读是 v3（幂等，不再迁移）。
+        // 落盘后再读是 v4（幂等，不再迁移）。
         let again = load_from(&d).unwrap();
         assert_eq!(again, cfg);
-        assert_eq!(again.schema_version, 3);
+        assert_eq!(again.schema_version, 4);
     }
     #[test]
     fn load_too_new_errors() {
@@ -1856,6 +2310,14 @@ mod tests {
     #[test]
     fn load_normalizes_unknown_template_id_to_custom() {
         let d = tmpdir().join(".csswitch");
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::single_route_catalog(
+                "custom-anthropic",
+                "relay-model-v1",
+                None,
+                None,
+            )
+            .unwrap();
         // 造一条 template_id 未命中注册表的 v2 profile（连接字段保留）。
         let cfg = Config {
             active_id: "p1".into(),
@@ -1866,6 +2328,11 @@ mod tests {
                 api_format: "anthropic".into(),
                 base_url: "https://relay.example/claude".into(),
                 api_key: "sk-x".into(),
+                model: "relay-model-v1".into(),
+                model_catalog,
+                default_model_route_id,
+                role_bindings,
+                model_policy: ModelPolicy::SavedCatalog,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1886,7 +2353,7 @@ mod tests {
         let d = tmpdir().join(".csswitch");
         let cfg = load_from(&d).unwrap();
         assert_eq!(cfg, Config::default());
-        assert_eq!(cfg.schema_version, 3);
+        assert_eq!(cfg.schema_version, 4);
         assert_eq!(cfg.proxy_port, 18991);
     }
 
@@ -2019,11 +2486,8 @@ mod tests {
         save_to(&d, &Config::default()).unwrap();
         update(&d, |c| {
             c.profiles.push(Profile {
-                id: "id1".into(),
                 name: "Q".into(),
-                template_id: "qwen".into(),
-                api_format: "openai_chat".into(),
-                ..Default::default()
+                ..saved_profile("id1", "qwen", "openai_chat", "qwen-plus-latest")
             });
             c.active_id = "id1".into();
         })
@@ -2075,7 +2539,7 @@ mod tests {
         fs::write(config_path(&d), &canonical).unwrap();
 
         let migrated = load_from(&d).unwrap();
-        assert_eq!(migrated.schema_version, 3);
+        assert_eq!(migrated.schema_version, 4);
         assert_eq!(migrated.active_id, "api-1");
         assert_eq!(migrated.proxy_port, 19001);
         assert_eq!(migrated.sandbox_port, 19002);
@@ -2089,8 +2553,150 @@ mod tests {
         assert_eq!(profile.api_key, "sk-existing");
         assert_eq!(profile.model, "glm-5.2");
         assert_eq!(profile.credential_source, CredentialSource::ApiKey);
-        assert_eq!(profile.model_policy, ModelPolicy::RequiredFixed);
+        assert_eq!(profile.model_policy, ModelPolicy::SavedCatalog);
         assert_eq!(fs::read(d.join("config.json.v2.bak")).unwrap(), canonical);
+    }
+
+    #[test]
+    fn v3_to_v4_preserves_unknown_fields_and_raw_backup_byte_for_byte() {
+        let d = tmpdir().join(".csswitch-v3-extensions");
+        fs::create_dir_all(&d).unwrap();
+        let raw = br#"{
+  "schema_version": 3,
+  "profiles": [{
+    "id": "qwen-legacy",
+    "name": "Qwen",
+    "template_id": "qwen",
+    "category": "cn_official",
+    "api_format": "openai_chat",
+    "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "api_key": "test-only",
+    "model": "claude-sonnet-5",
+    "credential_source": "api_key",
+    "model_policy": "optional_fixed",
+    "future_profile": {"keep": 2}
+  }],
+  "active_id": "qwen-legacy",
+  "proxy_port": 19031,
+  "sandbox_port": 19032,
+  "codex_network": {"mode": "auto", "proxy_url": "", "future_network": 3},
+  "mode": "proxy",
+  "future_top": [1, 2, 3]
+}"#;
+        fs::write(config_path(&d), raw).unwrap();
+        let migrated = load_from(&d).unwrap();
+        assert_eq!(migrated.extra["future_top"], serde_json::json!([1, 2, 3]));
+        assert_eq!(migrated.profiles[0].extra["future_profile"]["keep"], 2);
+        assert_eq!(migrated.codex_network.extra["future_network"], 3);
+        assert_eq!(migrated.profiles[0].model, "qwen-plus-latest");
+        assert_eq!(fs::read(d.join("config.json.v3.bak")).unwrap(), raw);
+        let canonical: serde_json::Value =
+            serde_json::from_slice(&fs::read(config_path(&d)).unwrap()).unwrap();
+        assert_eq!(canonical["schema_version"], 4);
+        assert!(canonical["profiles"][0].get("model").is_none());
+
+        update(&d, |cfg| cfg.pending_notice = Some("unrelated".into())).unwrap();
+        let again = load_from(&d).unwrap();
+        assert_eq!(again.extra["future_top"], serde_json::json!([1, 2, 3]));
+        assert_eq!(again.profiles[0].extra["future_profile"]["keep"], 2);
+        assert_eq!(again.codex_network.extra["future_network"], 3);
+        assert_eq!(fs::read(d.join("config.json.v3.bak")).unwrap(), raw);
+    }
+
+    #[test]
+    fn v4_route_and_role_extensions_survive_unrelated_update() {
+        let d = tmpdir().join(".csswitch-v4-route-extensions");
+        let mut profile = saved_profile("p1", "qwen", "openai_chat", "qwen-plus-latest");
+        profile.model_catalog[0]
+            .extra
+            .insert("future_route".into(), serde_json::json!({"keep": true}));
+        profile
+            .role_bindings
+            .extra
+            .insert("future_role".into(), serde_json::json!(7));
+        let cfg = Config {
+            profiles: vec![profile],
+            active_id: "p1".into(),
+            ..Default::default()
+        };
+        save_to(&d, &cfg).unwrap();
+        update(&d, |cfg| cfg.proxy_port = 19041).unwrap();
+        let got = load_from(&d).unwrap();
+        assert_eq!(
+            got.profiles[0].model_catalog[0].extra["future_route"]["keep"],
+            true
+        );
+        assert_eq!(got.profiles[0].role_bindings.extra["future_role"], 7);
+    }
+
+    #[test]
+    fn native_v3_model_variants_preserve_the_selected_upstream() {
+        for (template_id, api_format, old_model, expected, expected_len) in [
+            ("deepseek", "anthropic", "", "deepseek-v4-flash", 2),
+            (
+                "deepseek",
+                "anthropic",
+                "claude-haiku-4-5",
+                "deepseek-v4-flash",
+                2,
+            ),
+            (
+                "deepseek",
+                "anthropic",
+                "deepseek-v4-pro",
+                "deepseek-v4-pro",
+                2,
+            ),
+            ("qwen", "openai_chat", "claude-opus-4-8", "qwen3.7-max", 3),
+            ("qwen", "openai_chat", "qwen-turbo", "qwen-turbo", 3),
+            (
+                "qwen",
+                "openai_chat",
+                "future-qwen-exact",
+                "future-qwen-exact",
+                4,
+            ),
+        ] {
+            let v3 = crate::config_legacy::ConfigV3 {
+                schema_version: 3,
+                profiles: vec![crate::config_legacy::ProfileV3 {
+                    id: "p".into(),
+                    name: "legacy".into(),
+                    template_id: template_id.into(),
+                    api_format: api_format.into(),
+                    model: old_model.into(),
+                    model_policy: crate::config_legacy::ModelPolicyV3::OptionalFixed,
+                    credential_source: CredentialSource::ApiKey,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let migrated = migrate_v3_to_v4(v3).unwrap();
+            assert_eq!(
+                migrated.profiles[0].model, expected,
+                "{template_id}:{old_model}"
+            );
+            assert_eq!(migrated.profiles[0].model_catalog.len(), expected_len);
+        }
+
+        let selector = crate::model_catalog::selector_id_v1("qwen", "qwen-turbo");
+        let v3 = crate::config_legacy::ConfigV3 {
+            schema_version: 3,
+            profiles: vec![crate::config_legacy::ProfileV3 {
+                id: "p".into(),
+                template_id: "qwen".into(),
+                api_format: "openai_chat".into(),
+                model: selector,
+                model_policy: crate::config_legacy::ModelPolicyV3::OptionalFixed,
+                credential_source: CredentialSource::ApiKey,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            migrate_v3_to_v4(v3).unwrap().profiles[0].model,
+            "qwen-turbo"
+        );
     }
 
     #[test]
@@ -2153,14 +2759,11 @@ mod tests {
         let d = root.join(".csswitch-downgrade");
         let export_destination = root.join("codex-profiles-export.v1.json");
         let api = Profile {
-            id: "api-1".into(),
             name: "DeepSeek".into(),
-            template_id: "deepseek".into(),
             category: "cn_official".into(),
-            api_format: "anthropic".into(),
+            base_url: "https://api.deepseek.test/anthropic".into(),
             api_key: "sk-preserve".into(),
-            model_policy: ModelPolicy::OptionalFixed,
-            ..Default::default()
+            ..saved_profile("api-1", "deepseek", "anthropic", "deepseek-v4-pro")
         };
         let cfg = Config {
             profiles: vec![api, codex_profile("codex-1")],
@@ -2172,6 +2775,7 @@ mod tests {
             codex_network: csswitch_codex_network::CodexNetworkSettings {
                 mode: csswitch_codex_network::CodexNetworkMode::Custom,
                 proxy_url: "socks5h://127.0.0.1:7890".into(),
+                ..Default::default()
             },
             ..Default::default()
         };
@@ -2197,9 +2801,13 @@ mod tests {
 
         let export = fs::read_to_string(export_path).unwrap();
         assert!(export.contains("Codex account"));
+        assert!(export.contains("saved_model_catalog"));
         assert!(!export.contains("csswitch:codex:default"));
         assert!(!export.contains("credential_ref"));
         assert!(!export.contains("api_key"));
+        assert!(!export.contains("sk-preserve"));
+        assert!(!export.contains("api.deepseek.test"));
+        assert!(!export.contains("keep-secret"));
     }
 
     #[test]
@@ -2240,7 +2848,8 @@ mod tests {
             "codex-terminal".into(),
             CodexDowngradeAction::ExportThenRemove,
         )]);
-        downgrade_to_v2_and_latch(&dir, &actions, Some(&destination)).unwrap();
+        let fingerprint = prepare_downgrade_to_v2(&cfg, &actions).unwrap().fingerprint;
+        downgrade_to_v2_and_latch(&dir, &actions, Some(&destination), &fingerprint).unwrap();
 
         let raw: serde_json::Value =
             serde_json::from_slice(&fs::read(config_path(&dir)).unwrap()).unwrap();
@@ -2314,6 +2923,7 @@ mod tests {
             &secure,
             "config.json",
             br#"{"schema_version":3,"changed":true}"#,
+            None,
             |_| Err(io::Error::other("injected fsync failure")),
         )
         .unwrap_err();
@@ -2340,6 +2950,7 @@ mod tests {
             &secure,
             "config.json",
             br#"{"schema_version":3,"changed":true}"#,
+            None,
             |secure| {
                 fs::set_permissions(&secure.path, fs::Permissions::from_mode(0o500))?;
                 Err(io::Error::other("injected commit sync failure"))
@@ -2375,12 +2986,8 @@ mod tests {
         let d = tmpdir().join(".csswitch-clear-key");
         let mut cfg = Config {
             profiles: vec![Profile {
-                id: "api-1".into(),
-                template_id: "deepseek".into(),
-                api_format: "anthropic".into(),
                 api_key: "sk-must-not-survive".into(),
-                model_policy: ModelPolicy::OptionalFixed,
-                ..Default::default()
+                ..saved_profile("api-1", "deepseek", "anthropic", "deepseek-v4-pro")
             }],
             active_id: "api-1".into(),
             ..Default::default()
@@ -2441,6 +3048,7 @@ mod tests {
             &export_dir,
             "existing-export.json",
             b"replacement",
+            None,
             |_| Err(io::Error::other("injected export dir fsync failure")),
         )
         .is_err());

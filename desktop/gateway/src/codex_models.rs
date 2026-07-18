@@ -5,6 +5,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -254,6 +255,7 @@ pub(crate) struct CodexModelsSnapshot {
     models: Vec<CachedModel>,
     source: CatalogSource,
     age_seconds: u64,
+    published_generation: u64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -332,6 +334,7 @@ impl CodexModelsSnapshot {
                 "source": self.source.as_str(),
                 "stale": self.source == CatalogSource::StaleCache,
                 "age_seconds": self.age_seconds,
+                "generation": self.published_generation,
             },
         })
     }
@@ -416,6 +419,8 @@ pub(crate) struct CodexModelCatalog {
     normal_ttl_seconds: u64,
     stale_ttl_seconds: u64,
     state: Mutex<CatalogState>,
+    published: Mutex<Option<(CatalogIdentity, CodexModelsSnapshot)>>,
+    published_generation: AtomicU64,
 }
 
 #[derive(Clone, Copy)]
@@ -504,7 +509,67 @@ impl CodexModelCatalog {
             normal_ttl_seconds: policy.normal_ttl_seconds,
             stale_ttl_seconds: policy.stale_ttl_seconds,
             state: Mutex::new(CatalogState::default()),
+            published: Mutex::new(None),
+            published_generation: AtomicU64::new(0),
         })
+    }
+
+    /// Return one immutable, process-published snapshot for both `/v1/models`
+    /// and inference. `list` re-reads the shared cache epoch before consulting
+    /// the network, so an explicit refresh performed by the desktop's isolated
+    /// scratch gateway becomes visible here. A fully validated candidate is
+    /// swapped under one lock; unchanged catalogs keep their generation.
+    pub(crate) fn published_snapshot(
+        &self,
+        secrets: &InferenceSecrets,
+    ) -> Result<CodexModelsSnapshot, CodexModelsError> {
+        let identity = CatalogIdentity::from_secrets(secrets);
+        let mut published = self
+            .published
+            .lock()
+            .map_err(|_| CodexModelsError::cache("Codex published catalog lock is unavailable"))?;
+        // Keep candidate selection and publication under one process-local
+        // lock. Otherwise an older fresh-cache reader can resume after a newer
+        // reader and publish the old catalog with a larger generation.
+        let candidate = self.list(secrets)?;
+        self.publish_candidate(&identity, candidate, &mut published)
+    }
+
+    /// Explicit UI discovery path. It bypasses the normal fresh-cache TTL, but
+    /// does not invalidate or remove the last good cache before the new
+    /// response has been fully validated and atomically committed.
+    pub(crate) fn refresh_published_snapshot(
+        &self,
+        secrets: &InferenceSecrets,
+    ) -> Result<CodexModelsSnapshot, CodexModelsError> {
+        let identity = CatalogIdentity::from_secrets(secrets);
+        let mut published = self
+            .published
+            .lock()
+            .map_err(|_| CodexModelsError::cache("Codex published catalog lock is unavailable"))?;
+        let candidate = self.list_at_mode(secrets, unix_time_seconds(), true)?;
+        self.publish_candidate(&identity, candidate, &mut published)
+    }
+
+    fn publish_candidate(
+        &self,
+        identity: &CatalogIdentity,
+        mut candidate: CodexModelsSnapshot,
+        published: &mut Option<(CatalogIdentity, CodexModelsSnapshot)>,
+    ) -> Result<CodexModelsSnapshot, CodexModelsError> {
+        if let Some((_, snapshot)) = published
+            .as_ref()
+            .filter(|(published_identity, _)| published_identity == identity)
+            .filter(|(_, snapshot)| snapshot.models == candidate.models)
+        {
+            return Ok(snapshot.clone());
+        }
+        candidate.published_generation = self
+            .published_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .saturating_add(1);
+        *published = Some((identity.clone(), candidate.clone()));
+        Ok(candidate)
     }
 
     pub(crate) fn list(
@@ -518,6 +583,15 @@ impl CodexModelCatalog {
         &self,
         secrets: &InferenceSecrets,
         now: u64,
+    ) -> Result<CodexModelsSnapshot, CodexModelsError> {
+        self.list_at_mode(secrets, now, false)
+    }
+
+    fn list_at_mode(
+        &self,
+        secrets: &InferenceSecrets,
+        now: u64,
+        force_refresh: bool,
     ) -> Result<CodexModelsSnapshot, CodexModelsError> {
         let identity = CatalogIdentity::from_secrets(secrets);
         let mut state = self
@@ -536,12 +610,14 @@ impl CodexModelCatalog {
             .flatten()
             .filter(|cache| cache.matches(&identity))
             .filter(|cache| cache.age_at(now).is_some());
-        if let Some(cache) = cached.as_ref() {
-            if cache
-                .age_at(now)
-                .is_some_and(|age| age <= self.normal_ttl_seconds)
-            {
-                return Ok(snapshot_from_cache(cache, CatalogSource::FreshCache, now));
+        if !force_refresh {
+            if let Some(cache) = cached.as_ref() {
+                if cache
+                    .age_at(now)
+                    .is_some_and(|age| age <= self.normal_ttl_seconds)
+                {
+                    return Ok(snapshot_from_cache(cache, CatalogSource::FreshCache, now));
+                }
             }
         }
         let stale = cached.filter(|cache| {
@@ -599,6 +675,15 @@ impl CodexModelCatalog {
         auth_generation: u64,
         account_hash: &str,
     ) {
+        if let Ok(mut published) = self.published.lock() {
+            if published.as_ref().is_some_and(|(identity, _)| {
+                identity.auth_epoch == auth_epoch
+                    && identity.auth_generation == auth_generation
+                    && identity.account_hash == account_hash
+            }) {
+                *published = None;
+            }
+        }
         if let Ok(mut state) = self.state.lock() {
             let identity = CatalogIdentity {
                 auth_epoch: auth_epoch.to_string(),
@@ -1001,6 +1086,11 @@ fn parse_live_response(mut response: Response) -> Result<FetchResult, CodexModel
             }
         })
         .collect();
+    if models.is_empty() {
+        return Err(CodexModelsError::protocol(
+            "Codex model catalog contains no visible models",
+        ));
+    }
     models.sort_by(|left, right| {
         left.priority
             .cmp(&right.priority)
@@ -1100,6 +1190,7 @@ fn snapshot_from_cache(
         models: cache.models.clone(),
         source,
         age_seconds: cache.age_at(now).unwrap_or_default(),
+        published_generation: 0,
     }
 }
 
@@ -1477,6 +1568,119 @@ mod tests {
 
     fn secrets() -> InferenceSecrets {
         InferenceSecrets::for_test("access-secret", "account-secret")
+    }
+
+    fn published_generation(snapshot: &super::CodexModelsSnapshot) -> u64 {
+        snapshot.response_body()["diagnostics"]["generation"]
+            .as_u64()
+            .unwrap()
+    }
+
+    #[test]
+    fn explicit_refresh_replaces_shared_snapshot_and_failures_keep_last_generation() {
+        let root = private_root();
+        let (endpoint, _count, _requests, server) =
+            serve_responses(vec![response("200 OK", &model_body(&["gpt-old"]), "")]);
+        let formal = CodexModelCatalog::for_test(endpoint, root.clone()).unwrap();
+        let first = formal.published_snapshot(&secrets()).unwrap();
+        assert!(first.contains_raw("gpt-old"));
+        assert_eq!(published_generation(&first), 1);
+        server.join().unwrap();
+
+        let (endpoint, _count, _requests, server) =
+            serve_responses(vec![response("200 OK", &model_body(&["gpt-new"]), "")]);
+        let scratch = CodexModelCatalog::for_test(endpoint, root.clone()).unwrap();
+        let refreshed = scratch.refresh_published_snapshot(&secrets()).unwrap();
+        assert!(refreshed.contains_raw("gpt-new"));
+        server.join().unwrap();
+
+        let second = formal.published_snapshot(&secrets()).unwrap();
+        assert!(second.contains_raw("gpt-new"));
+        assert!(!second.contains_raw("gpt-old"));
+        assert_eq!(published_generation(&second), 2);
+
+        let (endpoint, _count, _requests, server) = serve_responses(vec![
+            response("503 Service Unavailable", b"", ""),
+            response("503 Service Unavailable", b"", ""),
+            response("503 Service Unavailable", b"", ""),
+        ]);
+        let failed_scratch = CodexModelCatalog::for_test(endpoint, root.clone()).unwrap();
+        let stale = failed_scratch
+            .refresh_published_snapshot(&secrets())
+            .unwrap();
+        assert_eq!(stale.source(), CatalogSource::StaleCache);
+        assert!(stale.contains_raw("gpt-new"));
+        server.join().unwrap();
+
+        let unchanged = formal.published_snapshot(&secrets()).unwrap();
+        assert!(unchanged.contains_raw("gpt-new"));
+        assert_eq!(published_generation(&unchanged), 2);
+
+        let (endpoint, _count, _requests, server) =
+            serve_responses(vec![response("200 OK", &model_body(&[]), "")]);
+        let empty_scratch = CodexModelCatalog::for_test(endpoint, root.clone()).unwrap();
+        let error = empty_scratch
+            .refresh_published_snapshot(&secrets())
+            .unwrap_err();
+        assert_eq!(error.error_kind, "protocol");
+        server.join().unwrap();
+        let still_unchanged = formal.published_snapshot(&secrets()).unwrap();
+        assert!(still_unchanged.contains_raw("gpt-new"));
+        assert_eq!(published_generation(&still_unchanged), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn late_refresh_cannot_publish_over_a_newer_cross_process_cache_epoch() {
+        let root = private_root();
+        let listener = bind_loopback();
+        let address = listener.local_addr().unwrap();
+        let (late_started_tx, late_started_rx) = std::sync::mpsc::channel();
+        let (release_late_tx, release_late_rx) = std::sync::mpsc::channel();
+        let formal_server = thread::spawn(move || {
+            let (mut first, _) = listener.accept().unwrap();
+            read_request(&mut first);
+            first
+                .write_all(&response("200 OK", &model_body(&["gpt-old"]), ""))
+                .unwrap();
+            first.flush().unwrap();
+
+            let (mut late, _) = listener.accept().unwrap();
+            read_request(&mut late);
+            late_started_tx.send(()).unwrap();
+            release_late_rx.recv().unwrap();
+            late.write_all(&response("200 OK", &model_body(&["gpt-late-old"]), ""))
+                .unwrap();
+            late.flush().unwrap();
+        });
+        let formal = Arc::new(
+            CodexModelCatalog::for_test(format!("http://{address}/models"), root.clone()).unwrap(),
+        );
+        let initial = formal.published_snapshot(&secrets()).unwrap();
+        assert_eq!(published_generation(&initial), 1);
+
+        let formal_for_late = Arc::clone(&formal);
+        let late = thread::spawn(move || formal_for_late.refresh_published_snapshot(&secrets()));
+        late_started_rx.recv().unwrap();
+
+        let (endpoint, _count, _requests, external_server) =
+            serve_responses(vec![response("200 OK", &model_body(&["gpt-new"]), "")]);
+        CodexModelCatalog::for_test(endpoint, root.clone())
+            .unwrap()
+            .refresh_published_snapshot(&secrets())
+            .unwrap();
+        external_server.join().unwrap();
+
+        release_late_tx.send(()).unwrap();
+        let error = late.join().unwrap().unwrap_err();
+        assert_eq!(error.error_kind, "cache_invalidated");
+        formal_server.join().unwrap();
+
+        let current = formal.published_snapshot(&secrets()).unwrap();
+        assert!(current.contains_raw("gpt-new"));
+        assert!(!current.contains_raw("gpt-late-old"));
+        assert_eq!(published_generation(&current), 2);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

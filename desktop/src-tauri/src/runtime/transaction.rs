@@ -1,5 +1,6 @@
 /// 切换事务的提交/回滚决策（纯函数，spec §7）。live 路径难做确定性单测，故把决策抽出单独测。
 #[derive(Debug, PartialEq)]
+#[cfg(test)]
 pub(crate) enum SwitchOutcome {
     Commit,           // scratch 校验过 + 正式代理探活健康 → 提交 active_id
     RollbackToOld,    // scratch 过但正式代理起/探活失败 → 杀候选、恢复旧代理、不提交
@@ -7,6 +8,7 @@ pub(crate) enum SwitchOutcome {
 }
 
 /// 给定「候选 scratch 校验结果」与「正式代理探活结果」，决定切换事务走向。
+#[cfg(test)]
 pub(crate) fn decide_switch(scratch_ok: bool, real_healthy: bool) -> SwitchOutcome {
     if !scratch_ok {
         return SwitchOutcome::AbortBeforeStart;

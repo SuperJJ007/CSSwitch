@@ -17,3 +17,4 @@ pub(crate) mod provider_contracts;
 pub mod science_control;
 pub mod server;
 pub mod skill_install;
+pub mod static_profile;

@@ -150,12 +150,101 @@ class SkillRuntimeBoundary(unittest.TestCase):
         )
         self.assertIn('runOneClick("cached_once")', js)
         self.assertIn("此选择不会保存", js)
-        self.assertNotIn("localStorage", js)
+        self.assertNotIn("localStorage", one_click)
+        self.assertIn('THEME_STORAGE_KEY = "csswitch-theme"', js)
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
         self.assertIn("fn safe_science_version(path: &Path)", science)
         self.assertIn("version_cache.version(app_bin)", science)
         self.assertIn('"cached_choice_required"', science)
+
+    def test_manual_science_open_refreshes_url_and_has_visible_feedback(self):
+        js = (ROOT / "desktop/src/main.js").read_text()
+        runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+        system = (ROOT / "desktop/src-tauri/src/runtime/system.rs").read_text()
+
+        handler = js.split("async function openBrowser()", 1)[1].split(
+            "async function runDoctor", 1
+        )[0]
+        self.assertIn("if (busy || browserOpenInFlight) return", handler)
+        self.assertIn("browserOpenInFlight = true", handler)
+        self.assertIn("browserOpenInFlight = false", handler)
+        self.assertIn("syncOpenBrowserControl()", handler)
+        self.assertIn("正在获取新的 Science 地址", handler)
+        self.assertIn("已向默认浏览器发出打开 Science 的请求", handler)
+        self.assertIn('result.status === "error"', handler)
+        self.assertIn("setBrowserFallback(result.fallback_url)", handler)
+        self.assertIn('setMsg("打开浏览器失败："', handler)
+
+        control = js.split("function syncOpenBrowserControl()", 1)[1].split(
+            "function syncActivationControls", 1
+        )[0]
+        self.assertIn("busy || browserOpenInFlight", control)
+        self.assertIn('browserOpenInFlight ? "打开中…" : "浏览器打开"', control)
+
+        command = runtime.split("fn open_url_inner", 1)[1].split(
+            "pub(crate) async fn quit_app", 1
+        )[0]
+        self.assertIn("sandbox_listener_matches_runtime", command)
+        self.assertIn("sandbox_url(sandbox_port, &runtime)", command)
+        self.assertNotIn("st.sandbox_url.clone()", command)
+        self.assertIn("manual_open_result(url.clone(), open_in_browser(&url))", command)
+        self.assertIn("CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE", runtime)
+        self.assertIn('failed_open["fallback_url"]', runtime)
+        self.assertIn('ACCEPTANCE_OPEN_BIN_ENV: &str = "CSSWITCH_ACCEPTANCE_OPEN_BIN"', system)
+        self.assertIn('TEST_OPEN_BIN_ENV: &str = "CSSWITCH_TEST_OPEN_BIN"', system)
+        self.assertIn('return Ok(PathBuf::from("/usr/bin/open"))', system)
+        self.assertIn("if !path.is_absolute()", system)
+        matrix = (ROOT / "test/installed_provider_matrix.py").read_text()
+        self.assertIn('"CSSWITCH_ACCEPTANCE_OPEN_BIN": str(self.bin_dir / "open")', matrix)
+
+    def test_simple_model_inputs_and_one_click_failures_are_visible_and_structured(self):
+        js = (ROOT / "desktop/src/main.js").read_text()
+        session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()
+        runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()
+        lifecycle = (ROOT / "desktop/src-tauri/src/runtime/proxy_lifecycle.rs").read_text()
+        lib = (ROOT / "desktop/src-tauri/src/lib.rs").read_text()
+
+        submission = js.split("function catalogSubmission(kind)", 1)[1].split(
+            "function catalogRolesChanged", 1
+        )[0]
+        for field in (
+            "default_model: editor.model.value",
+            "quality_model: editor.quality.value",
+            "fast_model: editor.fast.value",
+            "fable_model: editor.fable.value",
+        ):
+            self.assertIn(field, submission)
+        self.assertNotIn("async function applyPresetSync", js)
+        self.assertNotIn("function applyFetchResult", js)
+        self.assertIn("function catalogRolesChanged(kind)", js)
+        self.assertIn('catalogRolesChanged("wizard")', js)
+        self.assertIn('catalogRolesChanged("connection")', js)
+
+        one_click = js.split("async function runOneClick", 1)[1].split(
+            "async function importLocalSkill", 1
+        )[0]
+        self.assertLess(
+            one_click.index('r && r.status === "error"'),
+            one_click.index('const message = r.msg ||'),
+        )
+        self.assertIn("setBusy(false)", one_click)
+        self.assertIn("setBrowserFallback(r.fallback_url)", one_click)
+
+        gateway_ready = session.index("verify_gateway_model_catalog(pport, &secret, active_profile)?")
+        science_spawn = session.index('Command::new("zsh")', gateway_ready)
+        self.assertLess(gateway_ready, science_spawn)
+        for stage in ("start_gateway", "start_science", "verify_science_catalog"):
+            self.assertIn(f'"{stage}"', session)
+
+        self.assertIn("recover_interrupted_gateway(&app, &state)?", runtime)
+        self.assertIn("stop_managed_gateway_on_port", lifecycle)
+        self.assertIn('health.intent == "formal"', lifecycle)
+        self.assertIn("journal.previous_gateway.as_ref()", lifecycle)
+        self.assertIn("current == initial_for_probe", lifecycle)
+        boot = lib.split("LaunchPath::BootScience", 1)[1].split("// ---------- 入口", 1)[0]
+        self.assertIn("boot_result_error(&value)", boot)
+        self.assertIn("Some(message) => mark_boot_failed", boot)
 
     def test_science_runtime_identity_is_reused_for_serve_status_url_and_stop(self):
         session = (ROOT / "desktop/src-tauri/src/runtime/sandbox_session.rs").read_text()

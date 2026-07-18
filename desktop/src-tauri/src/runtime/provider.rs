@@ -1,4 +1,5 @@
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use crate::config;
 use crate::provider_contracts::{
@@ -26,6 +27,7 @@ pub(crate) struct ResolvedLaunchPlan {
     pub(crate) adapter: String,
     pub(crate) endpoint: String,
     pub(crate) model: String,
+    pub(crate) static_model_catalog: Option<String>,
     credential: CredentialHandle,
     pub(crate) model_policy: ModelPolicy,
     pub(crate) model_discovery: ModelDiscovery,
@@ -47,6 +49,7 @@ pub(crate) struct FormalGatewayPlan {
     pub(crate) adapter: String,
     pub(crate) endpoint: String,
     pub(crate) model: String,
+    pub(crate) static_model_catalog: Option<String>,
     pub(crate) credential: FormalCredential,
     pub(crate) model_policy: ModelPolicy,
     pub(crate) transport: Transport,
@@ -68,6 +71,7 @@ pub(crate) struct ScratchPlan {
     pub(crate) provider: String,
     pub(crate) endpoint: String,
     pub(crate) model: String,
+    pub(crate) static_model_catalog: Option<String>,
     pub(crate) credential: ScratchCredential,
     pub(crate) policy: ScratchPolicy,
     pub(crate) endpoint_policy: EndpointPolicy,
@@ -107,6 +111,7 @@ impl ResolvedLaunchPlan {
             adapter: self.adapter.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
+            static_model_catalog: self.static_model_catalog.clone(),
             credential,
             model_policy: self.model_policy,
             transport: self.transport,
@@ -131,6 +136,7 @@ impl ResolvedLaunchPlan {
             provider: self.adapter.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
+            static_model_catalog: self.static_model_catalog.clone(),
             credential,
             policy: self.scratch_policy,
             endpoint_policy: self.endpoint_policy,
@@ -259,10 +265,21 @@ pub(crate) fn resolve_launch_plan(p: &config::Profile) -> Result<ResolvedLaunchP
         EndpointPolicy::ProfileRequired => p.base_url.clone(),
         EndpointPolicy::GatewayManagedOfficial => String::new(),
     };
+    let static_model_catalog = match p.model_policy {
+        ModelPolicy::SavedCatalog => Some(crate::model_catalog::static_resolver_payload(
+            &contract.adapter,
+            &p.template_id,
+            &p.model_catalog,
+            &p.default_model_route_id,
+            &p.role_bindings,
+        )?),
+        ModelPolicy::DynamicCatalog => None,
+    };
     Ok(ResolvedLaunchPlan {
         adapter: contract.adapter,
         endpoint,
         model: p.model.clone(),
+        static_model_catalog,
         credential,
         model_policy: p.model_policy,
         model_discovery: contract.model_discovery,
@@ -282,6 +299,17 @@ pub(crate) fn resolve_template_plan(
     api_format: &str,
 ) -> Result<ResolvedLaunchPlan, String> {
     let contract = provider_contracts::contract_for(template_id, api_format)?;
+    let template =
+        crate::templates::by_id(template_id).ok_or_else(|| format!("未知模板：{template_id}"))?;
+    let requested = (template.model_catalog_source == "manual_or_discovered")
+        .then_some("manual-model-required");
+    let (model_catalog, default_model_route_id, role_bindings) =
+        crate::model_catalog::new_profile_catalog(template_id, api_format, requested)?;
+    let model = model_catalog
+        .iter()
+        .find(|route| route.selector_id == default_model_route_id)
+        .map(|route| route.upstream_model.clone())
+        .unwrap_or_default();
     let profile = config::Profile {
         template_id: template_id.to_string(),
         api_format: api_format.to_string(),
@@ -292,6 +320,10 @@ pub(crate) fn resolve_template_plan(
         credential_ref: (contract.default_credential_source == CredentialSource::CsswitchOauth)
             .then(|| "csswitch:codex:default".to_string()),
         model_policy: contract.default_model_policy,
+        model,
+        model_catalog,
+        default_model_route_id,
+        role_bindings,
         ..Default::default()
     };
     resolve_launch_plan(&profile)
@@ -325,12 +357,13 @@ pub(crate) fn proxy_fingerprint_with_runtime(
 ) -> u64 {
     let shim_mode = normalize_shim_mode(&launch.adapter, Some(shim_mode));
     key_fingerprint(&format!(
-        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{}\n{:?}\n{:?}\n{}\n{}\n{}\n{}\n{}\n{}",
         p.template_id,
         p.api_format,
         launch.adapter,
         launch.endpoint,
         launch.model,
+        launch.static_model_catalog.as_deref().unwrap_or_default(),
         launch.thinking_policy,
         launch.credential_fingerprint_material(),
         gateway_kind,
@@ -348,6 +381,101 @@ pub(crate) fn proxy_fingerprint_with_runtime(
             .map(|route| route.fingerprint.as_str())
             .unwrap_or_default()
     ))
+}
+
+fn sha256_fingerprint(domain: &[u8], value: &[u8]) -> String {
+    let mut digest = Sha256::new();
+    digest.update(domain);
+    digest.update(value);
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+pub(crate) fn route_fingerprint(
+    profile: &config::Profile,
+    launch: &FormalGatewayPlan,
+    shim_mode: &str,
+) -> String {
+    let material = format!(
+        "{}\0{}\0{}\0{}\0{}\0{}\0{}\0{:?}\0{:?}\0{}",
+        profile.template_id,
+        profile.api_format,
+        launch.adapter,
+        launch.endpoint,
+        launch.static_model_catalog.as_deref().unwrap_or_default(),
+        launch.thinking_policy,
+        launch.credential_fingerprint_material(),
+        launch.transport,
+        launch.endpoint_policy,
+        normalize_shim_mode(&launch.adapter, Some(shim_mode)),
+    );
+    sha256_fingerprint(b"csswitch-route-fp-v1\0", material.as_bytes())
+}
+
+pub(crate) fn catalog_fingerprint(profile: &config::Profile) -> Result<String, String> {
+    let value = serde_json::json!({
+        "policy": profile.model_policy,
+        "routes": profile.model_catalog.iter().map(|route| serde_json::json!({
+            "selector_id": route.selector_id,
+            "display_name": route.display_name,
+            "supports_tools": route.supports_tools,
+        })).collect::<Vec<_>>(),
+        "default_model_route_id": profile.default_model_route_id,
+        "role_bindings": profile.role_bindings,
+    });
+    let encoded = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok(sha256_fingerprint(b"csswitch-catalog-fp-v1\0", &encoded))
+}
+
+pub(crate) fn binding_fingerprint(
+    cfg: &config::Config,
+    runtime: &crate::runtime::science::ScienceRuntimeIdentity,
+) -> Result<String, String> {
+    let host = runtime.skill_install_host_context(cfg.sandbox_port)?;
+    let value = serde_json::json!({
+        "proxy_port": cfg.proxy_port,
+        "path_secret_fp": sha256_fingerprint(b"csswitch-path-secret-v1\0", cfg.secret.as_bytes()),
+        "sandbox_port": cfg.sandbox_port,
+        "runtime": host,
+    });
+    let encoded = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
+    Ok(sha256_fingerprint(b"csswitch-binding-fp-v1\0", &encoded))
+}
+
+pub(crate) fn desired_runtime_binding(
+    cfg: &config::Config,
+    profile: &config::Profile,
+    runtime: &crate::runtime::science::ScienceRuntimeIdentity,
+) -> Result<config::RuntimeBindingCommit, String> {
+    let launch = resolve_launch_plan(profile)?.formal();
+    Ok(config::RuntimeBindingCommit {
+        profile_id: profile.id.clone(),
+        route_fp: route_fingerprint(
+            profile,
+            &launch,
+            current_shim_mode_for_adapter(&launch.adapter),
+        ),
+        catalog_fp: catalog_fingerprint(profile)?,
+        binding_fp: binding_fingerprint(cfg, runtime)?,
+    })
+}
+
+/// Science only needs a restart when its visible selector catalog or the
+/// runtime binding changes. Route-only changes (credentials, endpoint, or an
+/// upstream target behind a stable selector) are applied by replacing the
+/// managed gateway while keeping Science alive.
+pub(crate) fn science_restart_required(
+    committed: Option<&config::RuntimeBindingCommit>,
+    desired: &config::RuntimeBindingCommit,
+) -> bool {
+    !committed.is_some_and(|current| {
+        current.profile_id == desired.profile_id
+            && current.catalog_fp == desired.catalog_fp
+            && current.binding_fp == desired.binding_fp
+    })
 }
 
 /// 当前支持 anthropic / openai_chat / openai_responses；其它 schema 值激活时失败关闭。
@@ -507,36 +635,150 @@ pub(crate) fn parse_endpoint(url: &str) -> Option<UpstreamEndpoint> {
 #[cfg(test)]
 mod tests {
     use super::{
-        adapter_for_profile, assert_format_supported, gateway_kind_for_adapter, key_fingerprint,
-        managed_shim_mode, normalize_shim_mode, parse_endpoint, proxy_args_for, proxy_fingerprint,
-        proxy_fingerprint_with_runtime, reject_openai_custom_anthropic_base, resolve_template_plan,
-        status_upstream_endpoint, upstream_endpoint,
+        adapter_for_profile, assert_format_supported, catalog_fingerprint,
+        gateway_kind_for_adapter, key_fingerprint, managed_shim_mode, normalize_shim_mode,
+        parse_endpoint, proxy_args_for, proxy_fingerprint, proxy_fingerprint_with_runtime,
+        reject_openai_custom_anthropic_base, resolve_template_plan, route_fingerprint,
+        science_restart_required, status_upstream_endpoint, upstream_endpoint,
     };
     use crate::config::Profile;
 
+    fn complete_saved_profile(mut profile: Profile) -> Profile {
+        let requested = (!profile.model.trim().is_empty()).then_some(profile.model.as_str());
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog(
+                &profile.template_id,
+                &profile.api_format,
+                requested,
+            )
+            .unwrap();
+        profile.model = model_catalog
+            .iter()
+            .find(|route| route.selector_id == default_model_route_id)
+            .map(|route| route.upstream_model.clone())
+            .unwrap_or_default();
+        profile.model_catalog = model_catalog;
+        profile.default_model_route_id = default_model_route_id;
+        profile.role_bindings = role_bindings;
+        profile.model_policy = crate::provider_contracts::ModelPolicy::SavedCatalog;
+        profile
+    }
+
+    #[test]
+    fn route_only_changes_do_not_change_catalog_or_require_science_restart() {
+        let original = complete_saved_profile(Profile {
+            id: "relay-1".into(),
+            template_id: "custom".into(),
+            api_format: "anthropic".into(),
+            base_url: "https://relay-a.example/anthropic".into(),
+            api_key: "sk-a".into(),
+            model: "upstream-a".into(),
+            ..Default::default()
+        });
+        let mut changed = original.clone();
+        changed.base_url = "https://relay-b.example/anthropic".into();
+        changed.api_key = "sk-b".into();
+        changed.model_catalog[0].upstream_model = "upstream-b".into();
+
+        let original_launch = proxy_args_for(&original).unwrap().formal();
+        let changed_launch = proxy_args_for(&changed).unwrap().formal();
+        assert_ne!(
+            route_fingerprint(&original, &original_launch, "off"),
+            route_fingerprint(&changed, &changed_launch, "off")
+        );
+        assert_eq!(
+            catalog_fingerprint(&original).unwrap(),
+            catalog_fingerprint(&changed).unwrap()
+        );
+
+        let committed = crate::config::RuntimeBindingCommit {
+            profile_id: original.id.clone(),
+            route_fp: route_fingerprint(&original, &original_launch, "off"),
+            catalog_fp: catalog_fingerprint(&original).unwrap(),
+            binding_fp: "binding-a".into(),
+        };
+        let desired = crate::config::RuntimeBindingCommit {
+            profile_id: changed.id.clone(),
+            route_fp: route_fingerprint(&changed, &changed_launch, "off"),
+            catalog_fp: catalog_fingerprint(&changed).unwrap(),
+            binding_fp: "binding-a".into(),
+        };
+        assert!(!science_restart_required(Some(&committed), &desired));
+    }
+
+    #[test]
+    fn visible_catalog_default_role_or_binding_changes_require_science_restart() {
+        let original = complete_saved_profile(Profile {
+            id: "relay-1".into(),
+            template_id: "custom".into(),
+            api_format: "anthropic".into(),
+            model: "upstream-a".into(),
+            ..Default::default()
+        });
+        let original_catalog_fp = catalog_fingerprint(&original).unwrap();
+        let committed = crate::config::RuntimeBindingCommit {
+            profile_id: original.id.clone(),
+            route_fp: "route-a".into(),
+            catalog_fp: original_catalog_fp.clone(),
+            binding_fp: "binding-a".into(),
+        };
+
+        let mut display = original.clone();
+        display.model_catalog[0].display_name.push_str(" Pro");
+        let display_fp = catalog_fingerprint(&display).unwrap();
+        assert_ne!(original_catalog_fp, display_fp);
+        assert!(science_restart_required(
+            Some(&committed),
+            &crate::config::RuntimeBindingCommit {
+                catalog_fp: display_fp,
+                ..committed.clone()
+            }
+        ));
+
+        let mut default_and_role = original.clone();
+        let mut second = default_and_role.model_catalog[0].clone();
+        second.selector_id.push_str("-fast");
+        second.display_name = "Fast".into();
+        second.upstream_model = "upstream-fast".into();
+        default_and_role.model_catalog.push(second.clone());
+        default_and_role.default_model_route_id = second.selector_id.clone();
+        default_and_role.role_bindings.haiku = second.selector_id;
+        let role_fp = catalog_fingerprint(&default_and_role).unwrap();
+        assert_ne!(original_catalog_fp, role_fp);
+
+        assert!(science_restart_required(
+            Some(&committed),
+            &crate::config::RuntimeBindingCommit {
+                binding_fp: "binding-b".into(),
+                ..committed.clone()
+            }
+        ));
+        assert!(science_restart_required(None, &committed));
+    }
+
     #[test]
     fn proxy_args_derive_adapter_and_key_env() {
-        let ds = Profile {
+        let ds = complete_saved_profile(Profile {
             template_id: "deepseek".into(),
             api_format: "anthropic".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             api_key: "sk-ds".into(),
             ..Default::default()
-        };
+        });
         let a = proxy_args_for(&ds).unwrap().formal();
         assert_eq!(a.adapter, "deepseek");
         assert!(
             matches!(a.credential, super::FormalCredential::ApiKey { ref env, .. } if env == "DEEPSEEK_API_KEY")
         );
 
-        let glm = Profile {
+        let glm = complete_saved_profile(Profile {
             template_id: "glm".into(),
             api_format: "anthropic".into(),
             base_url: "https://open.bigmodel.cn/api/anthropic".into(),
             api_key: "gk".into(),
             model: "glm-5".into(),
             ..Default::default()
-        };
+        });
         let b = proxy_args_for(&glm).unwrap().formal();
         assert_eq!(b.adapter, "relay");
         assert!(
@@ -545,14 +787,14 @@ mod tests {
         assert_eq!(b.endpoint, "https://open.bigmodel.cn/api/anthropic");
         assert_eq!(b.model, "glm-5");
 
-        let custom_openai = Profile {
+        let custom_openai = complete_saved_profile(Profile {
             template_id: "custom-openai".into(),
             api_format: "openai_chat".into(),
             base_url: "https://open.bigmodel.cn/api/paas/v4".into(),
             api_key: "ok".into(),
             model: "glm-4.5".into(),
             ..Default::default()
-        };
+        });
         let c = proxy_args_for(&custom_openai).unwrap().formal();
         assert_eq!(c.adapter, "openai-custom");
         assert!(
@@ -561,14 +803,14 @@ mod tests {
         assert_eq!(c.endpoint, "https://open.bigmodel.cn/api/paas/v4");
         assert_eq!(c.model, "glm-4.5");
 
-        let custom_responses = Profile {
+        let custom_responses = complete_saved_profile(Profile {
             template_id: "custom-openai-responses".into(),
             api_format: "openai_responses".into(),
             base_url: "https://api.openai.com/v1".into(),
             api_key: "ok".into(),
             model: "gpt-5.2".into(),
             ..Default::default()
-        };
+        });
         let d = proxy_args_for(&custom_responses).unwrap().formal();
         assert_eq!(d.adapter, "openai-responses");
         assert!(
@@ -577,14 +819,14 @@ mod tests {
         assert_eq!(d.endpoint, "https://api.openai.com/v1");
         assert_eq!(d.model, "gpt-5.2");
 
-        let custom_profile_openai = Profile {
+        let custom_profile_openai = complete_saved_profile(Profile {
             template_id: "custom".into(),
             api_format: "openai_chat".into(),
             base_url: "https://api.example.com/v1".into(),
             api_key: "ok".into(),
             model: "gpt-5.2".into(),
             ..Default::default()
-        };
+        });
         let e = proxy_args_for(&custom_profile_openai).unwrap().formal();
         assert_eq!(adapter_for_profile(&custom_profile_openai), "openai-custom");
         assert_eq!(e.adapter, "openai-custom");
@@ -680,13 +922,13 @@ mod tests {
 
     #[test]
     fn api_key_public_projection_never_contains_key_material() {
-        let profile = Profile {
+        let profile = complete_saved_profile(Profile {
             template_id: "glm".into(),
             api_format: "anthropic".into(),
             api_key: "sk-super-secret".into(),
             model: "glm-5.2".into(),
             ..Default::default()
-        };
+        });
         let public = serde_json::to_value(proxy_args_for(&profile).unwrap().public()).unwrap();
         let encoded = serde_json::to_string(&public).unwrap();
         assert!(!encoded.contains("super-secret"));
@@ -747,14 +989,14 @@ mod tests {
 
     #[test]
     fn proxy_fingerprint_includes_protocol_semantics() {
-        let mut p = Profile {
+        let mut p = complete_saved_profile(Profile {
             template_id: "kimi".into(),
             api_format: "anthropic".into(),
             base_url: "https://same.example/anthropic".into(),
             api_key: "same-key".into(),
             model: "same-model".into(),
             ..Default::default()
-        };
+        });
         let kimi_launch = proxy_args_for(&p).unwrap().formal();
         let kimi_fp = proxy_fingerprint(&p, &kimi_launch);
 
@@ -769,14 +1011,14 @@ mod tests {
 
     #[test]
     fn proxy_fingerprint_includes_runtime_and_shim_identity() {
-        let p = Profile {
+        let p = complete_saved_profile(Profile {
             template_id: "deepseek".into(),
             api_format: "anthropic".into(),
             base_url: "https://api.deepseek.com/anthropic".into(),
             api_key: "same-key".into(),
             model: "same-model".into(),
             ..Default::default()
-        };
+        });
         let launch = proxy_args_for(&p).unwrap().formal();
         let other_runtime_off = proxy_fingerprint_with_runtime(&p, &launch, "other", "off");
         let rust_off = proxy_fingerprint_with_runtime(&p, &launch, "rust", "off");
@@ -790,14 +1032,14 @@ mod tests {
             "shim 切换必须阻止误复用"
         );
 
-        let relay_profile = Profile {
+        let relay_profile = complete_saved_profile(Profile {
             template_id: "glm".into(),
             api_format: "anthropic".into(),
             base_url: "https://relay.example/v1".into(),
             api_key: "same-key".into(),
             model: "same-model".into(),
             ..Default::default()
-        };
+        });
         let relay_launch = proxy_args_for(&relay_profile).unwrap().formal();
         assert_eq!(
             proxy_fingerprint_with_runtime(&relay_profile, &relay_launch, "rust", "off"),
@@ -825,6 +1067,7 @@ mod tests {
                 &csswitch_codex_network::CodexNetworkSettings {
                     mode: csswitch_codex_network::CodexNetworkMode::Custom,
                     proxy_url: "http://127.0.0.1:7890".into(),
+                    ..Default::default()
                 },
                 &csswitch_codex_network::EnvironmentSnapshot::default(),
             )

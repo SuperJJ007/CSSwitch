@@ -89,8 +89,32 @@ else
 # 找一个空闲端口，起一个真代理（假 key，上游 URL 是假的但不会被 /health、/v1/models 触及）
 P="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()')"
 SEC="verify-test-secret"
+STATIC_CATALOG="$(PYTHONPATH="$ROOT" python3 - <<'PY'
+import json
+
+from test.test_gateway_rust import static_catalog_fingerprint
+
+selector = "claude-csswitch-verify-deepseek-111111111111"
+catalog = {
+    "schema_version": 1,
+    "adapter": "deepseek",
+    "default_selector_id": selector,
+    "routes": [{
+        "selector_id": selector,
+        "display_name": "DeepSeek Verify",
+        "upstream_model": "deepseek-v4-flash",
+        "supports_tools": True,
+    }],
+    "role_bindings": {role: selector for role in ("sonnet", "opus", "haiku", "fable")},
+    "legacy_aliases": [],
+}
+catalog["catalog_fp"] = static_catalog_fingerprint(catalog)
+print(json.dumps(catalog, separators=(",", ":"), sort_keys=True))
+PY
+)"
 DEEPSEEK_API_KEY=fake CSSWITCH_AUTH_TOKEN="$SEC" CSSWITCH_LAUNCH_ID=ops-test \
   CSSWITCH_TOOLUSE_SHIM=off CSSWITCH_UPSTREAM_URL="http://127.0.0.1:1/never" \
+  CSSWITCH_STATIC_MODEL_CATALOG_V1="$STATIC_CATALOG" \
   "$GATEWAY" --provider deepseek --port "$P" \
   >/dev/null 2>&1 &
 PROXY_PID=$!

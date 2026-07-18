@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "CSSwitch",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "identifier": "com.csswitch.menubar",
   "build": {
     "frontendDist": "../src"
@@ -12,10 +12,10 @@
       {
         "label": "main",
         "title": "CSSwitch",
-        "width": 420,
-        "height": 700,
-        "minWidth": 380,
-        "minHeight": 600,
+        "width": 920,
+        "height": 650.5,
+        "minWidth": 760,
+        "minHeight": 520,
         "resizable": true,
         "decorations": true,
         "transparent": false,

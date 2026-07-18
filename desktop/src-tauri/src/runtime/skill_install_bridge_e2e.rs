@@ -300,6 +300,54 @@ fn read_http_body(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
     Ok(bytes[header_end..header_end + length].to_vec())
 }
 
+fn read_http_request(stream: &mut TcpStream) -> Result<(String, Vec<u8>), String> {
+    let mut bytes = Vec::new();
+    let header_end = loop {
+        if bytes.len() > 64 * 1024 {
+            return Err("headers too large".into());
+        }
+        let mut buffer = [0_u8; 4096];
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Err("request ended before headers".into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+        if let Some(offset) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            break offset + 4;
+        }
+    };
+    let headers = std::str::from_utf8(&bytes[..header_end]).map_err(|e| e.to_string())?;
+    let request_line = headers.lines().next().unwrap_or_default().to_string();
+    let length = headers
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(0);
+    if length > 8 * 1024 * 1024 {
+        return Err("body too large".into());
+    }
+    while bytes.len() - header_end < length {
+        let mut buffer = [0_u8; 4096];
+        let count = stream
+            .read(&mut buffer)
+            .map_err(|error| error.to_string())?;
+        if count == 0 {
+            return Err("body truncated".into());
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+    Ok((
+        request_line,
+        bytes[header_end..header_end + length].to_vec(),
+    ))
+}
+
 fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) {
     let headers = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -307,6 +355,150 @@ fn write_http_response(stream: &mut TcpStream, content_type: &str, body: &[u8]) 
     );
     let _ = stream.write_all(headers.as_bytes());
     let _ = stream.write_all(body);
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModelAliasObservation {
+    model_gets: usize,
+    requested_models: Vec<String>,
+}
+
+struct ModelAliasProvider {
+    port: u16,
+    models: Arc<Mutex<Vec<(String, String)>>>,
+    observation: Arc<Mutex<ModelAliasObservation>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl ModelAliasProvider {
+    fn start(models: Vec<(String, String)>) -> Self {
+        use std::sync::atomic::Ordering;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, 8765);
+        let models = Arc::new(Mutex::new(models));
+        let thread_models = models.clone();
+        let observation = Arc::new(Mutex::new(ModelAliasObservation::default()));
+        let thread_observation = observation.clone();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_shutdown = shutdown.clone();
+        let worker = thread::spawn(move || {
+            while !thread_shutdown.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                        let Ok((request_line, body)) = read_http_request(&mut stream) else {
+                            continue;
+                        };
+                        if request_line.starts_with("GET /v1/models") {
+                            let models = thread_models
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .clone();
+                            let data: Vec<Value> = models
+                                .iter()
+                                .map(|(id, display_name)| {
+                                    json!({
+                                        "type": "model",
+                                        "id": id,
+                                        "display_name": display_name,
+                                        "supports_tools": true,
+                                        "created_at": "2026-01-01T00:00:00Z"
+                                    })
+                                })
+                                .collect();
+                            let response = serde_json::to_vec(&json!({
+                                "data": data,
+                                "has_more": false,
+                                "first_id": data.first().and_then(|item| item.get("id")),
+                                "last_id": data.last().and_then(|item| item.get("id"))
+                            }))
+                            .unwrap();
+                            thread_observation
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .model_gets += 1;
+                            write_http_response(&mut stream, "application/json", &response);
+                            continue;
+                        }
+                        if request_line.starts_with("POST /v1/messages") {
+                            let value: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                            if let Some(model) = value.get("model").and_then(Value::as_str) {
+                                thread_observation
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .requested_models
+                                    .push(model.to_string());
+                            }
+                            let response =
+                                if value.get("stream").and_then(Value::as_bool) == Some(true) {
+                                    terminal_sse()
+                                } else {
+                                    json_response()
+                                };
+                            write_http_response(
+                                &mut stream,
+                                if value.get("stream").and_then(Value::as_bool) == Some(true) {
+                                    "text/event-stream"
+                                } else {
+                                    "application/json"
+                                },
+                                &response,
+                            );
+                            continue;
+                        }
+                        let response = br#"{"type":"error","error":{"type":"not_found_error","message":"not found"}}"#;
+                        write_http_response(&mut stream, "application/json", response);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        Self {
+            port,
+            models,
+            observation,
+            shutdown,
+            thread: Some(worker),
+        }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    fn replace_models(&self, models: Vec<(String, String)>) {
+        *self
+            .models
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = models;
+    }
+
+    fn snapshot(&self) -> ModelAliasObservation {
+        self.observation
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+}
+
+impl Drop for ModelAliasProvider {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+
+        self.shutdown.store(true, Ordering::Release);
+        let _ = TcpStream::connect(("127.0.0.1", self.port));
+        if let Some(worker) = self.thread.take() {
+            let _ = worker.join();
+        }
+    }
 }
 
 fn route_model_request(
@@ -1148,6 +1340,9 @@ fn playwright_output(guard: &ScienceGuard, args: &[&str]) -> Result<String, Stri
         .args(args)
         .current_dir(&guard.workdir)
         .env("PLAYWRIGHT_CLI_SESSION", &guard.session);
+    if let Some(path) = std::env::var_os("CSSWITCH_PLAYWRIGHT_BROWSERS_PATH") {
+        command.env("PLAYWRIGHT_BROWSERS_PATH", path);
+    }
     let output = output_with_timeout(&mut command, Duration::from_secs(120))
         .map_err(|error| format!("Playwright {args:?}：{error}"))?;
     if !output.status.success() {
@@ -1293,6 +1488,16 @@ fn open_chat(guard: &mut ScienceGuard) -> Result<String, String> {
     let project = wait_control(guard, "button \"New\"", 30)?;
     click(guard, &project, "button \"New\"")?;
     wait_chat_idle(guard, 80)
+}
+
+fn open_model_catalog(guard: &ScienceGuard, current: &str) -> Result<String, String> {
+    click(guard, current, "button \"Model:")?;
+    let mut catalog = snapshot(guard)?;
+    if catalog.contains("More models") {
+        click(guard, &catalog, "More models")?;
+        catalog = snapshot(guard)?;
+    }
+    Ok(catalog)
 }
 
 fn send_prompt(guard: &ScienceGuard, current: &str, prompt: &str) -> Result<(), String> {
@@ -1790,6 +1995,175 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
         .invoked_tools
         .iter()
         .any(|name| name.contains("host.skills.delete") || name == "bash"));
+
+    guard.stop();
+    drop(provider);
+    let stderr = fs::read_to_string(science_stderr).unwrap_or_default();
+    assert!(!stderr.contains("ANTHROPIC_API_KEY"));
+    assert!(!stderr.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore = "explicit installed Science multi-model alias E2E; temp HOME/data-dir, local mock/browser only"]
+fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() {
+    assert_eq!(
+        std::env::var("CSSWITCH_REAL_SCIENCE_MODEL_ALIAS_E2E").as_deref(),
+        Ok("1"),
+        "必须显式设置 CSSWITCH_REAL_SCIENCE_MODEL_ALIAS_E2E=1"
+    );
+
+    let root = temp_dir("real-model-alias");
+    let outer_home = root.join("home");
+    let sandbox_home = outer_home.join(".csswitch/sandbox/home");
+    let data_dir = sandbox_home.join(".claude-science");
+    let safe_bin = prepare_safe_bin(&sandbox_home);
+    let workdir = root.join("browser-workdir");
+    fs::create_dir_all(&workdir).unwrap();
+    crate::oauth_forge::ensure_virtual_login(&data_dir, "virtual@localhost.invalid", &sandbox_home)
+        .unwrap();
+
+    let science_bin = std::env::var_os("CSSWITCH_REAL_SCIENCE_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
+        })
+        .canonicalize()
+        .expect("canonical installed Science binary");
+    let playwright = std::env::var_os("CSSWITCH_PLAYWRIGHT_CLI")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            PathBuf::from("/Users/superjj/.codex/skills/playwright/scripts/playwright_cli.sh")
+        });
+    assert!(playwright.is_file());
+
+    let mut version_command = safe_command(&science_bin, &sandbox_home, &safe_bin);
+    version_command.arg("--version");
+    let version_output = output_with_timeout(&mut version_command, Duration::from_secs(10))
+        .expect("read installed Science version");
+    assert!(version_output.status.success());
+    let science_version = String::from_utf8(version_output.stdout).unwrap();
+
+    let provider = ModelAliasProvider::start(vec![
+        (
+            "claude-csswitch-codex-stage0-old-a".into(),
+            "Stage0 Codex Old A".into(),
+        ),
+        (
+            "claude-csswitch-codex-stage0-old-b".into(),
+            "Stage0 Codex Old B".into(),
+        ),
+    ]);
+    let port = free_port();
+    let sandbox_port = free_port();
+    assert_ne!(port, sandbox_port);
+    let science_stdout = root.join("science.stdout.log");
+    let science_stderr = root.join("science.stderr.log");
+    let child = spawn_science(
+        &science_bin,
+        &sandbox_home,
+        &safe_bin,
+        &data_dir,
+        port,
+        sandbox_port,
+        &provider.base_url(),
+        &science_stdout,
+        &science_stderr,
+    );
+    let mut guard = ScienceGuard {
+        science_bin,
+        sandbox_home,
+        safe_bin,
+        data_dir,
+        child: Some(child),
+        gateway_child: None,
+        install_bridge: root.join("unused-install-bridge"),
+        playwright,
+        session: format!("csswitch-model-alias-{}", std::process::id()),
+        workdir,
+        browser_open: false,
+        port,
+    };
+    wait_port(port);
+    assert_installed_runtime_identity(&guard, &science_version);
+
+    let old_chat = open_chat(&mut guard).unwrap();
+    let old_catalog = open_model_catalog(&guard, &old_chat).unwrap();
+    assert!(old_catalog.contains("Stage0 Codex Old A"), "{old_catalog}");
+    assert!(old_catalog.contains("Stage0 Codex Old B"), "{old_catalog}");
+
+    let static_models: Vec<(String, String)> = (1..=6)
+        .map(|index| {
+            let upstream = format!("stage0-model-{index}");
+            (
+                crate::model_catalog::selector_id_v1("qwen", &upstream),
+                format!("Stage0 Qwen Model {index}"),
+            )
+        })
+        .collect();
+    let selected_alias = static_models[4].0.clone();
+    let gets_before_hot_replace = provider.snapshot().model_gets;
+    provider.replace_models(static_models.clone());
+    let hot_chat = open_chat(&mut guard).unwrap();
+    let hot_catalog = open_model_catalog(&guard, &hot_chat).unwrap();
+    assert!(hot_catalog.contains("Stage0 Codex Old A"), "{hot_catalog}");
+    assert!(
+        !hot_catalog.contains("Stage0 Qwen Model 1"),
+        "{hot_catalog}"
+    );
+    assert_eq!(
+        provider.snapshot().model_gets,
+        gets_before_hot_replace,
+        "运行中的 Science 新建会话不应热刷新目录"
+    );
+
+    guard.stop_science();
+    guard.restart_science(
+        free_port(),
+        &provider.base_url(),
+        &root.join("science-restart.stdout.log"),
+        &root.join("science-restart.stderr.log"),
+    );
+    wait_port(port);
+    assert_installed_runtime_identity(&guard, &science_version);
+
+    let new_chat = open_chat(&mut guard).unwrap();
+    let new_catalog = open_model_catalog(&guard, &new_chat).unwrap();
+    assert!(!new_catalog.contains("Stage0 Codex Old A"), "{new_catalog}");
+    assert!(!new_catalog.contains("Stage0 Codex Old B"), "{new_catalog}");
+    for (_, display_name) in &static_models {
+        assert!(
+            new_catalog.contains(display_name),
+            "{display_name}: {new_catalog}"
+        );
+    }
+    click(&guard, &new_catalog, "Stage0 Qwen Model 5").unwrap();
+    let selected = wait_chat_idle(&guard, 40).unwrap();
+    assert!(
+        selected.contains("Model: Stage0 Qwen Model 5"),
+        "{selected}"
+    );
+    send_prompt(&guard, &selected, "stage0 model alias round trip").unwrap();
+    for _ in 0..300 {
+        if provider
+            .snapshot()
+            .requested_models
+            .iter()
+            .any(|model| model == &selected_alias)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let observation = provider.snapshot();
+    assert!(observation.model_gets >= 2, "{observation:?}");
+    assert!(
+        observation
+            .requested_models
+            .iter()
+            .any(|model| model == &selected_alias),
+        "{observation:?}"
+    );
 
     guard.stop();
     drop(provider);

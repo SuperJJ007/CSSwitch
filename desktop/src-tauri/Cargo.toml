@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.7.0"
+version = "0.8.0"
 description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
 authors = ["CSSwitch"]
 edition = "2021"

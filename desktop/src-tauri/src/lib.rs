@@ -16,6 +16,7 @@ mod commands;
 mod config;
 mod config_legacy;
 mod lifecycle;
+mod model_catalog;
 mod oauth_forge;
 mod proc;
 mod provider_contracts;
@@ -259,6 +260,16 @@ fn mark_boot_failed<R: tauri::Runtime>(app: &tauri::AppHandle<R>, error: String)
     let _ = app.emit("boot://failed", error);
 }
 
+fn boot_result_error(value: &serde_json::Value) -> Option<String> {
+    (value.get("status").and_then(serde_json::Value::as_str) == Some("error")).then(|| {
+        value
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("自动启动未完成")
+            .to_string()
+    })
+}
+
 fn run_boot_coordinator(app: tauri::AppHandle) {
     {
         let state = app.state::<SharedAppState>();
@@ -303,11 +314,14 @@ fn run_boot_coordinator(app: tauri::AppHandle) {
                     lifecycle,
                     None,
                 ) {
-                    Ok(_) => {
-                        let mut st = lock(state.inner());
-                        st.boot = BootState::Ready;
-                        st.boot_error = None;
-                    }
+                    Ok(value) => match boot_result_error(&value) {
+                        Some(message) => mark_boot_failed(&app, message),
+                        None => {
+                            let mut st = lock(state.inner());
+                            st.boot = BootState::Ready;
+                            st.boot_error = None;
+                        }
+                    },
                     Err(e) => mark_boot_failed(&app, e.to_string()),
                 }
             }
@@ -346,6 +360,9 @@ pub fn run() {
             commands::profiles::create_profile,
             commands::profiles::update_profile_metadata,
             commands::profiles::update_profile_connection,
+            commands::profiles::validate_profile_catalog_model,
+            commands::profiles::preview_profile_preset_sync,
+            commands::profiles::apply_profile_preset_sync,
             commands::profiles::clear_profile_key,
             commands::profiles::delete_profile,
             commands::profiles::set_active_profile,
@@ -359,6 +376,7 @@ pub fn run() {
             commands::runtime::boot_error,
             commands::runtime::open_url,
             commands::skill_install::install_local_skill_package,
+            commands::skill_listing::list_installed_skills,
             commands::diagnostics::run_doctor,
             commands::diagnostics::app_version,
             commands::diagnostics::open_release_page,
@@ -402,7 +420,23 @@ mod tests {
 
     use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
-    use crate::{decide_launch_with_auto_boot, should_begin_boot, AppState, BootState, LaunchPath};
+    use crate::{
+        boot_result_error, decide_launch_with_auto_boot, should_begin_boot, AppState, BootState,
+        LaunchPath,
+    };
+
+    #[test]
+    fn auto_boot_rejects_structured_runtime_failure() {
+        let failed = serde_json::json!({
+            "status": "error",
+            "message": "gateway recovery degraded",
+        });
+        assert_eq!(
+            boot_result_error(&failed).as_deref(),
+            Some("gateway recovery degraded")
+        );
+        assert!(boot_result_error(&serde_json::json!({"status": "ok"})).is_none());
+    }
 
     #[test]
     fn app_state_clear_proxy_identity_removes_runtime_credentials() {
@@ -454,6 +488,14 @@ mod tests {
     }
 
     fn keyed_profile(id: &str, key: &str) -> Profile {
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog("deepseek", "anthropic", None).unwrap();
+        let model = model_catalog
+            .iter()
+            .find(|route| route.selector_id == default_model_route_id)
+            .unwrap()
+            .upstream_model
+            .clone();
         Profile {
             id: id.into(),
             name: id.into(),
@@ -461,6 +503,11 @@ mod tests {
             category: "cn_official".into(),
             api_format: "anthropic".into(),
             api_key: key.into(),
+            model,
+            model_catalog,
+            default_model_route_id,
+            role_bindings,
+            model_policy: crate::provider_contracts::ModelPolicy::SavedCatalog,
             ..Default::default()
         }
     }

@@ -18,8 +18,8 @@ use crate::runtime::provider::{
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
 use crate::runtime::science::{
-    science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
-    SCIENCE_DOWNLOAD_URL,
+    sandbox_listener_matches_runtime, sandbox_url, science_runtime_preflight as runtime_preflight,
+    settings_change_needs_teardown, stop_sandbox, SCIENCE_DOWNLOAD_URL,
 };
 use crate::runtime::settings::{system_ssh_config_path, validate_runtime_ports};
 use crate::runtime::system::open_in_browser;
@@ -40,6 +40,7 @@ fn status_response_for_config_error(error: &dyn std::fmt::Display) -> serde_json
             proxy_ok: false,
             sandbox_ok: false,
             upstream_ok: false,
+            upstream_applicable: true,
         }),
         serde_json::Value::Null,
         "",
@@ -75,6 +76,10 @@ fn status_runtime_identity(
         current_shim_mode.to_string()
     };
     (gateway_kind, runtime_shim_mode, current_shim_mode)
+}
+
+fn status_upstream_applicable(adapter: &str) -> bool {
+    !adapter.is_empty() && adapter != "codex"
 }
 
 pub(crate) fn stop_sandbox_state<R: tauri::Runtime>(
@@ -370,30 +375,80 @@ pub(crate) fn one_click_login_cmd(
     lifecycle: SharedLifecycle,
     runtime_choice: Option<String>,
 ) -> Result<serde_json::Value, crate::commands::codex::RuntimeCommandError> {
-    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
-    let active = cfg
-        .active_profile()
-        .ok_or("未配置生效 profile，请先在面板选择或新建一条配置。")?;
-    let adapter = resolve_launch_plan(active)?.adapter;
-    let prepared = crate::commands::codex::prepare_provider_auth(
+    let cfg = match config::load_from(&config::default_dir()) {
+        Ok(cfg) => cfg,
+        Err(error) => return Ok(one_click_failure_value(error.to_string())),
+    };
+    let active = match cfg.active_profile() {
+        Some(active) => active,
+        None => {
+            return Ok(one_click_failure_value(
+                "未配置生效 profile，请先在面板选择或新建一条配置。".into(),
+            ))
+        }
+    };
+    let adapter = match resolve_launch_plan(active) {
+        Ok(plan) => plan.adapter,
+        Err(message) => return Ok(one_click_failure_value(message)),
+    };
+    let prepared = match crate::commands::codex::prepare_provider_auth(
         &app,
         &adapter,
         crate::commands::codex::CodexPreflightTarget::ActiveProfile,
-    )?;
-    lifecycle
-        .with_serialized(|| -> Result<_, String> {
-            if let Some(prepared) = prepared.as_ref() {
-                prepared.verify_unchanged()?;
-            }
-            crate::runtime::sandbox_session::one_click_login(
-                app,
-                state,
-                lifecycle.as_ref(),
-                runtime_choice.as_deref(),
-                prepared.as_ref().map(|prepared| prepared.proof()),
-            )
-        })
-        .map_err(crate::commands::codex::RuntimeCommandError::from)
+    ) {
+        Ok(prepared) => prepared,
+        Err(crate::commands::codex::RuntimeCommandError::Message(message)) => {
+            return Ok(one_click_failure_value(message))
+        }
+        Err(auth @ crate::commands::codex::RuntimeCommandError::Auth(_)) => return Err(auth),
+    };
+    match lifecycle.with_serialized(|| -> Result<_, String> {
+        if let Some(prepared) = prepared.as_ref() {
+            prepared.verify_unchanged()?;
+        }
+        crate::runtime::proxy_lifecycle::recover_interrupted_gateway(&app, &state)?;
+        crate::runtime::sandbox_session::one_click_login(
+            app,
+            state,
+            lifecycle.as_ref(),
+            runtime_choice.as_deref(),
+            prepared.as_ref().map(|prepared| prepared.proof()),
+        )
+    }) {
+        Ok(value) => Ok(value),
+        Err(message) => Ok(one_click_failure_value(message)),
+    }
+}
+
+fn one_click_failure_value(message: String) -> serde_json::Value {
+    let recovery_status = config::load_from(&config::default_dir())
+        .ok()
+        .and_then(|cfg| cfg.runtime_transaction)
+        .map(|_| "degraded")
+        .unwrap_or("not_needed");
+    let stage = science_failure_stage(&message);
+    json!({
+        "action": "failed",
+        "stage": stage,
+        "status": "error",
+        "recovery_status": recovery_status,
+        "message": message,
+        "fallback_url": null,
+    })
+}
+
+fn science_failure_stage(message: &str) -> &'static str {
+    if message.contains("停止旧进程") || message.contains("停止沙箱") {
+        "science_stop"
+    } else if message.contains("代理") || message.contains("gateway") {
+        "gateway_start"
+    } else if message.contains("模型目录") || message.contains("selector") {
+        "catalog_verify"
+    } else if message.contains("沙箱") || message.contains("Science") {
+        "science_start"
+    } else {
+        "prepare"
+    }
 }
 
 #[tauri::command]
@@ -514,6 +569,7 @@ pub(crate) fn status(state: State<'_, SharedAppState>) -> serde_json::Value {
         proxy_ok,
         sandbox_ok,
         upstream_ok,
+        upstream_applicable: status_upstream_applicable(&adapter),
     });
     let (gateway_kind, shim_mode, catalog_shim_mode) =
         status_runtime_identity(&adapter, &secret, launched_gateway_kind, launched_shim_mode);
@@ -546,11 +602,48 @@ pub(crate) fn boot_error(state: State<'_, SharedAppState>) -> Option<String> {
     lock(state.inner()).boot_error.clone()
 }
 
+fn manual_open_result(url: String, result: Result<(), String>) -> serde_json::Value {
+    match result {
+        Ok(()) => json!({
+            "status": "ok",
+            "message": "已向默认浏览器发出打开 Science 的请求。",
+            "fallback_url": null,
+        }),
+        Err(error) => json!({
+            "status": "error",
+            "message": format!("打开浏览器失败：{error}"),
+            "fallback_url": url,
+        }),
+    }
+}
+
+fn open_url_inner(state: &SharedAppState) -> Result<serde_json::Value, String> {
+    let (sandbox_port, runtime) = {
+        let st = lock(state);
+        let runtime = st
+            .science_runtime
+            .clone()
+            .ok_or("隔离 Science 尚未运行，请先「一键开始」。")?;
+        (st.sandbox_port, runtime)
+    };
+    if sandbox_port == 0 || !sandbox_listener_matches_runtime(sandbox_port, &runtime) {
+        return Err("隔离 Science 尚未就绪，请重新点击「一键开始」。".into());
+    }
+    // Science 的控制地址可能是短期、一次性的。每次手动打开都重新获取，
+    // 不复用 one-click 已消费的内存 URL。成功时不返回 URL；只有系统
+    // opener 失败时才把同一次新 URL 交给 UI，供用户复制或再次打开。
+    let url = sandbox_url(sandbox_port, &runtime);
+    Ok(manual_open_result(url.clone(), open_in_browser(&url)))
+}
+
 #[tauri::command]
-pub(crate) fn open_url(state: State<'_, SharedAppState>) -> Result<(), String> {
-    let url = { lock(state.inner()).sandbox_url.clone() };
-    let url = url.ok_or("还没有沙箱 URL，请先「一键开始」。")?;
-    open_in_browser(&url)
+pub(crate) async fn open_url(
+    state: State<'_, SharedAppState>,
+    lifecycle: State<'_, SharedLifecycle>,
+) -> Result<serde_json::Value, String> {
+    let state = state.inner().clone();
+    let lifecycle = lifecycle.inner().clone();
+    run_blocking(move || lifecycle.with_serialized(|| open_url_inner(&state))).await
 }
 
 #[tauri::command]
@@ -570,7 +663,8 @@ pub(crate) async fn quit_app(
 #[cfg(test)]
 mod tests {
     use super::{
-        config_last_error_json, status_response_for_config_error, status_runtime_identity,
+        config_last_error_json, manual_open_result, science_failure_stage,
+        status_response_for_config_error, status_runtime_identity, status_upstream_applicable,
     };
     use crate::{
         config::{self, Config, Profile},
@@ -616,6 +710,14 @@ mod tests {
     }
 
     #[test]
+    fn upstream_applicability_is_provider_semantics_not_endpoint_parse_success() {
+        assert!(!status_upstream_applicable(""));
+        assert!(!status_upstream_applicable("codex"));
+        assert!(status_upstream_applicable("relay"));
+        assert!(status_upstream_applicable("deepseek"));
+    }
+
+    #[test]
     fn status_runtime_identity_prefers_launched_identity_and_fail_closes_partial_launch() {
         let (gateway, shim, catalog_shim) =
             status_runtime_identity("deepseek", "", String::new(), String::new());
@@ -634,6 +736,31 @@ mod tests {
         assert_eq!(gateway, "");
         assert_eq!(shim, "");
         assert_eq!(catalog_shim, "rewrite");
+    }
+
+    #[test]
+    fn science_operation_failures_have_stable_structured_stages() {
+        assert_eq!(science_failure_stage("停止旧进程失败"), "science_stop");
+        assert_eq!(science_failure_stage("代理探活失败"), "gateway_start");
+        assert_eq!(science_failure_stage("模型目录不一致"), "catalog_verify");
+        assert_eq!(science_failure_stage("沙箱起后超时"), "science_start");
+        assert_eq!(science_failure_stage("配置不可用"), "prepare");
+    }
+
+    #[test]
+    fn manual_browser_failure_returns_the_same_fresh_url_for_copy_and_retry() {
+        let url = "http://127.0.0.1:8990/?nonce=fresh".to_string();
+        let failed = manual_open_result(url.clone(), Err("opener rejected".into()));
+        assert_eq!(failed["status"], "error");
+        assert_eq!(failed["fallback_url"], url);
+        assert!(failed["message"]
+            .as_str()
+            .unwrap()
+            .contains("打开浏览器失败"));
+
+        let opened = manual_open_result(url, Ok(()));
+        assert_eq!(opened["status"], "ok");
+        assert!(opened["fallback_url"].is_null());
     }
 
     struct EnvGuard {
@@ -691,6 +818,10 @@ mod tests {
             r#"#!/bin/sh
 if [ -n "${CSSWITCH_FAKE_OPEN_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$CSSWITCH_FAKE_OPEN_LOG"
+fi
+if [ -n "${CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE:-}" ] && [ ! -e "$CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE" ]; then
+  : > "$CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE"
+  exit 1
 fi
 exit 0
 "#,
@@ -770,7 +901,10 @@ PY
     ;;
   url)
     p="$(cat "$state/port")"
-    echo "http://127.0.0.1:$p"
+    count="$(cat "$state/url-count" 2>/dev/null || echo 0)"
+    count=$((count + 1))
+    printf '%s' "$count" > "$state/url-count"
+    echo "http://127.0.0.1:$p/?nonce=$count"
     ;;
   stop)
     pid="$(cat "$state/pid" 2>/dev/null || true)"
@@ -890,6 +1024,7 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_OPEN_BIN", bin_dir.join("open"));
         env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
         env_guard.set("CSSWITCH_FAKE_SCIENCE_CALL_LOG", &science_call_log);
@@ -913,6 +1048,21 @@ esac
             base_url: format!("http://127.0.0.1:{mock_upstream_port}/anthropic"),
             api_key: fake_key.into(),
             model: "mock-model".into(),
+            model_catalog: vec![crate::model_catalog::ModelRoute {
+                selector_id: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                display_name: "Mock model".into(),
+                upstream_model: "mock-model".into(),
+                supports_tools: Some(true),
+                ..Default::default()
+            }],
+            default_model_route_id: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+            role_bindings: crate::model_catalog::RoleBindings {
+                sonnet: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                opus: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                haiku: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                fable: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cfg = Config {
@@ -990,12 +1140,45 @@ esac
         assert_eq!(call_count(&science_call_log, "url"), 3);
         assert_eq!(call_count(&route_config_log, "configure-third-party"), 1);
 
+        super::open_url_inner(&state)
+            .expect("first manual open should refresh the one-time Science URL");
+        super::open_url_inner(&state)
+            .expect("second manual open should refresh the one-time Science URL again");
+        assert_eq!(call_count(&science_call_log, "url"), 5);
+        let opened_urls: Vec<_> = fs::read_to_string(&open_log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(opened_urls.len() >= 4);
+        assert!(opened_urls[opened_urls.len() - 2].ends_with("/?nonce=4"));
+        assert!(opened_urls[opened_urls.len() - 1].ends_with("/?nonce=5"));
+        assert_ne!(
+            opened_urls[opened_urls.len() - 2],
+            opened_urls[opened_urls.len() - 1]
+        );
+
+        let fail_once = tmp.join("open-failed-once");
+        env_guard.set("CSSWITCH_FAKE_OPEN_FAIL_ONCE_FILE", &fail_once);
+        let failed_open = super::open_url_inner(&state)
+            .expect("manual opener failure should be a structured UI result");
+        assert_eq!(failed_open["status"], "error");
+        assert!(failed_open["fallback_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/?nonce=6"));
+        let retried_open = super::open_url_inner(&state)
+            .expect("retry should fetch and submit another fresh Science URL");
+        assert_eq!(retried_open["status"], "ok");
+        assert!(retried_open["fallback_url"].is_null());
+        assert_eq!(call_count(&science_call_log, "url"), 7);
+
         let route_check = lifecycle
             .with_serialized(|| sandbox_session::force_third_party_reconcile(&handle, &state));
         assert_eq!(route_check.as_deref(), Ok("Skill 路由已强制核验并同步。"));
         assert_eq!(call_count(&science_call_log, "--version"), 2);
         assert_eq!(call_count(&science_call_log, "status"), 3);
-        assert_eq!(call_count(&science_call_log, "url"), 4);
+        assert_eq!(call_count(&science_call_log, "url"), 8);
         assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
 
         stop_test_sandbox(&handle, &state, sandbox_port);
@@ -1035,7 +1218,7 @@ esac
         );
         assert_eq!(call_count(&science_call_log, "--version"), 2);
         assert_eq!(call_count(&science_call_log, "status"), 3);
-        assert_eq!(call_count(&science_call_log, "url"), 9);
+        assert_eq!(call_count(&science_call_log, "url"), 13);
         assert_eq!(call_count(&route_config_log, "configure-third-party"), 2);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
@@ -1046,7 +1229,9 @@ esac
         let upgraded_script = fs::read_to_string(&fake_science)
             .unwrap()
             .replace("0.0.0-csswitch-test", "0.0.1-csswitch-test");
-        write_executable(&fake_science, &upgraded_script);
+        let upgraded_candidate = bin_dir.join("claude-science-upgraded");
+        write_executable(&upgraded_candidate, &upgraded_script);
+        fs::rename(&upgraded_candidate, &fake_science).unwrap();
         let (version_cache, confirmed_stopped) = {
             let st = lock(&state);
             (
@@ -1070,7 +1255,7 @@ esac
         assert_eq!(upgraded["action"], "started");
         assert_eq!(call_count(&science_call_log, "--version"), 3);
         assert_eq!(call_count(&science_call_log, "status"), 3);
-        assert_eq!(call_count(&science_call_log, "url"), 11);
+        assert_eq!(call_count(&science_call_log, "url"), 15);
         assert_eq!(call_count(&route_config_log, "configure-third-party"), 3);
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
@@ -1160,6 +1345,7 @@ esac
         env_guard.set("HOME", &home);
         env_guard.set("CSSWITCH_REPO", &root);
         env_guard.set("SCIENCE_BIN", &fake_science);
+        env_guard.set("CSSWITCH_TEST_OPEN_BIN", bin_dir.join("open"));
         env_guard.set("CSSWITCH_TEST_FAKE_SCIENCE_IDENTITY", "1");
         env_guard.set("CSSWITCH_FAKE_OPEN_LOG", &open_log);
         env_guard.set("CSSWITCH_DOCTOR_CHECK_REAL_HOME", "0");
@@ -1181,6 +1367,21 @@ esac
             base_url: format!("http://127.0.0.1:{mock_upstream_port}/anthropic"),
             api_key: fake_key.into(),
             model: "mock-model".into(),
+            model_catalog: vec![crate::model_catalog::ModelRoute {
+                selector_id: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                display_name: "Mock model".into(),
+                upstream_model: "mock-model".into(),
+                supports_tools: Some(true),
+                ..Default::default()
+            }],
+            default_model_route_id: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+            role_bindings: crate::model_catalog::RoleBindings {
+                sonnet: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                opus: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                haiku: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                fable: "claude-csswitch-relay-mock-model-0123456789ab".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         let cfg = Config {
@@ -1233,7 +1434,7 @@ esac
         assert_eq!(down_status["last_error"]["type"], "proxy_unhealthy");
         assert_eq!(
             down_status["last_error"]["message"],
-            "代理进程不可达或已退出，请点击「一键开始」或「启动代理」恢复。"
+            "代理进程不可达或已退出，请点击「一键开始」恢复。"
         );
         assert_eq!(down_status["last_error"]["port"], proxy_port);
 

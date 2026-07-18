@@ -1465,6 +1465,7 @@ mod tests {
             &csswitch_codex_network::CodexNetworkSettings {
                 mode: csswitch_codex_network::CodexNetworkMode::Custom,
                 proxy_url: format!("http://{proxy}"),
+                ..Default::default()
             },
             &csswitch_codex_network::EnvironmentSnapshot::default(),
         )
@@ -1503,6 +1504,7 @@ mod tests {
             &csswitch_codex_network::CodexNetworkSettings {
                 mode: csswitch_codex_network::CodexNetworkMode::Custom,
                 proxy_url: format!("http://{proxy}"),
+                ..Default::default()
             },
             &csswitch_codex_network::EnvironmentSnapshot::default(),
         )

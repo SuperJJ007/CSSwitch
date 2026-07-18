@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::runtime::provider::{
     assert_format_supported, is_native_adapter, reject_openai_custom_anthropic_base,
@@ -23,7 +24,7 @@ pub(crate) fn is_main_list_model(id: &str) -> bool {
     false
 }
 
-fn build_capabilities(view: PublicPlanView) -> serde_json::Value {
+fn build_capabilities(view: PublicPlanView, model_required: bool) -> serde_json::Value {
     let tools_hint = match view.transport {
         crate::provider_contracts::Transport::OpenaiChat
         | crate::provider_contracts::Transport::OpenaiResponses
@@ -42,7 +43,7 @@ fn build_capabilities(view: PublicPlanView) -> serde_json::Value {
         "auth_mode": view.auth_mode,
         "credential_source": view.credential_source,
         "base_url_required": view.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired,
-        "model_required": view.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed,
+        "model_required": model_required,
         "model_discovery": model_discovery,
         "supports_thinking_policy": !view.thinking_policy.is_empty(),
         "thinking_policy": view.thinking_policy,
@@ -53,7 +54,10 @@ fn build_capabilities(view: PublicPlanView) -> serde_json::Value {
 
 pub(crate) fn template_capabilities(t: &templates::Template) -> serde_json::Value {
     match resolve_template_plan(t.id, t.api_format) {
-        Ok(plan) => build_capabilities(plan.public()),
+        Ok(plan) => build_capabilities(
+            plan.public(),
+            t.model_catalog_source == "manual_or_discovered",
+        ),
         Err(error) => json!({"status": "error", "error": error}),
     }
 }
@@ -66,7 +70,25 @@ pub(crate) fn profile_capabilities(p: &config::Profile) -> serde_json::Value {
             .unwrap_or_else(|| "anthropic".to_string());
     }
     match resolve_launch_plan(&normalized) {
-        Ok(plan) => build_capabilities(plan.public()),
+        Ok(plan) => build_capabilities(
+            plan.public(),
+            p.model_policy == crate::provider_contracts::ModelPolicy::SavedCatalog
+                && p.model_catalog.is_empty(),
+        ),
+        Err(error)
+            if p.model_policy == crate::provider_contracts::ModelPolicy::SavedCatalog
+                && p.model_catalog.is_empty() =>
+        {
+            match resolve_template_plan(&normalized.template_id, &normalized.api_format) {
+                Ok(plan) => {
+                    let mut value = build_capabilities(plan.public(), true);
+                    value["status"] = json!("incomplete");
+                    value["error"] = json!(error);
+                    value
+                }
+                Err(_) => json!({"status": "error", "error": error}),
+            }
+        }
         Err(error) => json!({"status": "error", "error": error}),
     }
 }
@@ -101,6 +123,10 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
             json!({
                 "id": p.id, "name": p.name, "template_id": p.template_id, "category": p.category,
                 "api_format": p.api_format, "base_url": p.base_url, "model": p.model,
+                "model_catalog": p.model_catalog,
+                "default_model_route_id": p.default_model_route_id,
+                "role_bindings": p.role_bindings,
+                "model_count": p.model_catalog.len(),
                 "key": key_masked.clone(), "has_key": !p.api_key.is_empty(), "key_masked": key_masked,
                 "credential_source": p.credential_source, "model_policy": p.model_policy,
                 "has_credential": resolve_launch_plan(p).map(|plan| plan.public().credential_configured).unwrap_or(false),
@@ -131,24 +157,124 @@ pub(crate) fn build_list_templates(experimental_codex_enabled: bool) -> Vec<serd
                 .as_ref()
                 .map(|contract| contract.adapter.clone())
                 .unwrap_or_else(|| "unsupported".to_string());
-            let requires_model_override = contract
-                .as_ref()
-                .map(|contract| {
-                    contract.default_model_policy
-                        == crate::provider_contracts::ModelPolicy::RequiredFixed
-                })
-                .unwrap_or(false);
+            let requires_model_override = t.model_catalog_source == "manual_or_discovered";
+            let builtin_models = t
+                .preset_catalog_id
+                .map(crate::model_catalog::preset_upstream_models)
+                .transpose()
+                .unwrap_or_default()
+                .unwrap_or_default();
+            let preset_catalog = t
+                .preset_catalog_id
+                .map(crate::model_catalog::preset_catalog)
+                .transpose()
+                .unwrap_or_default();
+            let (recommended_catalog, recommended_default_model_route_id, recommended_role_bindings) =
+                preset_catalog.unwrap_or_default();
             json!({
                 "id": t.id, "name": t.name, "category": t.category, "api_format": t.api_format,
                 "adapter": adapter, "base_url": t.base_url, "base_url_editable": t.base_url_editable,
                 "requires_model_override": requires_model_override,
-                "builtin_models": t.builtin_models, "icon": t.icon, "icon_color": t.icon_color,
+                "preset_catalog_id": t.preset_catalog_id,
+                "model_catalog_source": t.model_catalog_source,
+                "builtin_models": builtin_models,
+                "recommended_catalog": recommended_catalog,
+                "recommended_default_model_route_id": recommended_default_model_route_id,
+                "recommended_role_bindings": recommended_role_bindings,
+                "icon": t.icon, "icon_color": t.icon_color,
                 "website_url": t.website_url, "capabilities": template_capabilities(t),
             })
         })
         .collect()
 }
 
+pub(crate) fn build_preset_sync_preview(dir: &Path, id: &str) -> Result<serde_json::Value, String> {
+    let cfg = config::load_from(dir).map_err(|error| error.to_string())?;
+    let profile = cfg
+        .profile_by_id(id)
+        .ok_or_else(|| format!("找不到 profile：{id}"))?;
+    let template = templates::by_id(&profile.template_id)
+        .ok_or_else(|| format!("未知模板：{}", profile.template_id))?;
+    let preset_id = template
+        .preset_catalog_id
+        .ok_or("该配置没有可同步的内置推荐目录")?;
+    let (mut recommended, mut default, mut roles) =
+        crate::model_catalog::preset_catalog(preset_id)?;
+    let selector_by_generated: std::collections::BTreeMap<String, String> = recommended
+        .iter_mut()
+        .filter_map(|route| {
+            let generated = route.selector_id.clone();
+            let existing = profile
+                .model_catalog
+                .iter()
+                .find(|existing| existing.upstream_model == route.upstream_model)?;
+            route.selector_id = existing.selector_id.clone();
+            Some((generated, existing.selector_id.clone()))
+        })
+        .collect();
+    let remap = |selector: &mut String| {
+        if let Some(existing) = selector_by_generated.get(selector) {
+            *selector = existing.clone();
+        }
+    };
+    remap(&mut default);
+    remap(&mut roles.sonnet);
+    remap(&mut roles.opus);
+    remap(&mut roles.haiku);
+    remap(&mut roles.fable);
+    crate::model_catalog::validate_saved_catalog(&recommended, &default, &roles)?;
+    let current_upstreams: std::collections::BTreeSet<&str> = profile
+        .model_catalog
+        .iter()
+        .map(|route| route.upstream_model.as_str())
+        .collect();
+    let recommended_upstreams: std::collections::BTreeSet<&str> = recommended
+        .iter()
+        .map(|route| route.upstream_model.as_str())
+        .collect();
+    let additions: Vec<&str> = recommended_upstreams
+        .difference(&current_upstreams)
+        .copied()
+        .collect();
+    let removals: Vec<&str> = current_upstreams
+        .difference(&recommended_upstreams)
+        .copied()
+        .collect();
+    let fingerprint_material = serde_json::to_vec(&json!({
+        "profile_id": profile.id,
+        "template_id": profile.template_id,
+        "api_format": profile.api_format,
+        "current_catalog": profile.model_catalog,
+        "current_default": profile.default_model_route_id,
+        "current_roles": profile.role_bindings,
+        "preset_catalog_id": preset_id,
+        "recommended_catalog": recommended,
+        "recommended_default": default,
+        "recommended_roles": roles,
+    }))
+    .map_err(|error| error.to_string())?;
+    let mut digest = Sha256::new();
+    digest.update(b"csswitch-preset-sync-preview-v1\0");
+    digest.update(fingerprint_material);
+    let preview_fingerprint = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(json!({
+        "profile_id": id,
+        "preset_catalog_id": preset_id,
+        "additions": additions,
+        "removals": removals,
+        "model_catalog": recommended,
+        "default_model_route_id": default,
+        "role_bindings": roles,
+        "preview_fingerprint": preview_fingerprint,
+        "requires_confirmation": true,
+    }))
+}
+
+#[cfg(test)]
 pub(crate) fn create_profile_inner(
     dir: &Path,
     template_id: &str,
@@ -156,6 +282,18 @@ pub(crate) fn create_profile_inner(
     key: Option<&str>,
     base_url_override: Option<&str>,
     model: Option<&str>,
+) -> Result<String, String> {
+    create_profile_with_catalog_inner(dir, template_id, name, key, base_url_override, model, None)
+}
+
+pub(crate) fn create_profile_with_catalog_inner(
+    dir: &Path,
+    template_id: &str,
+    name: &str,
+    key: Option<&str>,
+    base_url_override: Option<&str>,
+    model: Option<&str>,
+    catalog_edit: Option<CatalogEdit>,
 ) -> Result<String, String> {
     let cfg = config::load_from(dir).map_err(|error| error.to_string())?;
     config::require_template_enabled(&cfg, template_id)?;
@@ -171,7 +309,14 @@ pub(crate) fn create_profile_inner(
     {
         return Err("OAuth profile 不能通过 API-key 创建入口写入 key".into());
     }
-    let p = config::Profile {
+    let (model_catalog, default_model_route_id, role_bindings) =
+        crate::model_catalog::new_profile_catalog(template_id, tpl.api_format, model)?;
+    let effective_model = model_catalog
+        .iter()
+        .find(|route| route.selector_id == default_model_route_id)
+        .map(|route| route.upstream_model.clone())
+        .unwrap_or_default();
+    let mut p = config::Profile {
         id: id.clone(),
         name: name.to_string(),
         template_id: template_id.to_string(),
@@ -185,7 +330,10 @@ pub(crate) fn create_profile_inner(
         } else {
             String::new()
         },
-        model: model.unwrap_or("").to_string(),
+        model: effective_model,
+        model_catalog,
+        default_model_route_id,
+        role_bindings,
         credential_source: contract.default_credential_source,
         credential_ref: (contract.default_credential_source
             == crate::provider_contracts::CredentialSource::CsswitchOauth)
@@ -197,7 +345,25 @@ pub(crate) fn create_profile_inner(
         sort_index: Some(config::now_ms()),
         created_at: Some(config::now_ms()),
         notes: None,
+        extra: Default::default(),
     };
+    if let Some(edit) = catalog_edit {
+        if p.model_policy != crate::provider_contracts::ModelPolicy::SavedCatalog {
+            return Err("动态 Codex profile 禁止保存静态模型目录".into());
+        }
+        let (routes, default, roles, effective_model) =
+            crate::model_catalog::normalize_catalog_edit(
+                &p.template_id,
+                &p.api_format,
+                edit.routes,
+                &edit.default_model_route_id,
+                edit.role_bindings,
+            )?;
+        p.model_catalog = routes;
+        p.default_model_route_id = default;
+        p.role_bindings = roles;
+        p.model = effective_model;
+    }
     assert_format_supported(&p)?; // custom 选了不支持格式则拒
     let resolved = resolve_launch_plan(&p)?;
     reject_openai_custom_anthropic_base(&resolved.adapter, &p.base_url)?;
@@ -206,7 +372,7 @@ pub(crate) fn create_profile_inner(
     {
         return Err("中转 / 自定义端点必须填写连接地址（base_url），未创建。".to_string());
     }
-    if resolved.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
+    if resolved.model_policy == crate::provider_contracts::ModelPolicy::SavedCatalog
         && p.model.trim().is_empty()
     {
         return Err("中转 / 自定义端点必须选择或填写一个模型，未创建。".to_string());
@@ -258,6 +424,9 @@ pub(crate) fn ensure_codex_profile_inner(dir: &Path) -> Result<EnsureCodexProfil
         base_url: template.base_url.to_string(),
         api_key: String::new(),
         model: String::new(),
+        model_catalog: Vec::new(),
+        default_model_route_id: String::new(),
+        role_bindings: Default::default(),
         credential_source: contract.default_credential_source,
         credential_ref: Some("csswitch:codex:default".to_string()),
         model_policy: contract.default_model_policy,
@@ -267,6 +436,7 @@ pub(crate) fn ensure_codex_profile_inner(dir: &Path) -> Result<EnsureCodexProfil
         sort_index: Some(config::now_ms()),
         created_at: Some(config::now_ms()),
         notes: None,
+        extra: Default::default(),
     };
     config::update_result(dir, |cfg| {
         config::require_template_enabled(cfg, "codex")?;
@@ -337,6 +507,7 @@ pub(crate) fn delete_profile_inner(dir: &Path, id: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn update_profile_connection_inner(
     dir: &Path,
     id: &str,
@@ -357,7 +528,14 @@ pub(crate) fn update_profile_connection_inner(
         candidate.api_format = f.to_string();
     }
     if let Some(m) = model {
-        candidate.model = m.to_string();
+        candidate.model = crate::model_catalog::set_profile_default_route(
+            &candidate.template_id,
+            &candidate.api_format,
+            &mut candidate.model_catalog,
+            &mut candidate.default_model_route_id,
+            &mut candidate.role_bindings,
+            m,
+        )?;
     }
     if let Some(k) = key.filter(|value| !value.is_empty()) {
         if candidate.credential_source != crate::provider_contracts::CredentialSource::ApiKey {
@@ -369,24 +547,30 @@ pub(crate) fn update_profile_connection_inner(
     config::write_rolling_backup(dir).ok(); // 覆盖前留底
     config::update(dir, |c| {
         if let Some(p) = c.profile_by_id_mut(id) {
-            if let Some(u) = base_url {
-                p.base_url = u.to_string();
-            }
-            if let Some(f) = api_format {
-                p.api_format = f.to_string();
-            }
-            if let Some(m) = model {
-                p.model = m.to_string();
-            }
-            if let Some(k) = key {
-                if !k.is_empty() {
-                    p.api_key = k.to_string(); // 空=不改（留占位不覆盖已存 key）
-                }
-            }
+            *p = candidate.clone();
         }
     })
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+pub(crate) fn persist_profile_candidate_inner(
+    dir: &Path,
+    id: &str,
+    candidate: &config::Profile,
+) -> Result<(), String> {
+    if candidate.id != id {
+        return Err("profile candidate identity mismatch".into());
+    }
+    resolve_launch_plan(candidate)?;
+    config::write_rolling_backup(dir).ok();
+    config::update_result(dir, |cfg| {
+        let profile = cfg
+            .profile_by_id_mut(id)
+            .ok_or_else(|| format!("找不到 profile：{id}"))?;
+        *profile = candidate.clone();
+        Ok(((), true))
+    })
 }
 
 /// 非 active 连接编辑的上游校验裁决（纯函数，P2-d）：
@@ -421,6 +605,14 @@ pub(crate) struct ConnectionEdit {
     api_format: Option<String>,
     model: Option<String>,
     key: Option<String>,
+    catalog: Option<CatalogEdit>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CatalogEdit {
+    pub(crate) routes: Vec<crate::model_catalog::ModelRoute>,
+    pub(crate) default_model_route_id: String,
+    pub(crate) role_bindings: crate::model_catalog::RoleBindings,
 }
 
 impl ConnectionEdit {
@@ -435,12 +627,18 @@ impl ConnectionEdit {
             api_format,
             model,
             key,
+            catalog: None,
         }
+    }
+
+    pub(crate) fn with_catalog(mut self, catalog: Option<CatalogEdit>) -> Self {
+        self.catalog = catalog;
+        self
     }
 
     /// 把非空编辑值套到目标 profile（内存候选与落盘共用同一逻辑）。
     /// 语义与 `update_profile_connection_inner` 一致：None=不改；key 为空串=不改（留占位不覆盖已存 key）。
-    pub(crate) fn apply(&self, p: &mut config::Profile) {
+    pub(crate) fn apply(&self, p: &mut config::Profile) -> Result<(), String> {
         if let Some(u) = &self.base_url {
             p.base_url = u.clone();
         }
@@ -448,13 +646,37 @@ impl ConnectionEdit {
             p.api_format = f.clone();
         }
         if let Some(m) = &self.model {
-            p.model = m.clone();
+            p.model = crate::model_catalog::set_profile_default_route(
+                &p.template_id,
+                &p.api_format,
+                &mut p.model_catalog,
+                &mut p.default_model_route_id,
+                &mut p.role_bindings,
+                m,
+            )?;
+        }
+        if let Some(edit) = &self.catalog {
+            if p.model_policy != crate::provider_contracts::ModelPolicy::SavedCatalog {
+                return Err("动态 Codex profile 禁止保存静态模型目录".into());
+            }
+            let (routes, default, roles, model) = crate::model_catalog::normalize_catalog_edit(
+                &p.template_id,
+                &p.api_format,
+                edit.routes.clone(),
+                &edit.default_model_route_id,
+                edit.role_bindings.clone(),
+            )?;
+            p.model_catalog = routes;
+            p.default_model_route_id = default;
+            p.role_bindings = roles;
+            p.model = model;
         }
         if let Some(k) = &self.key {
             if !k.is_empty() {
                 p.api_key = k.clone();
             }
         }
+        Ok(())
     }
 }
 
@@ -513,12 +735,13 @@ pub(crate) fn probe_kind_for_model(model: &str) -> scratch::ProbeKind {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_get_config, build_list_templates, clear_profile_key_inner, create_profile_inner,
-        delete_profile_inner, ensure_codex_profile_inner, is_canonical_codex_profile,
-        is_main_list_model, merge_and_sort_models, nonactive_probe_verdict, probe_kind_for,
+        build_get_config, build_list_templates, build_preset_sync_preview, clear_profile_key_inner,
+        create_profile_inner, delete_profile_inner, ensure_codex_profile_inner,
+        is_canonical_codex_profile, is_main_list_model, merge_and_sort_models,
+        nonactive_probe_verdict, persist_profile_candidate_inner, probe_kind_for,
         probe_kind_for_model, profile_capabilities, template_capabilities,
-        update_profile_connection_inner, update_profile_metadata_inner, ConnectionEdit,
-        EnsureCodexProfileDisposition,
+        update_profile_connection_inner, update_profile_metadata_inner, CatalogEdit,
+        ConnectionEdit, EnsureCodexProfileDisposition,
     };
     use crate::config;
 
@@ -586,7 +809,7 @@ mod tests {
             Some("new-model".into()),
             Some(String::new()), // 空 key = 不改（留占位不覆盖已存 key）
         );
-        edit.apply(&mut p);
+        edit.apply(&mut p).unwrap();
         assert_eq!(p.base_url, "new-url");
         assert_eq!(p.api_format, "anthropic", "None 字段不改");
         assert_eq!(p.model, "new-model");
@@ -594,7 +817,7 @@ mod tests {
 
         // 非空 key 覆盖；其余 None 不动。
         let edit2 = ConnectionEdit::new(None, None, None, Some("new-key".into()));
-        edit2.apply(&mut p);
+        edit2.apply(&mut p).unwrap();
         assert_eq!(p.api_key, "new-key", "非空 key 覆盖");
         assert_eq!(p.base_url, "new-url", "None 字段不改");
         assert_eq!(p.model, "new-model", "None 字段不改");
@@ -747,14 +970,73 @@ mod tests {
     }
 
     #[test]
-    fn create_relay_without_model_is_rejected() {
-        // 修 #9 P1-a：后端命令层直接创建 relay/自定义端点空 model 也被拦（不变量不可绕过）。
+    fn preset_relay_without_model_uses_recommendation_but_custom_requires_one() {
         let d = tmpdir_profile();
-        let e = create_profile_inner(&d, "glm", "GLM", Some("gk"), None, None);
-        assert!(e.is_err(), "relay 空 model 应拒绝创建");
-        assert!(e.unwrap_err().contains("模型"));
-        // native 不受约束（model 可空）。
+        let glm = create_profile_inner(&d, "glm", "GLM", Some("gk"), None, None)
+            .expect("preset provider should use its versioned recommendation");
+        let cfg = config::load_from(&d).unwrap();
+        let glm = cfg.profile_by_id(&glm).unwrap();
+        assert_eq!(glm.model, "glm-5.2");
+        assert!(!glm.model_catalog.is_empty());
+        let custom = create_profile_inner(
+            &d,
+            "custom",
+            "Custom",
+            Some("gk"),
+            Some("https://example.test/anthropic"),
+            None,
+        );
+        assert!(
+            custom.is_err(),
+            "manual custom endpoint must choose a model"
+        );
+        assert!(custom.unwrap_err().contains("模型"));
         assert!(create_profile_inner(&d, "deepseek", "DS", Some("gk"), None, None).is_ok());
+    }
+
+    #[test]
+    fn preset_sync_fingerprint_changes_with_saved_catalog_default_and_roles() {
+        let d = tmpdir_profile();
+        let id = create_profile_inner(&d, "glm", "GLM", Some("gk"), None, None).unwrap();
+        let first = build_preset_sync_preview(&d, &id).unwrap()["preview_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        config::update(&d, |cfg| {
+            cfg.profile_by_id_mut(&id).unwrap().model_catalog[0]
+                .display_name
+                .push_str(" changed");
+        })
+        .unwrap();
+        let second = build_preset_sync_preview(&d, &id).unwrap()["preview_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(first, second);
+
+        config::update(&d, |cfg| {
+            let profile = cfg.profile_by_id_mut(&id).unwrap();
+            let replacement = profile.model_catalog[1].selector_id.clone();
+            profile.default_model_route_id = replacement;
+        })
+        .unwrap();
+        let third = build_preset_sync_preview(&d, &id).unwrap()["preview_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(second, third);
+
+        config::update(&d, |cfg| {
+            let profile = cfg.profile_by_id_mut(&id).unwrap();
+            profile.role_bindings.haiku = profile.model_catalog[2].selector_id.clone();
+        })
+        .unwrap();
+        let fourth = build_preset_sync_preview(&d, &id).unwrap()["preview_fingerprint"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_ne!(third, fourth);
     }
 
     #[test]
@@ -809,6 +1091,77 @@ mod tests {
         assert!(e.is_err());
     }
 
+    #[test]
+    fn update_connection_persists_canonical_default_route_across_reload() {
+        let d = tmpdir_profile();
+        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, None).unwrap();
+        update_profile_connection_inner(&d, &id, None, None, Some("glm-manual-v9"), None).unwrap();
+        let reloaded = config::load_from(&d).unwrap();
+        let profile = reloaded.profile_by_id(&id).unwrap();
+        assert_eq!(profile.model, "glm-manual-v9");
+        let route = profile
+            .model_catalog
+            .iter()
+            .find(|route| route.selector_id == profile.default_model_route_id)
+            .expect("default route must survive serialization");
+        assert_eq!(route.upstream_model, "glm-manual-v9");
+    }
+
+    #[test]
+    fn connection_edit_persists_ordered_multi_model_catalog_roles_and_stable_selectors() {
+        let d = tmpdir_profile();
+        let id = create_profile_inner(&d, "glm", "GLM", Some("k"), None, None).unwrap();
+        let original = config::load_from(&d).unwrap();
+        let original_profile = original.profile_by_id(&id).unwrap();
+        let stable = original_profile.model_catalog[0].selector_id.clone();
+        let edit = CatalogEdit {
+            routes: vec![
+                crate::model_catalog::ModelRoute {
+                    selector_id: stable.clone(),
+                    display_name: "GLM renamed".into(),
+                    upstream_model: original_profile.model_catalog[0].upstream_model.clone(),
+                    supports_tools: Some(true),
+                    ..Default::default()
+                },
+                crate::model_catalog::ModelRoute {
+                    selector_id: String::new(),
+                    display_name: "Manual B".into(),
+                    upstream_model: "manual-b".into(),
+                    supports_tools: None,
+                    ..Default::default()
+                },
+            ],
+            default_model_route_id: "manual-b".into(),
+            role_bindings: crate::model_catalog::RoleBindings {
+                opus: stable.clone(),
+                sonnet: "manual-b".into(),
+                ..Default::default()
+            },
+        };
+        let mut candidate = original_profile.clone();
+        ConnectionEdit::new(None, None, None, None)
+            .with_catalog(Some(edit))
+            .apply(&mut candidate)
+            .unwrap();
+        persist_profile_candidate_inner(&d, &id, &candidate).unwrap();
+        let reloaded = config::load_from(&d).unwrap();
+        let profile = reloaded.profile_by_id(&id).unwrap();
+        assert_eq!(profile.model_catalog.len(), 2);
+        assert_eq!(profile.model_catalog[0].selector_id, stable);
+        assert_eq!(profile.model_catalog[1].upstream_model, "manual-b");
+        assert_eq!(profile.model, "manual-b");
+        assert_eq!(
+            profile.role_bindings.opus,
+            profile.model_catalog[0].selector_id
+        );
+        assert_eq!(
+            profile.role_bindings.sonnet,
+            profile.model_catalog[1].selector_id
+        );
+        assert_eq!(profile.role_bindings.haiku, profile.default_model_route_id);
+        assert_eq!(profile.role_bindings.fable, profile.default_model_route_id);
+    }
+
     // ---------- MP-2 Minor [4]: 未命中 id → Err（不静默 Ok） ----------
     #[test]
     fn update_metadata_unknown_id_errors() {
@@ -849,7 +1202,7 @@ mod tests {
         )
         .unwrap();
         let v = build_get_config(&d).unwrap();
-        assert_eq!(v["schema_version"], 3);
+        assert_eq!(v["schema_version"], 4);
         let arr = v["profiles"].as_array().unwrap();
         let p = arr.iter().find(|p| p["id"] == id).unwrap();
         assert!(p["key"].as_str().unwrap().ends_with("9999"));
@@ -863,7 +1216,14 @@ mod tests {
         );
         assert_eq!(p["has_key"], true);
         assert_eq!(p["key_masked"], p["key"], "保留旧 key 字段并补新掩码字段");
-        assert_eq!(p["capabilities"]["model_required"], true);
+        assert_eq!(p["capabilities"]["model_required"], false);
+        assert!(p["model_catalog"]
+            .as_array()
+            .is_some_and(|models| !models.is_empty()));
+        assert!(p["default_model_route_id"]
+            .as_str()
+            .is_some_and(|id| !id.is_empty()));
+        assert!(p["role_bindings"].is_object());
         assert_eq!(
             p["capabilities"]["model_discovery"],
             "anthropic_models_or_manual"
@@ -1094,7 +1454,7 @@ mod tests {
 
         let relay = template_capabilities(crate::templates::by_id("glm").unwrap());
         assert_eq!(relay["base_url_required"], true);
-        assert_eq!(relay["model_required"], true);
+        assert_eq!(relay["model_required"], false);
         assert_eq!(relay["model_discovery"], "anthropic_models_or_manual");
         assert_eq!(relay["thinking_policy"], "adaptive");
 

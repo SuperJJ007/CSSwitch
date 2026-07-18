@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -84,6 +85,52 @@ fn append_installer_note(mut message: String, status: &RegistrationStatus) -> St
         message.push_str(&format!(" {note}"));
     }
     message
+}
+
+fn verify_gateway_model_catalog(
+    port: u16,
+    secret: &str,
+    profile: &config::Profile,
+) -> Result<(), String> {
+    let (status, body) = proc::http_get_body_cancellable(
+        port,
+        Some(secret),
+        "/v1/models",
+        operation::LOCAL_HEALTH_TIMEOUT_MS,
+        None,
+    )
+    .ok_or("gateway 模型目录探活无响应")?;
+    if status != 200 {
+        return Err(format!("gateway 模型目录探活返回 {status}"));
+    }
+    let value: Value = serde_json::from_str(&body).map_err(|_| "gateway 模型目录不是合法 JSON")?;
+    let ids: Vec<&str> = value
+        .get("data")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|model| model.get("id").and_then(Value::as_str))
+        .collect();
+    if profile.model_policy == crate::provider_contracts::ModelPolicy::DynamicCatalog {
+        if ids.is_empty()
+            || ids
+                .iter()
+                .any(|id| !id.starts_with("claude-csswitch-codex-"))
+        {
+            return Err("Codex published model snapshot 为空或包含非法 alias".into());
+        }
+        return Ok(());
+    }
+    let expected: std::collections::BTreeSet<&str> = profile
+        .model_catalog
+        .iter()
+        .map(|route| route.selector_id.as_str())
+        .collect();
+    let actual: std::collections::BTreeSet<&str> = ids.iter().copied().collect();
+    if actual != expected || ids.first().copied() != Some(profile.default_model_route_id.as_str()) {
+        return Err("gateway 模型目录与已提交白名单/default selector 不一致".into());
+    }
+    Ok(())
 }
 
 fn configure_third_party_best_effort<R: Runtime>(
@@ -236,6 +283,98 @@ pub(crate) fn one_click_login<R: Runtime>(
     runtime_choice: Option<&str>,
     auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
 ) -> Result<Value, String> {
+    one_click_login_with_options(app, state, lifecycle, runtime_choice, auth_proof, true)
+}
+
+pub(crate) fn reconcile_science_for_active<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: SharedAppState,
+    lifecycle: &lifecycle::Lifecycle,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
+) -> Result<Value, String> {
+    one_click_login_with_options(app, state, lifecycle, None, auth_proof, false)
+}
+
+/// Rollback-only recovery path. The persisted config is already the old,
+/// authoritative profile. Do not trust its previous runtime binding to decide
+/// reuse: a healthy process may actually have loaded the failed candidate
+/// catalog. Stop only the exact in-memory Science identity and start the
+/// committed chain again from a clean process.
+pub(crate) fn force_restart_science_for_active<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: SharedAppState,
+    lifecycle: &lifecycle::Lifecycle,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
+) -> Result<Value, String> {
+    let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
+    let remembered = { lock(&state).science_runtime.clone() };
+    match remembered {
+        Some(runtime) => match probe_known_runtime(cfg.sandbox_port, &runtime) {
+            SandboxScienceState::RunningHealthy => {
+                let mut st = lock(&state);
+                st.science_runtime = Some(runtime);
+                stop_sandbox_state(&app, &mut st).map_err(|error| {
+                    format!("回滚时停止候选 Science 失败，未猜测 PID 或按端口结束进程：{error}")
+                })?;
+            }
+            SandboxScienceState::Stopped => {
+                let mut st = lock(&state);
+                st.science_confirmed_stopped = Some(runtime);
+                st.science_runtime = None;
+            }
+            SandboxScienceState::Unknown => {
+                return Err(
+                    "回滚时 Science 可能正在运行，但身份无法确认；已拒绝猜测 PID 或按端口结束进程。"
+                        .into(),
+                );
+            }
+        },
+        None if proc::loopback_port_in_use(
+            cfg.sandbox_port,
+            operation::LOCAL_HEALTH_TIMEOUT_MS,
+        ) =>
+        {
+            return Err(
+                "回滚时 Science 端口仍被占用，但没有可确认的 runtime 身份；已拒绝强制结束。".into(),
+            );
+        }
+        None => {}
+    }
+    one_click_login_with_options(app, state, lifecycle, None, auth_proof, false)
+}
+
+fn advance_runtime_transaction(
+    dir: &Path,
+    active_profile_id: &str,
+    previous_binding: Option<config::RuntimeBindingCommit>,
+    stage: &str,
+) -> Result<(), String> {
+    config::update(dir, |current| match current.runtime_transaction.as_mut() {
+        Some(journal) if journal.target_profile_id == active_profile_id => {
+            journal.stage = stage.to_string();
+        }
+        _ => {
+            current.runtime_transaction = Some(config::RuntimeTransactionJournal {
+                transaction_id: config::new_id(),
+                target_profile_id: active_profile_id.to_string(),
+                stage: stage.to_string(),
+                previous_binding: previous_binding.clone(),
+                previous_gateway: None,
+            });
+        }
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
+}
+
+fn one_click_login_with_options<R: Runtime>(
+    app: tauri::AppHandle<R>,
+    state: SharedAppState,
+    lifecycle: &lifecycle::Lifecycle,
+    runtime_choice: Option<&str>,
+    auth_proof: Option<&crate::codex_auth_supervisor::CodexAuthReadyProof>,
+    open_surface: bool,
+) -> Result<Value, String> {
     let trace = OperationTrace::start(OperationKind::OneClickLogin, "command=one_click_login");
     let dir = config::default_dir();
     let cfg = config::load_from(&dir).map_err(|e| e.to_string())?;
@@ -279,7 +418,18 @@ pub(crate) fn one_click_login<R: Runtime>(
         SandboxScienceState::RunningHealthy => {
             let running_runtime =
                 running_runtime.ok_or("Science 状态为运行中，但无法确认其 binary 身份")?;
-            if oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home) {
+            let desired_binding = crate::runtime::provider::desired_runtime_binding(
+                &cfg,
+                active_profile,
+                &running_runtime,
+            )?;
+            let science_binding_matches = !crate::runtime::provider::science_restart_required(
+                cfg.runtime_binding.as_ref(),
+                &desired_binding,
+            );
+            let login_intact =
+                oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home);
+            if login_intact && science_binding_matches {
                 let (_pport, secret, proxy_action) = ensure_proxy(
                     &app,
                     &state,
@@ -288,6 +438,7 @@ pub(crate) fn one_click_login<R: Runtime>(
                     Some(&trace),
                     auth_proof,
                 )?;
+                verify_gateway_model_catalog(cfg.proxy_port, &secret, active_profile)?;
                 let installer_bridge = skill_install_bridge_dir(&secret)?;
                 // Science 已在运行时只读检查，不并发改写它的 MCP 配置。
                 let installer = match current_skill_install_bridge_key() {
@@ -315,14 +466,34 @@ pub(crate) fn one_click_login<R: Runtime>(
                     st.science_runtime = Some(running_runtime.clone());
                     st.science_confirmed_stopped = None;
                 }
+                let refreshed_cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+                let committed = crate::runtime::provider::desired_runtime_binding(
+                    &refreshed_cfg,
+                    refreshed_cfg
+                        .active_profile()
+                        .ok_or("生效 profile 在启动期间消失")?,
+                    &running_runtime,
+                )?;
+                config::update(&dir, |cfg| {
+                    cfg.runtime_binding = Some(committed.clone());
+                    cfg.runtime_transaction = None;
+                })
+                .map_err(|error| error.to_string())?;
                 let base = match proxy_action {
                     ProxyAction::Reused => "已在运行",
                     ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
                 };
-                let msg = match open_science_surface(&app, &url) {
-                    Ok("webview") => format!("{base}，已重新打开 Science 窗口。"),
-                    Ok(_) => format!("{base}，已重新打开 Science。"),
-                    Err(_) => format!("{base}，服务已就绪；自动打开失败，请点击“打开 Science”。"),
+                let (msg, fallback_url) = if open_surface {
+                    match open_science_surface(&app, &url) {
+                        Ok("webview") => (format!("{base}，已重新打开 Science 窗口。"), None),
+                        Ok(_) => (format!("{base}，已向系统浏览器发送打开请求。"), None),
+                        Err(_) => (
+                            format!("{base}，服务已就绪；自动打开失败。"),
+                            Some(url.clone()),
+                        ),
+                    }
+                } else {
+                    (format!("{base}，Science 绑定保持不变。"), None)
                 };
                 let msg = append_installer_note(msg, &installer);
                 trace.finish(format!(
@@ -332,20 +503,38 @@ pub(crate) fn one_click_login<R: Runtime>(
                 return Ok(json!({
                     "msg": msg,
                     "action": "reopened",
+                    "stage": "complete",
+                    "status": "ok",
+                    "recovery_status": "not_needed",
+                    "fallback_url": fallback_url,
                     "external_skill_installer": installer_status_json(&installer)
                 }));
             }
+            config::update(&dir, |current| {
+                current.runtime_transaction = Some(config::RuntimeTransactionJournal {
+                    transaction_id: config::new_id(),
+                    target_profile_id: active_profile.id.clone(),
+                    stage: "stop_old_science".into(),
+                    previous_binding: cfg.runtime_binding.clone(),
+                    previous_gateway: None,
+                });
+            })
+            .map_err(|error| error.to_string())?;
             {
                 let mut st = lock(&state);
-                st.science_runtime = Some(running_runtime);
+                st.science_runtime = Some(running_runtime.clone());
                 if let Err(error) = stop_sandbox_state(&app, &mut st) {
                     trace.finish("error=sandbox_stop_for_login_refresh");
                     return Err(format!(
-                        "隔离 Science 登录状态失效，但停止旧进程失败：{error}"
+                        "隔离 Science 需要刷新登录或模型目录，但停止旧进程失败：{error}"
                     ));
                 }
             }
-            select_science_runtime_cached(runtime_choice, &version_cache)?
+            if login_intact {
+                running_runtime
+            } else {
+                select_science_runtime_cached(runtime_choice, &version_cache)?
+            }
         }
         SandboxScienceState::Stopped => {
             select_science_runtime_cached(runtime_choice, &version_cache)?
@@ -357,6 +546,14 @@ pub(crate) fn one_click_login<R: Runtime>(
             ));
         }
     };
+
+    let transaction_cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+    advance_runtime_transaction(
+        &dir,
+        &active_profile.id,
+        transaction_cfg.runtime_binding.clone(),
+        "start_gateway",
+    )?;
 
     let preview_port = sport
         .checked_add(1)
@@ -397,6 +594,13 @@ pub(crate) fn one_click_login<R: Runtime>(
         Some(&launch_runtime),
         Some(&trace),
         auth_proof,
+    )?;
+    verify_gateway_model_catalog(pport, &secret, active_profile)?;
+    advance_runtime_transaction(
+        &dir,
+        &active_profile.id,
+        transaction_cfg.runtime_binding.clone(),
+        "start_science",
     )?;
     let installer_bridge = skill_install_bridge_dir(&secret)?;
     // 本地 MCP 注册是 best-effort：失败只降级该工具，绝不阻断 Science 启动。
@@ -495,6 +699,12 @@ pub(crate) fn one_click_login<R: Runtime>(
             "端口 {sport} 有服务响应，但按 data-dir 确认不是本沙箱 Science（疑似被其它服务占用）。已尝试停掉刚起的沙箱。"
         ));
     }
+    advance_runtime_transaction(
+        &dir,
+        &active_profile.id,
+        transaction_cfg.runtime_binding.clone(),
+        "verify_science_catalog",
+    )?;
 
     // Third-party policy setup is best-effort. A dedicated control URL is only
     // consumed when the persisted route state says reconciliation is required.
@@ -518,10 +728,30 @@ pub(crate) fn one_click_login<R: Runtime>(
         oauth_forge::LoginAction::Created => "已启动",
         _ => "沙箱已重新启动，沿用原有对话",
     };
-    let msg = match open_science_surface(&app, &url) {
-        Ok("webview") => format!("{started}，已打开 Science 窗口。"),
-        Ok(_) => format!("{started}。"),
-        Err(_) => format!("{started}，服务已就绪；自动打开失败，请点击“打开 Science”。"),
+    let refreshed_cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+    let committed = crate::runtime::provider::desired_runtime_binding(
+        &refreshed_cfg,
+        refreshed_cfg
+            .active_profile()
+            .ok_or("生效 profile 在启动期间消失")?,
+        &launch_runtime,
+    )?;
+    config::update(&dir, |cfg| {
+        cfg.runtime_binding = Some(committed.clone());
+        cfg.runtime_transaction = None;
+    })
+    .map_err(|error| error.to_string())?;
+    let (msg, fallback_url) = if open_surface {
+        match open_science_surface(&app, &url) {
+            Ok("webview") => (format!("{started}，已打开 Science 窗口。"), None),
+            Ok(_) => (format!("{started}，已向系统浏览器发送打开请求。"), None),
+            Err(_) => (
+                format!("{started}，服务已就绪；自动打开失败。"),
+                Some(url.clone()),
+            ),
+        }
+    } else {
+        (format!("{started}，Science 已按新模型目录刷新。"), None)
     };
     let msg = append_installer_note(msg, &installer);
     trace.stage(OperationStage::OpenBrowser, "done");
@@ -532,6 +762,68 @@ pub(crate) fn one_click_login<R: Runtime>(
     Ok(json!({
         "msg": msg,
         "action": "started",
+        "stage": "complete",
+        "status": "ok",
+        "recovery_status": "not_needed",
+        "fallback_url": fallback_url,
         "external_skill_installer": installer_status_json(&installer)
     }))
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::advance_runtime_transaction;
+    use crate::config::{self, Config, RuntimeBindingCommit};
+
+    #[test]
+    fn runtime_journal_advances_in_place_and_retargets_without_secrets() {
+        let dir = std::env::temp_dir().join(format!(
+            "csswitch-runtime-journal-{}-{}",
+            std::process::id(),
+            config::new_id()
+        ));
+        let previous = RuntimeBindingCommit {
+            profile_id: "old".into(),
+            route_fp: "route-fp".into(),
+            catalog_fp: "catalog-fp".into(),
+            binding_fp: "binding-fp".into(),
+        };
+        config::save_to(
+            &dir,
+            &Config {
+                runtime_binding: Some(previous.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        advance_runtime_transaction(&dir, "new", Some(previous.clone()), "start_gateway").unwrap();
+        let first = config::load_from(&dir)
+            .unwrap()
+            .runtime_transaction
+            .unwrap();
+        assert_eq!(first.target_profile_id, "new");
+        assert_eq!(first.stage, "start_gateway");
+        assert_eq!(first.previous_binding, Some(previous.clone()));
+
+        advance_runtime_transaction(&dir, "new", Some(previous.clone()), "start_science").unwrap();
+        let second = config::load_from(&dir)
+            .unwrap()
+            .runtime_transaction
+            .unwrap();
+        assert_eq!(second.transaction_id, first.transaction_id);
+        assert_eq!(second.stage, "start_science");
+
+        advance_runtime_transaction(&dir, "newer", Some(previous), "start_gateway").unwrap();
+        let retargeted = config::load_from(&dir)
+            .unwrap()
+            .runtime_transaction
+            .unwrap();
+        assert_ne!(retargeted.transaction_id, second.transaction_id);
+        assert_eq!(retargeted.target_profile_id, "newer");
+        let encoded = serde_json::to_string(&retargeted).unwrap();
+        assert!(!encoded.contains("api_key"));
+        assert!(!encoded.contains("base_url"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

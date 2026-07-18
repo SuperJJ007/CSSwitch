@@ -473,6 +473,7 @@ class SubprocessScenarioControl:
         self._parent = Path(evidence_parent)
         self.evidence_dir = self._parent / "provider-mock"
         self.manifest_path = self._parent / "provider-mock-manifest.v1.json"
+        self.stderr_path = self._parent / "provider-mock.stderr.log"
         self._process: Optional[subprocess.Popen] = None
         self._client: Optional[UnixScenarioControlClient] = None
         self._token: Optional[str] = None
@@ -576,17 +577,24 @@ class SubprocessScenarioControl:
             "--secrets-fd",
             str(secrets_read),
         ]
+        stderr_handle = None
         try:
             try:
+                if self.stderr_path.exists() or self.stderr_path.is_symlink():
+                    raise ControllerError("provider mock stderr evidence must not pre-exist")
+                stderr_handle = self.stderr_path.open("xb")
+                self.stderr_path.chmod(0o600)
                 self._process = subprocess.Popen(
                     command,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
+                    stderr=stderr_handle,
                     close_fds=True,
                     pass_fds=(token_read, secrets_read),
                 )
             finally:
+                if stderr_handle is not None:
+                    stderr_handle.close()
                 os.close(token_read)
                 os.close(secrets_read)
             self._write_pipe(token_write, token.encode("utf-8"))
@@ -918,6 +926,8 @@ class InstalledProviderSession:
         root: Optional[Path] = None,
         app_bundle: Path = APP_BUNDLE,
         allow_test_bundle: bool = False,
+        expected_bundle_id: str = EXPECTED_BUNDLE_ID,
+        config_dir_name: str = ".csswitch",
         inspector: Optional[ProcessInspector] = None,
         scenario_control: Optional[Any] = None,
     ):
@@ -927,6 +937,12 @@ class InstalledProviderSession:
         self.app_bundle = Path(app_bundle)
         if self.app_bundle != APP_BUNDLE and not allow_test_bundle:
             raise ControllerError("non-installed app bundle is test-only")
+        if config_dir_name not in {".csswitch", ".csswitch-acceptance"}:
+            raise ControllerError("unsupported config data root")
+        if not isinstance(expected_bundle_id, str) or not expected_bundle_id:
+            raise ControllerError("expected bundle identifier is required")
+        self.expected_bundle_id = expected_bundle_id
+        self.config_dir_name = config_dir_name
         self.inspector = inspector or ProcessInspector()
         try:
             Path(root).lstat() if root is not None else None
@@ -937,7 +953,7 @@ class InstalledProviderSession:
         self._root_created_by_session = not root_preexisted
         self._workspace_destroyed = False
         self.home = self.root / "home"
-        self.csswitch_dir = self.home / ".csswitch"
+        self.csswitch_dir = self.home / self.config_dir_name
         self.evidence = self.root / "evidence"
         self.tmp = self.root / "tmp"
         self.bin_dir = self.root / "bin"
@@ -998,7 +1014,7 @@ class InstalledProviderSession:
 
     def _validate_bundle(self) -> Tuple[Path, Path]:
         info = _read_bundle_info(self.app_bundle)
-        if info.get("CFBundleIdentifier") != EXPECTED_BUNDLE_ID:
+        if info.get("CFBundleIdentifier") != self.expected_bundle_id:
             raise ControllerError("unexpected installed bundle identifier")
         executable_name = info.get("CFBundleExecutable")
         if executable_name != EXPECTED_EXECUTABLE:
@@ -1016,7 +1032,7 @@ class InstalledProviderSession:
         tripwire = self.evidence / "python3-tripwire.log"
         open_script = """#!/bin/sh
 set -eu
-test -n "${CSSWITCH_FAKE_OPEN_LOG:-}" && printf 'open-called\\n' >> "$CSSWITCH_FAKE_OPEN_LOG"
+test -n "${CSSWITCH_FAKE_OPEN_LOG:-}" && printf 'open-called %s\\n' "$*" >> "$CSSWITCH_FAKE_OPEN_LOG"
 exit 0
 """
         security_script = "#!/bin/sh\nexit 0\n"
@@ -1121,7 +1137,10 @@ case "$cmd" in
     ;;
   url)
     recorded_port="$(cat "$state/port")"
-    printf 'http://127.0.0.1:%s\\n' "$recorded_port"
+    count="$(cat "$state/url-count" 2>/dev/null || echo 0)"
+    count=$((count + 1))
+    printf '%s' "$count" > "$state/url-count"
+    printf 'http://127.0.0.1:%s/?nonce=%s\\n' "$recorded_port" "$count"
     ;;
   stop)
     if test ! -e "$state/pid" && test ! -e "$state/port" && test ! -e "$state/executable"; then
@@ -1272,7 +1291,7 @@ esac
                     }
                 )
                 continue
-            if bundle_id == EXPECTED_BUNDLE_ID:
+            if bundle_id == self.expected_bundle_id:
                 matches.append(
                     {"pid": record.pid, "executable": str(executable), "identity": "same_bundle"}
                 )
@@ -1344,6 +1363,7 @@ esac
             "TMPDIR": str(self.tmp),
             "PATH": f"{self.bin_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
             "SCIENCE_BIN": str(self.fake_science),
+            "CSSWITCH_ACCEPTANCE_OPEN_BIN": str(self.bin_dir / "open"),
             "CSSWITCH_EXPECTED_SANDBOX_PORT": str(self.sandbox_port),
             "CSSWITCH_TOOLUSE_SHIM": self.case.shim,
             "CSSWITCH_UPSTREAM_URL": self._native_override(mock_base),

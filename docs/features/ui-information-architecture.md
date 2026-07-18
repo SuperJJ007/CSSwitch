@@ -7,16 +7,16 @@
 - 用户先回答“现在用哪套连接、能不能启动”，再按需进入编辑、诊断或账号设置。
 - Profile 是模型连接页的核心对象；API Key、CSSwitch OAuth 等统一称为“凭据”。
 - Codex 继续作为一种 provider capability，不建立第二套启动入口或独立产品模式。
-- 稳定后端能力和交互原型明确分层，不让原型入口暗示功能已经可用。
+- 只展示可由当前后端证明的能力；浏览器视觉预览不改变产品状态口径。
 
 ## 主导航
 
 | 页面 | 回答的问题 | 主要对象 |
 |---|---|---|
 | 模型连接 | 现在用什么，下一步怎么启动？ | 当前 Profile、配置列表、模型、凭据摘要、主操作 |
+| Skill & MCP | 当前组织发现了哪些 Skill，OPERON 是否已绑定？ | Skill、来源、Bundle、OPERON 绑定状态 |
 | 状态 | 哪一层没有就绪，去哪里诊断？ | Proxy、Science、上游、诊断动作 |
-| 设置 | 哪些全局能力会影响连接与权限？ | Runtime、SSH 权限、Codex 账号与网络、扩展入口 |
-| Skill & MCP | 已安装什么，处于哪个 attach/load 阶段？ | 当前仅为显式原型；普通产品模式不展示 |
+| 设置 | 哪些全局能力会影响连接与权限？ | Runtime、SSH 权限、Codex 账号与网络 |
 
 不新增“Codex”一级导航。Codex 的日常选择属于 Profile，账号与网络属于设置，运行健康属于状态。
 
@@ -35,18 +35,17 @@
 | 能力类型 | 地址 | 模型 | 凭据 | 页面措辞 |
 |---|---|---|---|---|
 | 固定或可编辑 API provider | 按 capability 展示 | 固定、跟随或用户选择 | API Key / Token | 显示掩码，不显示完整值 |
-| 原生映射 provider | 通常隐藏或只读 | “内置映射”或“跟随 Science” | API Key / Token | 不伪造可选模型 |
+| 原生映射 provider | 通常隐藏或只读 | 默认、质量、快速、Fable 四个自由输入；推荐模型仅作候选 | API Key / Token | 按四个输入建立严格 selector 映射 |
 | Codex 动态目录 | 隐藏 | “在 Science 中选择”，并显示账号目录 | CSSwitch OAuth | 不保存固定模型，不要求 base URL / Key |
 
 Codex 入口关闭时，已有 Codex Profile 仍可被识别和管理，但不能设为当前或启动。OAuth 与 API Key 在同一“凭据”列出现，避免把 Codex 错误描述成没有鉴权。
 
 ## 设置页
 
-设置页按所有权分成三个区块：
+设置页按所有权分成两个区块：
 
 1. 运行设置：Proxy / Science 端口和隔离 Science 的 SSH 权限。
 2. Codex 账号与连接：实验开关、账号状态与登录动作、网络路线、兼容性降级。
-3. 扩展：当前正式能力只暴露本地 Skill 包导入；完整 Skill 管理仍是显式原型。
 
 Codex 区块内部再分为：
 
@@ -56,24 +55,35 @@ Codex 区块内部再分为：
 
 关闭 Codex 实验入口和退出 Codex 登录必须保持两个独立动作；网络路线也不能混入通用 Proxy 端口设置。
 
+## Skill & MCP 页面
+
+扩展是一级页面，不再作为设置页中的低频附属入口。页面内部保留 Skills / MCP 两个标签，但当前只有 Skills 接入真实列表：
+
+1. Skills：只读扫描 CSSwitch 管理的 Science active org，区分 CSSwitch 系统、本地包、GitHub、Science / 用户本地与来源未验证五类。
+2. 绑定：只有 `RunningHealthy` 且成功回读 OPERON 才显示“已绑定 / 未绑定”；其余情况统一显示“绑定未知”，不推断 load 或可用性。
+3. 操作边界：`导入本地 Skill 包` 继续使用 v0.7.0 的真实系统 picker；页面不提供删除、detach、模拟 load 验证或 GitHub 安装向导。
+4. MCP：保留不可点击的“暂未开放”标签，不展示列表、新建、编辑、启停或 attach 操作。
+
+设置页不重复出现扩展卡片，避免用户在“管理对象”和“全局权限”之间来回寻找同一入口。
+
 ## 状态与文案
 
 - “配置已保存”“已设为当前”“Gateway 已就绪”“Science 已打开”是不同状态，不合并成一个成功提示。
 - Codex 模型目录区分 live、stale cache、网络失败和未登录；不把缓存目录写成实时目录。
-- Skill 区分文件提交、attach、load 验证和重启要求；MCP 后端未就绪前保持禁用。
-- 浏览器预览、交互原型、源码测试、Tauri App 和发布 artifact 的验证结论分开记录。
+- Skill 的“已发现”“已绑定”和“当前会话已加载”是三件事；本页只证明前两者，不显示“可用”。
+- 浏览器视觉预览、源码测试、Tauri App 和发布 artifact 的验证结论分开记录。
 
 ## 响应式与验收门
 
 - 目标 Tauri 窗口为 `920×600`，最低 `760×520`；两档均不得出现水平溢出。
 - 窄窗下保持主操作优先、Profile 操作贴右；允许名称截断和列表纵向滚动，不允许关键动作换到不可预测位置。
-- 普通模式默认进入模型连接页，不展示 Skill/MCP 原型导航；显式原型参数才允许进入原型页。
-- 自动门至少覆盖前端语法、Codex 结构化错误、Skill 状态机、重复 DOM id 和缺失图片。
+- 普通模式默认进入模型连接页，但始终展示 Skill/MCP 一级导航；浏览器的 `page=skills` 只用于视觉检查。
+- 自动门至少覆盖前端语法、Codex 结构化错误、Skill 列表合同、重复 DOM id 和缺失图片。
 - 合并前仍需在 Tauri App 复核模型连接、Codex 设置、Codex 动态目录、深色主题与最小窗口；浏览器 mock 不能替代真实 App 验收。
 
 ## 暂不扩展
 
 - 不把 `auth.json`、`config.toml` 或完整 endpoint 放进主流程。
-- 不在本轮实现完整 Skill inventory 与真实 attach/load 管理。
-- MCP 继续显示“暂未开放”，不提供可达的新建、编辑或 attach 流程。
+- 不在本轮实现 Skill 删除、detach、load 验证或完整生命周期管理。
+- 不实现 MCP 列表、新建、编辑、启停或 attach。
 - 不在 UI 层复制后端 capability 判断或认证守卫。

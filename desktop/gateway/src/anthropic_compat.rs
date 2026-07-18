@@ -2,8 +2,6 @@ use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Map, Value};
 
-const RELAY_DEFAULT_MODEL: &str = "claude-opus-4-8";
-const RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL: &str = "provider.relay.force-model-shell";
 const RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED: &str = "provider.kimi.relay-thinking-enabled";
 const RULE_TOOL_RELAY_INPUT_SCHEMA_NORMALIZE: &str = "tool.relay.input-schema-normalize";
 const RULE_TOOL_KIMI_WEB_SEARCH_SERVER_TOOL_FILTER: &str =
@@ -207,28 +205,6 @@ fn is_siliconflow_anthropic_endpoint(endpoint: &str) -> bool {
         .any(|official| host.eq_ignore_ascii_case(official))
 }
 
-pub fn resolve_relay_model(
-    name: Option<&str>,
-    forced_model: Option<&str>,
-    relay_models: &[String],
-) -> String {
-    if let Some(model) = forced_model.filter(|model| !model.is_empty()) {
-        return model.to_string();
-    }
-    let name = name.unwrap_or("");
-    if name.is_empty() {
-        return RELAY_DEFAULT_MODEL.to_string();
-    }
-    if relay_models.is_empty() || relay_models.iter().any(|model| model == name) {
-        return name.to_string();
-    }
-    relay_models
-        .iter()
-        .find(|model| model.starts_with(&format!("{name}-")) || *model == name)
-        .cloned()
-        .unwrap_or_else(|| name.to_string())
-}
-
 fn enabled_budget(max_tokens: Option<u64>) -> u64 {
     let default = 1024;
     match max_tokens {
@@ -422,8 +398,7 @@ fn apply_siliconflow_tool_choice_compat(
 
 pub fn transform_relay_request(
     mut body: Value,
-    forced_model: Option<&str>,
-    relay_models: &[String],
+    target_model: &str,
     relay_thinking: Option<&str>,
     upstream_url: &str,
 ) -> Result<(Value, AnthropicMetadata), String> {
@@ -434,15 +409,11 @@ pub fn transform_relay_request(
         return Err("request body must be a JSON object with a 'messages' array".to_string());
     }
 
-    let target_model = resolve_relay_model(
-        obj.get("model").and_then(Value::as_str),
-        forced_model,
-        relay_models,
-    );
-    let mut rule_ids = Vec::new();
-    if forced_model.filter(|model| !model.is_empty()).is_some() {
-        append_rule_id(&mut rule_ids, RULE_PROVIDER_RELAY_FORCE_MODEL_SHELL);
+    if target_model.is_empty() {
+        return Err("resolved upstream model is required".into());
     }
+    let target_model = target_model.to_string();
+    let mut rule_ids = Vec::new();
     if relay_thinking == Some("enabled") && target_model.to_ascii_lowercase().contains("kimi") {
         append_rule_id(&mut rule_ids, RULE_PROVIDER_KIMI_RELAY_THINKING_ENABLED);
     }
@@ -461,10 +432,7 @@ pub fn transform_relay_request(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_siliconflow_anthropic_endpoint, resolve_relay_model, transform_relay_request,
-        KimiServerToolFilter,
-    };
+    use super::{is_siliconflow_anthropic_endpoint, transform_relay_request, KimiServerToolFilter};
     use serde_json::{json, Value};
 
     fn fixture() -> Value {
@@ -505,8 +473,7 @@ mod tests {
         for case in cases {
             let (mapped, metadata) = transform_relay_request(
                 case["request"].clone(),
-                None,
-                &[],
+                case["mapped"]["model"].as_str().unwrap(),
                 None,
                 case["endpoint"].as_str().unwrap(),
             )
@@ -521,14 +488,9 @@ mod tests {
     #[test]
     fn relay_snaps_bare_model_and_preserves_max_tokens() {
         let fixture = fixture();
-        let relay_models = vec![
-            "claude-haiku-4-5-20251001".to_string(),
-            "claude-opus-4-8".to_string(),
-        ];
         let (mapped, metadata) = transform_relay_request(
             fixture["plain_request"].clone(),
-            None,
-            &relay_models,
+            fixture["plain_target_model"].as_str().unwrap(),
             None,
             "",
         )
@@ -541,17 +503,12 @@ mod tests {
     #[test]
     fn relay_force_model_overrides_shell() {
         let fixture = fixture();
-        let (mapped, metadata) = transform_relay_request(
-            fixture["force_request"].clone(),
-            Some("MiniMax-M2"),
-            &[],
-            None,
-            "",
-        )
-        .unwrap();
+        let (mapped, metadata) =
+            transform_relay_request(fixture["force_request"].clone(), "MiniMax-M2", None, "")
+                .unwrap();
         assert_eq!(mapped, fixture["force_mapped"]);
         assert_eq!(metadata.target_model, fixture["force_target_model"]);
-        assert_eq!(metadata.rule_ids, vec!["provider.relay.force-model-shell"]);
+        assert_eq!(metadata.rule_ids, Vec::<String>::new());
     }
 
     #[test]
@@ -559,8 +516,7 @@ mod tests {
         let fixture = fixture();
         let (mapped, metadata) = transform_relay_request(
             fixture["kimi_request"].clone(),
-            Some("kimi-k2.7-code"),
-            &[],
+            "kimi-k2.7-code",
             Some("enabled"),
             "",
         )
@@ -570,7 +526,6 @@ mod tests {
         assert_eq!(
             metadata.rule_ids,
             vec![
-                "provider.relay.force-model-shell".to_string(),
                 "provider.kimi.relay-thinking-enabled".to_string(),
                 "tool.relay.input-schema-normalize".to_string(),
                 "tool.kimi.web_search.server-tool-filter".to_string(),
@@ -587,42 +542,13 @@ mod tests {
                 "tool_choice": {"type": "tool", "name": "web_search"},
                 "tools": [{"name": "web_search", "input_schema": {"type": "object"}}],
             }),
-            Some("kimi-k2.7-code"),
-            &[],
+            "kimi-k2.7-code",
             None,
             "",
         )
         .unwrap();
         assert!(mapped.get("tools").is_none());
         assert_eq!(mapped["tool_choice"], json!({"type": "auto"}));
-    }
-
-    #[test]
-    fn resolve_relay_model_defaults_and_passthrough() {
-        assert_eq!(resolve_relay_model(None, None, &[]), "claude-opus-4-8");
-        assert_eq!(
-            resolve_relay_model(Some("claude-opus-4-8"), None, &[]),
-            "claude-opus-4-8"
-        );
-        assert_eq!(
-            resolve_relay_model(Some("claude-opus-4-8"), Some("glm-5.2"), &[]),
-            "glm-5.2"
-        );
-        let models = vec![
-            "claude-haiku-4-5-20251001".to_string(),
-            "claude-haiku-4-5".to_string(),
-            "claude-haiku-4-5-20251111".to_string(),
-        ];
-        assert_eq!(
-            resolve_relay_model(Some("claude-haiku-4-5"), None, &models),
-            "claude-haiku-4-5",
-            "an exact live ID wins over earlier prefix matches"
-        );
-        assert_eq!(
-            resolve_relay_model(Some("claude-haiku"), None, &models),
-            "claude-haiku-4-5-20251001",
-            "otherwise the first requested-name prefix wins"
-        );
     }
 
     #[test]

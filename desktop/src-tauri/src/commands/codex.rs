@@ -204,7 +204,7 @@ struct CodexProfileLaunchSnapshot {
     template_id: String,
     api_format: String,
     base_url: String,
-    model: String,
+    model_catalog_snapshot: String,
     credential_source: crate::provider_contracts::CredentialSource,
     credential_ref: Option<String>,
     model_policy: crate::provider_contracts::ModelPolicy,
@@ -250,7 +250,12 @@ impl CodexLaunchSnapshot {
             template_id: profile.template_id.clone(),
             api_format: profile.api_format.clone(),
             base_url: profile.base_url.clone(),
-            model: profile.model.clone(),
+            model_catalog_snapshot: serde_json::to_string(&serde_json::json!({
+                "model_catalog": profile.model_catalog,
+                "default_model_route_id": profile.default_model_route_id,
+                "role_bindings": profile.role_bindings,
+            }))
+            .unwrap_or_else(|_| "serialization-error".into()),
             credential_source: profile.credential_source,
             credential_ref: profile.credential_ref.clone(),
             model_policy: profile.model_policy,
@@ -556,7 +561,7 @@ fn set_experimental_codex_enabled_at(
     Ok(json!({ "experimental_codex_enabled": enabled }))
 }
 
-fn codex_downgrade_preview_for(cfg: &config::Config) -> Value {
+fn codex_downgrade_preview_for(cfg: &config::Config) -> Result<Value, String> {
     let profiles: Vec<Value> = cfg
         .profiles
         .iter()
@@ -568,20 +573,39 @@ fn codex_downgrade_preview_for(cfg: &config::Config) -> Value {
     let active_will_clear = profiles
         .iter()
         .any(|profile| profile["id"].as_str() == Some(cfg.active_id.as_str()));
-    json!({
+    let actions = profiles
+        .iter()
+        .filter_map(|profile| profile["id"].as_str())
+        .map(|id| {
+            (
+                id.to_string(),
+                config::CodexDowngradeAction::ExportThenRemove,
+            )
+        })
+        .collect();
+    let prepared = config::prepare_downgrade_to_v2(cfg, &actions)?;
+    let catalog_export_count = prepared
+        .exports
+        .iter()
+        .filter(|value| value["kind"] == "saved_model_catalog")
+        .count();
+    Ok(json!({
         "schema_version": 1,
         "action": "export_then_remove_all",
         "profile_count": profiles.len(),
         "profiles": profiles,
         "active_will_clear": active_will_clear,
+        "catalog_export_count": catalog_export_count,
+        "preview_fingerprint": prepared.fingerprint,
         "credentials_unchanged": true,
         "app_exit_required": true,
-    })
+    }))
 }
 
 fn downgrade_actions_for_expected(
     cfg: &config::Config,
     expected_profile_ids: &[String],
+    expected_preview_fingerprint: &str,
 ) -> Result<BTreeMap<String, config::CodexDowngradeAction>, String> {
     let current: BTreeSet<String> = cfg
         .profiles
@@ -597,10 +621,15 @@ fn downgrade_actions_for_expected(
             "Codex profile 列表已变化或确认参数不完整；未导出、未降级，请重新预览。".into(),
         );
     }
-    Ok(current
+    let actions: BTreeMap<_, _> = current
         .into_iter()
         .map(|id| (id, config::CodexDowngradeAction::ExportThenRemove))
-        .collect())
+        .collect();
+    let actual = config::prepare_downgrade_to_v2(cfg, &actions)?.fingerprint;
+    if expected_preview_fingerprint.is_empty() || actual != expected_preview_fingerprint {
+        return Err("配置或模型目录在预览后已变化；未导出、未降级，请重新预览并确认。".into());
+    }
+    Ok(actions)
 }
 
 fn stop_all_before_downgrade(
@@ -1969,7 +1998,7 @@ pub(crate) async fn set_codex_network(
 #[tauri::command]
 pub(crate) fn codex_downgrade_preview() -> Result<Value, String> {
     let cfg = config::load_from(&config::default_dir()).map_err(|error| error.to_string())?;
-    Ok(codex_downgrade_preview_for(&cfg))
+    codex_downgrade_preview_for(&cfg)
 }
 
 /// Export metadata for every currently confirmed Codex profile, remove those
@@ -1982,6 +2011,7 @@ pub(crate) async fn codex_downgrade_export_all(
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
     expected_profile_ids: Vec<String>,
+    expected_preview_fingerprint: String,
 ) -> Result<Value, String> {
     let exit_app = app.clone();
     let picker_app = app.clone();
@@ -2011,9 +2041,18 @@ pub(crate) async fn codex_downgrade_export_all(
         lifecycle.with_serialized(|| {
             let dir = config::default_dir();
             let cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
-            let actions = downgrade_actions_for_expected(&cfg, &expected_profile_ids)?;
+            let actions = downgrade_actions_for_expected(
+                &cfg,
+                &expected_profile_ids,
+                &expected_preview_fingerprint,
+            )?;
             stop_all_before_downgrade(&app, &state, lifecycle.as_ref())?;
-            Ok(match config::downgrade_to_v2_and_latch(&dir, &actions, Some(&destination)) {
+            Ok(match config::downgrade_to_v2_and_latch(
+                &dir,
+                &actions,
+                Some(&destination),
+                &expected_preview_fingerprint,
+            ) {
                 Ok(_) => DowngradeCommandOutcome::Committed(json!({
                     "schema_version": 1,
                     "status": "DOWNGRADED_EXIT_REQUIRED",
@@ -2301,8 +2340,26 @@ mod tests {
                 Box::new(|cfg| cfg.profiles[0].base_url = "https://changed.test".into()),
             ),
             (
-                "profile.model",
-                Box::new(|cfg| cfg.profiles[0].model = "changed-model".into()),
+                "profile.model_catalog",
+                Box::new(|cfg| {
+                    cfg.profiles[0]
+                        .model_catalog
+                        .push(crate::model_catalog::ModelRoute {
+                            selector_id: "claude-csswitch-test-extra-0123456789ab".into(),
+                            display_name: "Extra".into(),
+                            upstream_model: "extra".into(),
+                            supports_tools: Some(true),
+                            ..Default::default()
+                        })
+                }),
+            ),
+            (
+                "profile.default_model_route_id",
+                Box::new(|cfg| cfg.profiles[0].default_model_route_id = "changed-route".into()),
+            ),
+            (
+                "profile.role_bindings",
+                Box::new(|cfg| cfg.profiles[0].role_bindings.sonnet = "changed-role".into()),
             ),
             (
                 "profile.credential_source",
@@ -2319,7 +2376,7 @@ mod tests {
                 "profile.model_policy",
                 Box::new(|cfg| {
                     cfg.profiles[0].model_policy =
-                        crate::provider_contracts::ModelPolicy::RequiredFixed
+                        crate::provider_contracts::ModelPolicy::SavedCatalog
                 }),
             ),
             (
@@ -2355,7 +2412,7 @@ mod tests {
         }
 
         let mut changed = base;
-        changed.profiles[0].model = "changed-model".into();
+        changed.proxy_port += 1;
         config::save_to(&temp.0, &changed).unwrap();
         let error = verify_launch_snapshot_unchanged(&temp.0, &target, &baseline).unwrap_err();
         assert!(error.starts_with("config_changed_retry："));
@@ -3199,44 +3256,70 @@ mod tests {
 
     #[test]
     fn downgrade_preview_and_confirmation_are_complete_and_secret_free() {
-        let mut codex = config::Profile {
+        let codex = config::Profile {
             id: "codex-1".into(),
             name: "My Codex".into(),
             template_id: "codex".into(),
-            api_key: "must-never-appear".into(),
+            api_format: "openai_responses".into(),
             credential_source: crate::provider_contracts::CredentialSource::CsswitchOauth,
             credential_ref: Some("csswitch:codex:default".into()),
+            model_policy: crate::provider_contracts::ModelPolicy::DynamicCatalog,
             ..Default::default()
         };
-        // A valid OAuth profile never has an API key. Keep the fake secret only
-        // long enough to prove the preview projection cannot serialize it.
+        let (model_catalog, default_model_route_id, role_bindings) =
+            crate::model_catalog::new_profile_catalog(
+                "deepseek",
+                "anthropic",
+                Some("deepseek-v4-pro"),
+            )
+            .unwrap();
+        let api = config::Profile {
+            id: "api-1".into(),
+            name: "DeepSeek".into(),
+            template_id: "deepseek".into(),
+            api_format: "anthropic".into(),
+            api_key: "must-never-appear".into(),
+            model: "deepseek-v4-pro".into(),
+            model_catalog,
+            default_model_route_id,
+            role_bindings,
+            model_policy: crate::provider_contracts::ModelPolicy::SavedCatalog,
+            ..Default::default()
+        };
         let preview_cfg = config::Config {
-            profiles: vec![codex.clone()],
+            profiles: vec![api.clone(), codex.clone()],
             active_id: codex.id.clone(),
             ..Default::default()
         };
-        let preview = codex_downgrade_preview_for(&preview_cfg);
+        let preview = codex_downgrade_preview_for(&preview_cfg).unwrap();
         assert_eq!(preview["profile_count"], 1);
         assert_eq!(preview["active_will_clear"], true);
         assert_eq!(preview["credentials_unchanged"], true);
         let encoded = preview.to_string();
         assert!(!encoded.contains("must-never-appear"));
         assert!(!encoded.contains("credential_ref"));
+        assert_eq!(preview["catalog_export_count"], 1);
+        let fingerprint = preview["preview_fingerprint"].as_str().unwrap().to_string();
 
-        codex.api_key.clear();
         let cfg = config::Config {
-            profiles: vec![codex],
+            profiles: vec![api, codex],
+            active_id: "codex-1".into(),
             ..Default::default()
         };
-        let actions = downgrade_actions_for_expected(&cfg, &["codex-1".into()]).unwrap();
+        let actions =
+            downgrade_actions_for_expected(&cfg, &["codex-1".into()], &fingerprint).unwrap();
         assert_eq!(
             actions.get("codex-1"),
             Some(&config::CodexDowngradeAction::ExportThenRemove)
         );
-        assert!(downgrade_actions_for_expected(&cfg, &[]).is_err());
-        assert!(
-            downgrade_actions_for_expected(&cfg, &["codex-1".into(), "codex-1".into()]).is_err()
-        );
-        assert!(downgrade_actions_for_expected(&cfg, &["other".into()]).is_err());
+        assert!(downgrade_actions_for_expected(&cfg, &[], &fingerprint).is_err());
+        assert!(downgrade_actions_for_expected(
+            &cfg,
+            &["codex-1".into(), "codex-1".into()],
+            &fingerprint,
+        )
+        .is_err());
+        assert!(downgrade_actions_for_expected(&cfg, &["other".into()], &fingerprint).is_err());
+        assert!(downgrade_actions_for_expected(&cfg, &["codex-1".into()], "stale").is_err());
     }
 }

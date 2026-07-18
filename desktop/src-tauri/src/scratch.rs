@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::runtime::operation::{self, OperationStage, OperationTrace};
 
 /// 探测类型：Models 验端点+鉴权（透传预设保存/获取模型）；Message 验具体模型（选了模型时）。
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum ProbeKind {
     Models,
     Message,
@@ -175,6 +175,7 @@ pub struct ScratchTarget<'a> {
     pub base_url: &'a str,
     pub key: &'a str,
     pub model: Option<&'a str>,
+    pub static_model_catalog: Option<&'a str>,
     pub relay_thinking: &'a str, // relay thinking 策略（模板 thinking_policy），非空注入 CSSWITCH_RELAY_THINKING
 }
 
@@ -288,6 +289,37 @@ pub fn scratch_probe(
             body: error,
         };
     }
+    let request_model = match kind {
+        ProbeKind::Models => {
+            cmd.env("CSSWITCH_GATEWAY_INTENT", "scratch-models");
+            None
+        }
+        ProbeKind::Message => {
+            let Some(catalog) = target.static_model_catalog else {
+                return ProbeResult {
+                    status: None,
+                    body: "scratch-message 缺少静态模型目录".into(),
+                };
+            };
+            let selector = serde_json::from_str::<serde_json::Value>(catalog)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("default_selector_id")
+                        .and_then(|id| id.as_str())
+                        .map(str::to_string)
+                });
+            let Some(selector) = selector else {
+                return ProbeResult {
+                    status: None,
+                    body: "scratch-message 静态模型目录缺少默认 selector".into(),
+                };
+            };
+            cmd.env("CSSWITCH_GATEWAY_INTENT", "scratch-message");
+            cmd.env("CSSWITCH_STATIC_MODEL_CATALOG_V1", catalog);
+            Some(selector)
+        }
+    };
     cmd.stdout(Stdio::null()).stderr(Stdio::null());
     // key/base_url/model 经 env 注入（绝不进 argv，避免 ps 泄露）；native 不带 relay base。
     for (k, v) in scratch_env(
@@ -406,6 +438,31 @@ pub fn scratch_probe(
             body: "临时探测已取消".into(),
         };
     }
+    if kind == ProbeKind::Message {
+        let catalog_ok = crate::proc::http_get_body_cancellable(
+            port,
+            Some(&secret),
+            "/v1/models",
+            operation::LOCAL_HEALTH_TIMEOUT_MS,
+            cancel,
+        )
+        .and_then(|(status, body)| (status == 200).then_some(body))
+        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
+        .and_then(|value| value.get("data").and_then(|data| data.as_array()).cloned())
+        .is_some_and(|models| {
+            request_model.as_deref().is_some_and(|expected| {
+                models
+                    .iter()
+                    .any(|model| model.get("id").and_then(|id| id.as_str()) == Some(expected))
+            })
+        });
+        if !catalog_ok {
+            return ProbeResult {
+                status: None,
+                body: "候选 gateway 的 /v1/models 未发布默认 selector".into(),
+            };
+        }
+    }
     match kind {
         ProbeKind::Models => {
             if let Some(t) = trace {
@@ -435,7 +492,12 @@ pub fn scratch_probe(
         }
         ProbeKind::Message => {
             // model 由 CSSWITCH_RELAY_MODEL 强制，请求体模型名占位即可（会被 override）。
-            let payload = br#"{"model":"claude-opus-4-8","max_tokens":1,"messages":[{"role":"user","content":"ping"}]}"#;
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "model": request_model.as_deref().unwrap_or(""),
+                "max_tokens": 1,
+                "messages": [{"role":"user","content":"ping"}]
+            }))
+            .unwrap_or_default();
             if let Some(t) = trace {
                 t.stage(OperationStage::ScratchUpstreamProbe, "POST /v1/messages");
             }
@@ -443,7 +505,7 @@ pub fn scratch_probe(
                 port,
                 Some(&secret),
                 "/v1/messages",
-                payload,
+                &payload,
                 operation::UPSTREAM_PROBE_TIMEOUT_MS,
             ) {
                 Some(code) => ProbeResult {
@@ -484,6 +546,7 @@ mod tests {
                 base_url: "",
                 key: "",
                 model: None,
+                static_model_catalog: None,
                 relay_thinking: "",
             },
             ProbeKind::Models,
@@ -550,6 +613,37 @@ mod tests {
                 base_url: &format!("http://127.0.0.1:{upstream_port}/up"),
                 key: "test-key",
                 model: Some("mock-model"),
+                static_model_catalog: Some(
+                    &crate::model_catalog::static_resolver_payload(
+                        "openai-custom",
+                        "custom-openai",
+                        &crate::model_catalog::single_route_catalog(
+                            "scratch-test",
+                            "mock-model",
+                            None,
+                            Some(true),
+                        )
+                        .unwrap()
+                        .0,
+                        &crate::model_catalog::single_route_catalog(
+                            "scratch-test",
+                            "mock-model",
+                            None,
+                            Some(true),
+                        )
+                        .unwrap()
+                        .1,
+                        &crate::model_catalog::single_route_catalog(
+                            "scratch-test",
+                            "mock-model",
+                            None,
+                            Some(true),
+                        )
+                        .unwrap()
+                        .2,
+                    )
+                    .unwrap(),
+                ),
                 relay_thinking: "",
             },
             ProbeKind::Message,

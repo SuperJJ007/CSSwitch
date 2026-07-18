@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::Read;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::thread;
@@ -275,6 +277,38 @@ pub fn verify_attach_control_ready(context: &ScienceHostContext) -> Result<(), A
     require_active_org(context, &expected_org, false)
 }
 
+/// Read the complete OPERON Skill attachment snapshot without changing it.
+///
+/// The same runtime identity, loopback URL, nonce authentication, response
+/// bounds and active-org checks used by attach are retained here. Callers must
+/// discard the whole result on any error; a failed readback is not evidence
+/// that every Skill is detached.
+pub fn read_agent_skill_names(
+    context: &ScienceHostContext,
+    expected_active_org: &str,
+) -> Result<BTreeSet<String>, AttachError> {
+    validate_context(context)?;
+    require_active_org(context, expected_active_org, false)?;
+    let control_url = fresh_control_url(context)?;
+    let (origin, nonce) = validate_control_url(&control_url, context.sandbox_port)?;
+    let client = Client::builder()
+        .connect_timeout(Duration::from_secs(2))
+        .timeout(Duration::from_secs(5))
+        .redirect(Policy::none())
+        .no_proxy()
+        .build()
+        .map_err(|_| {
+            AttachError::new(
+                "SCIENCE_CONTROL_FAILED",
+                "初始化 Science Skill 状态客户端失败",
+            )
+        })?;
+    let session = authenticate(&client, &origin, &nonce)?;
+    let names = agent_skills_required(&client, &origin, &session.auth_cookie)?;
+    require_active_org(context, expected_active_org, false)?;
+    Ok(names)
+}
+
 fn validate_context(context: &ScienceHostContext) -> Result<(), AttachError> {
     if !context.binary.is_absolute()
         || !context.home.is_absolute()
@@ -363,14 +397,41 @@ fn require_active_org(
 
 fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError> {
     let temp = context.home.join(".csswitch-skill-tmp");
-    fs::create_dir_all(&temp)
-        .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "创建受控 Science 临时目录失败"))?;
+    match fs::symlink_metadata(&temp) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(AttachError::new(
+                "SCIENCE_CONTROL_FAILED",
+                "受控 Science 临时路径不是安全目录",
+            ));
+        }
+        Ok(_) => {}
+        Err(problem) if problem.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&temp).map_err(|_| {
+                AttachError::new("SCIENCE_CONTROL_FAILED", "创建受控 Science 临时目录失败")
+            })?;
+        }
+        Err(_) => {
+            return Err(AttachError::new(
+                "SCIENCE_CONTROL_FAILED",
+                "检查受控 Science 临时目录失败",
+            ));
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&temp, fs::Permissions::from_mode(0o700)).map_err(|_| {
-            AttachError::new("SCIENCE_CONTROL_FAILED", "收紧 Science 临时目录权限失败")
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+        let directory = options.open(&temp).map_err(|_| {
+            AttachError::new("SCIENCE_CONTROL_FAILED", "受控 Science 临时目录校验失败")
         })?;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|_| {
+                AttachError::new("SCIENCE_CONTROL_FAILED", "收紧 Science 临时目录权限失败")
+            })?;
     }
     let mut command = Command::new(&context.binary);
     command
@@ -505,20 +566,40 @@ fn output_with_timeout(command: &mut Command) -> Result<ProcessOutput, AttachErr
     })
 }
 
-fn read_capped(mut reader: impl Read) -> Result<Vec<u8>, AttachError> {
+fn read_limited(
+    mut reader: impl Read,
+    read_error: &'static str,
+    limit_error: &'static str,
+) -> Result<Vec<u8>, AttachError> {
     let mut bytes = Vec::new();
     reader
         .by_ref()
         .take((PROCESS_OUTPUT_LIMIT + 1) as u64)
         .read_to_end(&mut bytes)
-        .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "读取 Science 输出失败"))?;
+        .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", read_error))?;
     if bytes.len() > PROCESS_OUTPUT_LIMIT {
         return Err(AttachError::new(
             "SCIENCE_CONTROL_OUTPUT_LIMIT",
-            "claude-science url 输出超过 64 KiB",
+            limit_error,
         ));
     }
     Ok(bytes)
+}
+
+fn read_capped(reader: impl Read) -> Result<Vec<u8>, AttachError> {
+    read_limited(
+        reader,
+        "读取 Science 输出失败",
+        "claude-science url 输出超过 64 KiB",
+    )
+}
+
+fn read_response_capped(response: Response) -> Result<Vec<u8>, AttachError> {
+    read_limited(
+        response,
+        "读取 OPERON 响应失败",
+        "OPERON 状态响应超过 64 KiB",
+    )
 }
 
 fn validate_control_url(raw: &str, expected_port: u16) -> Result<(String, String), AttachError> {
@@ -610,6 +691,23 @@ fn agent_skills(
     origin: &str,
     auth_cookie: &str,
 ) -> Result<BTreeSet<String>, AttachError> {
+    agent_skills_with_policy(client, origin, auth_cookie, false)
+}
+
+fn agent_skills_required(
+    client: &Client,
+    origin: &str,
+    auth_cookie: &str,
+) -> Result<BTreeSet<String>, AttachError> {
+    agent_skills_with_policy(client, origin, auth_cookie, true)
+}
+
+fn agent_skills_with_policy(
+    client: &Client,
+    origin: &str,
+    auth_cookie: &str,
+    require_operon: bool,
+) -> Result<BTreeSet<String>, AttachError> {
     let response = client
         .get(format!(
             "{origin}/api/agents?names={AGENT_NAME}&include_metadata=true"
@@ -621,15 +719,7 @@ fn agent_skills(
             AttachError::new("SCIENCE_CONTROL_FAILED", "读取 OPERON Skill 状态失败").retryable(true)
         })?;
     ensure_success(&response, "OPERON Skill 回读")?;
-    let bytes = response
-        .bytes()
-        .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "读取 OPERON 响应失败"))?;
-    if bytes.len() > PROCESS_OUTPUT_LIMIT {
-        return Err(AttachError::new(
-            "SCIENCE_CONTROL_OUTPUT_LIMIT",
-            "OPERON 状态响应超过 64 KiB",
-        ));
-    }
+    let bytes = read_response_capped(response)?;
     let value: Value = serde_json::from_slice(&bytes)
         .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "OPERON 状态响应非法"))?;
     let agents = value
@@ -644,18 +734,28 @@ fn agent_skills(
             == Some(AGENT_NAME)
     });
     let Some(agent) = agent else {
-        return Ok(BTreeSet::new());
+        return if require_operon {
+            Err(AttachError::new(
+                "SCIENCE_CONTROL_FAILED",
+                "OPERON 状态响应缺少目标 Agent",
+            ))
+        } else {
+            Ok(BTreeSet::new())
+        };
     };
     let skills = agent
         .get("skill_names")
         .or_else(|| agent.get("skillNames"))
         .and_then(Value::as_array)
         .ok_or_else(|| AttachError::new("SCIENCE_CONTROL_FAILED", "OPERON 状态缺少 skill_names"))?;
-    Ok(skills
-        .iter()
-        .filter_map(Value::as_str)
-        .map(str::to_string)
-        .collect())
+    let mut names = BTreeSet::new();
+    for skill in skills {
+        let name = skill.as_str().ok_or_else(|| {
+            AttachError::new("SCIENCE_CONTROL_FAILED", "OPERON skill_names 包含非法成员")
+        })?;
+        names.insert(name.to_string());
+    }
+    Ok(names)
 }
 
 fn response_cookie(response: &Response, name: &str) -> Option<String> {
@@ -692,7 +792,7 @@ mod tests {
     use super::*;
     use std::io::Write as _;
     use std::net::{TcpListener, TcpStream};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -823,6 +923,37 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
     }
 
     #[test]
+    fn fresh_url_rejects_symlink_temp_without_changing_target_permissions() {
+        let context = context_with_script(
+            "symlink-temp",
+            "printf '%s\n' 'http://127.0.0.1:18998/?nonce=one'",
+            18_998,
+        );
+        let target = context.home.join("permission-target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        symlink(&target, context.home.join(".csswitch-skill-tmp")).unwrap();
+
+        assert_eq!(
+            fresh_control_url(&context).unwrap_err().code,
+            "SCIENCE_CONTROL_FAILED"
+        );
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn limited_reader_rejects_before_buffering_past_the_contract() {
+        let oversized = std::io::Cursor::new(vec![b'x'; PROCESS_OUTPUT_LIMIT + 2]);
+        let error = read_limited(oversized, "read failed", "too large").unwrap_err();
+        assert_eq!(error.code, "SCIENCE_CONTROL_OUTPUT_LIMIT");
+        assert_eq!(error.message, "too large");
+    }
+
+    #[test]
     fn fresh_url_rejects_nonzero_multiple_urls_wrong_port_and_changed_binary() {
         let _guard = ENV_LOCK.lock().unwrap();
         let nonzero = context_with_script("nonzero", "exit 7", 18_991);
@@ -941,6 +1072,37 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
         assert!(requests[3].contains(r#"{"skill_name":"demo"}"#));
         assert!(requests[4].starts_with("GET /api/agents?names=OPERON&include_metadata=true "));
         fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn strict_list_readback_rejects_missing_operon_and_malformed_skills() {
+        for body in [
+            r#"[{"name":"OTHER","skill_names":[]}]"#,
+            r#"[{"name":"OPERON","skill_names":"demo"}]"#,
+            r#"[{"name":"OPERON","skill_names":["demo",42]}]"#,
+        ] {
+            let Some(listener) = bind_loopback() else {
+                return;
+            };
+            let port = listener.local_addr().unwrap().port();
+            let worker = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = read_request(&mut stream);
+                reply(&mut stream, None, body);
+            });
+            let client = Client::builder()
+                .connect_timeout(Duration::from_secs(2))
+                .timeout(Duration::from_secs(5))
+                .redirect(Policy::none())
+                .no_proxy()
+                .build()
+                .unwrap();
+            let error =
+                agent_skills_required(&client, &format!("http://127.0.0.1:{port}"), "auth-token")
+                    .unwrap_err();
+            assert_eq!(error.code, "SCIENCE_CONTROL_FAILED");
+            worker.join().unwrap();
+        }
     }
 
     #[test]

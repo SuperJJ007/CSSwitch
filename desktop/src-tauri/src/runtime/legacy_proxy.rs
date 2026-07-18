@@ -26,6 +26,13 @@ pub(crate) enum LegacyProxyCleanup {
     StopFailed(u32),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedGatewayCleanup {
+    NotManaged,
+    Stopped(u32),
+    StopFailed(u32),
+}
+
 fn parse_lsof_records(output: &str) -> Vec<(u32, String)> {
     let mut records = Vec::new();
     let mut pid = None;
@@ -105,6 +112,21 @@ fn current_uid() -> Option<u32> {
         .ok()
 }
 
+fn process_text_files(pid: u32) -> Vec<std::path::PathBuf> {
+    let output = match Command::new(system_tool("/usr/sbin/lsof", "lsof"))
+        .args(["-nP", "-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return Vec::new(),
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
 fn has_exact_arg_pair(command: &str, name: &str, value: &str) -> bool {
     let fields: Vec<&str> = command.split_whitespace().collect();
     fields
@@ -180,6 +202,64 @@ pub(crate) fn stop_legacy_csswitch_python_on_port(
         thread::sleep(Duration::from_millis(50));
     }
     LegacyProxyCleanup::StopFailed(process.pid)
+}
+
+/// Stop an interrupted managed Rust Gateway only after the caller has
+/// authenticated its health identity. Process ownership is independently
+/// constrained to one listener owned by the current uid whose executable is
+/// the exact packaged Gateway binary. `health_still_matches` is re-run
+/// immediately before SIGTERM to close the listener-replacement race.
+pub(crate) fn stop_managed_gateway_on_port<F>(
+    port: u16,
+    expected_binary: &Path,
+    health_still_matches: F,
+) -> ManagedGatewayCleanup
+where
+    F: Fn() -> bool,
+{
+    let Some(uid) = current_uid() else {
+        return ManagedGatewayCleanup::NotManaged;
+    };
+    let records = listener_records(port);
+    if records.len() != 1 {
+        return ManagedGatewayCleanup::NotManaged;
+    }
+    let (pid, command_name) = records[0].clone();
+    let Some(process) = process_snapshot(pid, command_name) else {
+        return ManagedGatewayCleanup::NotManaged;
+    };
+    if pid <= 1 || process.uid != uid {
+        return ManagedGatewayCleanup::NotManaged;
+    }
+    let Ok(expected) = expected_binary.canonicalize() else {
+        return ManagedGatewayCleanup::NotManaged;
+    };
+    let executable_matches = process_text_files(pid)
+        .into_iter()
+        .filter_map(|path| path.canonicalize().ok())
+        .any(|path| path == expected);
+    if !executable_matches
+        || !health_still_matches()
+        || listener_records(port).as_slice() != [(pid, process.command_name.clone())]
+    {
+        return ManagedGatewayCleanup::NotManaged;
+    }
+    let status = Command::new(system_tool("/bin/kill", "kill"))
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    if !matches!(status, Ok(status) if status.success()) {
+        return ManagedGatewayCleanup::StopFailed(pid);
+    }
+    for _ in 0..40 {
+        if !listener_records(port)
+            .iter()
+            .any(|(listener_pid, _)| *listener_pid == pid)
+        {
+            return ManagedGatewayCleanup::Stopped(pid);
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    ManagedGatewayCleanup::StopFailed(pid)
 }
 
 #[cfg(test)]

@@ -1,14 +1,18 @@
 use std::fs::{self, File};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use csswitch_skill_install_core::MAX_IMPORT_ORIGIN_BYTES;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 
 pub(crate) const SKILL_NAME: &str = "csswitch-external-skill-tools";
 const IMPORT_ORIGIN_FILE: &str = ".import-origin";
 const MARKETPLACE: &str = "csswitch-system-bridge";
+const MAX_ROUTE_SKILL_BODY_BYTES: usize = 64 * 1024;
 const SKILL_BODY: &str =
     include_str!("../../resources/skills/csswitch-external-skill-tools/SKILL.md");
 const LEGACY_SPLIT_CONNECTORS_SHA256: &str =
@@ -84,7 +88,15 @@ pub(crate) fn ensure_route_skill(data_dir: &Path) -> Result<bool, String> {
 }
 
 pub(crate) fn inspect_route_skill(data_dir: &Path) -> Result<bool, String> {
-    let target = route_skill_path(data_dir)?;
+    let active_org = read_active_org(data_dir)?;
+    inspect_route_skill_for_org(data_dir, &active_org)
+}
+
+pub(crate) fn inspect_route_skill_for_org(
+    data_dir: &Path,
+    expected_org: &str,
+) -> Result<bool, String> {
+    let target = route_skill_path_for_org(data_dir, expected_org)?;
     if !target.exists() && fs::symlink_metadata(&target).is_err() {
         return Ok(false);
     }
@@ -93,33 +105,28 @@ pub(crate) fn inspect_route_skill(data_dir: &Path) -> Result<bool, String> {
 
 fn route_skill_path(data_dir: &Path) -> Result<PathBuf, String> {
     let active_org = read_active_org(data_dir)?;
+    route_skill_path_for_org(data_dir, &active_org)
+}
+
+fn route_skill_path_for_org(data_dir: &Path, active_org: &str) -> Result<PathBuf, String> {
+    if !valid_active_org(active_org) {
+        return Err("active org 标识非法".into());
+    }
     let skills_root = data_dir.join("orgs").join(active_org).join("skills");
     ensure_safe_skills_root(data_dir, &skills_root)?;
     Ok(skills_root.join(SKILL_NAME))
 }
 
 fn read_active_org(data_dir: &Path) -> Result<String, String> {
-    if !data_dir.is_absolute() {
-        return Err("Science data-dir 必须是绝对路径".into());
-    }
-    reject_symlink_path(data_dir)?;
-    let active = data_dir.join("active-org.json");
-    reject_symlink_path(&active)?;
-    let body = fs::read(&active).map_err(|_| "读取 Science active-org.json 失败")?;
-    let value: Value = serde_json::from_slice(&body).map_err(|_| "Science active-org.json 非法")?;
-    let org = value
-        .get("org_uuid")
-        .and_then(Value::as_str)
-        .ok_or("active-org.json 缺少 org_uuid")?;
-    let valid = !org.is_empty()
+    csswitch_skill_install_core::active_org(data_dir).map_err(|error| error.message)
+}
+
+fn valid_active_org(org: &str) -> bool {
+    !org.is_empty()
         && org.len() <= 128
         && org
             .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte));
-    if !valid {
-        return Err("active org 标识非法".into());
-    }
-    Ok(org.to_string())
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
 
 fn ensure_safe_skills_root(data_dir: &Path, skills_root: &Path) -> Result<(), String> {
@@ -145,7 +152,9 @@ fn route_skill_matches(target: &Path) -> Result<bool, String> {
     let marker_path = target.join(IMPORT_ORIGIN_FILE);
     reject_symlink_path(&body_path)?;
     reject_symlink_path(&marker_path)?;
-    if fs::read(&body_path).ok().as_deref() != Some(SKILL_BODY.as_bytes()) {
+    if read_regular_file_limited(&body_path, MAX_ROUTE_SKILL_BODY_BYTES)?.as_deref()
+        != Some(SKILL_BODY.as_bytes())
+    {
         return Ok(false);
     }
     route_marker_matches(&marker_path)
@@ -163,9 +172,9 @@ fn legacy_route_skill_matches(target: &Path) -> Result<bool, String> {
     let marker_path = target.join(IMPORT_ORIGIN_FILE);
     reject_symlink_path(&body_path)?;
     reject_symlink_path(&marker_path)?;
-    let body = match fs::read(&body_path) {
-        Ok(body) => body,
-        Err(_) => return Ok(false),
+    let body = match read_regular_file_limited(&body_path, MAX_ROUTE_SKILL_BODY_BYTES)? {
+        Some(body) => body,
+        None => return Ok(false),
     };
     let digest = format!("{:x}", Sha256::digest(&body));
     if !matches!(
@@ -184,8 +193,7 @@ fn legacy_route_skill_matches(target: &Path) -> Result<bool, String> {
 }
 
 fn route_marker_matches(marker_path: &Path) -> Result<bool, String> {
-    let marker: Value = match fs::read(marker_path)
-        .ok()
+    let marker: Value = match read_regular_file_limited(marker_path, MAX_IMPORT_ORIGIN_BYTES)?
         .and_then(|body| serde_json::from_slice(&body).ok())
     {
         Some(value) => value,
@@ -204,6 +212,49 @@ fn route_marker_matches(marker_path: &Path) -> Result<bool, String> {
             .and_then(Value::as_str)
             .is_some_and(|value| !value.is_empty())
         && marker.get("license").and_then(Value::as_str) == Some("MIT"))
+}
+
+fn read_regular_file_limited(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if !metadata.file_type().is_symlink()
+                && metadata.is_file()
+                && metadata.len() <= limit as u64 =>
+        {
+            metadata
+        }
+        Ok(_) => return Ok(None),
+        Err(_) => return Ok(None),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    let opened = match file.metadata() {
+        Ok(metadata) if metadata.is_file() && metadata.len() <= limit as u64 => metadata,
+        _ => return Ok(None),
+    };
+    if !opened.is_file() {
+        return Ok(None);
+    }
+    let mut body = Vec::new();
+    if Read::by_ref(&mut file)
+        .take((limit + 1) as u64)
+        .read_to_end(&mut body)
+        .is_err()
+        || body.len() > limit
+    {
+        return Ok(None);
+    }
+    Ok(Some(body))
 }
 
 fn migrate_legacy_route_body(target: &Path) -> Result<(), String> {
@@ -434,6 +485,27 @@ mod tests {
         fs::write(target.join("SKILL.md"), b"modified").unwrap();
         assert!(ensure_route_skill(&data).is_err());
         assert_eq!(fs::read(target.join("SKILL.md")).unwrap(), b"modified");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_oversized_route_body_and_marker_without_unbounded_reads() {
+        let (root, data) = test_data("oversized-route-files");
+        let target = write_managed_route(&data);
+        fs::write(
+            target.join("SKILL.md"),
+            vec![b'x'; MAX_ROUTE_SKILL_BODY_BYTES + 1],
+        )
+        .unwrap();
+        assert!(!inspect_route_skill(&data).unwrap());
+
+        fs::write(target.join("SKILL.md"), SKILL_BODY.as_bytes()).unwrap();
+        fs::write(
+            target.join(IMPORT_ORIGIN_FILE),
+            vec![b'x'; MAX_IMPORT_ORIGIN_BYTES + 1],
+        )
+        .unwrap();
+        assert!(!inspect_route_skill(&data).unwrap());
         fs::remove_dir_all(root).unwrap();
     }
 

@@ -67,7 +67,7 @@ export function formatCodexAuthCommandError(error) {
   }
   if (error.code === "codex_login_required") {
     if (["state_missing", "state_uncommitted"].includes(error.reason)) {
-      return "CSSwitch Codex 尚未登录；请在高级设置中登录。原生 Codex 登录不会被复用或修改。";
+      return "CSSwitch Codex 尚未登录；请在“设置 > Codex 账号与连接”中登录。原生 Codex 登录不会被复用或修改。";
     }
     const labels = {
       oauth_missing: "OAuth 记录缺失",

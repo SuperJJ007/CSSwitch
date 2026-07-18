@@ -7,6 +7,10 @@ use tauri::{Manager, Runtime};
 use crate::config;
 
 const OPERATION_LOG_MAX_BYTES: u64 = 1_048_576;
+#[cfg(all(not(test), feature = "acceptance-build"))]
+const ACCEPTANCE_OPEN_BIN_ENV: &str = "CSSWITCH_ACCEPTANCE_OPEN_BIN";
+#[cfg(test)]
+const TEST_OPEN_BIN_ENV: &str = "CSSWITCH_TEST_OPEN_BIN";
 
 /// Locate the CSSwitch repository root containing the Rust gateway and scripts.
 /// Prefer `CSSWITCH_REPO`; otherwise walk upwards from the executable path.
@@ -165,8 +169,45 @@ pub(crate) fn kill_child(slot: &mut Option<Child>) {
 }
 
 /// Open a URL with the system browser (macOS `open`) and verify exit status.
+fn select_browser_open_binary(override_bin: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
+    let Some(raw) = override_bin else {
+        return Ok(PathBuf::from("/usr/bin/open"));
+    };
+    let path = PathBuf::from(raw);
+    if !path.is_absolute() {
+        return Err("Acceptance 测试 opener 必须是绝对路径".into());
+    }
+    let meta = std::fs::symlink_metadata(&path)
+        .map_err(|_| "Acceptance 测试 opener 不可访问".to_string())?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return Err("Acceptance 测试 opener 必须是普通非符号链接文件".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 == 0 {
+            return Err("Acceptance 测试 opener 不可执行".into());
+        }
+    }
+    Ok(path)
+}
+
+fn browser_open_binary() -> Result<PathBuf, String> {
+    #[cfg(test)]
+    let override_bin = std::env::var_os(TEST_OPEN_BIN_ENV);
+    #[cfg(all(not(test), feature = "acceptance-build"))]
+    let override_bin = std::env::var_os(ACCEPTANCE_OPEN_BIN_ENV);
+    #[cfg(all(not(test), not(feature = "acceptance-build")))]
+    let override_bin = None;
+    select_browser_open_binary(override_bin)
+}
+
 pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
-    let st = Command::new("open")
+    // Formal and manually launched Acceptance builds default to the fixed
+    // system opener. Only an explicit test-only absolute executable override
+    // can divert an Acceptance/test run into a fake evidence recorder.
+    let open_bin = browser_open_binary()?;
+    let st = Command::new(&open_bin)
         .arg(url)
         .status()
         .map_err(|e| format!("打开浏览器失败：{e}"))?;
@@ -178,8 +219,19 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{operation_log_archive_path, redact, should_rotate_operation_log};
+    use super::{
+        operation_log_archive_path, redact, select_browser_open_binary, should_rotate_operation_log,
+    };
     use std::path::Path;
+
+    #[test]
+    fn browser_open_defaults_to_system_binary_and_rejects_relative_override() {
+        assert_eq!(
+            select_browser_open_binary(None).unwrap(),
+            Path::new("/usr/bin/open")
+        );
+        assert!(select_browser_open_binary(Some("open".into())).is_err());
+    }
 
     #[test]
     fn redact_replaces_nonempty_secret_only() {

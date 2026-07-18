@@ -1,15 +1,15 @@
 {
-  "productName": "CSSwitch Acceptance",
-  "identifier": "com.csswitch.acceptance",
+  "productName": "CSSwitch Test",
+  "identifier": "com.csswitch.test",
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "CSSwitch Acceptance",
-        "width": 420,
-        "height": 700,
-        "minWidth": 380,
-        "minHeight": 600,
+        "title": "CSSwitch Test",
+        "width": 920,
+        "height": 650.5,
+        "minWidth": 760,
+        "minHeight": 520,
         "resizable": true,
         "decorations": true,
         "transparent": false,

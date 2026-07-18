@@ -119,6 +119,7 @@ mod tests {
             &CodexNetworkSettings {
                 mode: CodexNetworkMode::Custom,
                 proxy_url: format!("{scheme}://127.0.0.1:{port}"),
+                ..Default::default()
             },
             &EnvironmentSnapshot::default(),
         )

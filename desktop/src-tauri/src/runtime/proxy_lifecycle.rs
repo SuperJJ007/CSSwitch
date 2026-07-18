@@ -8,7 +8,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 use tauri::{Manager, Runtime};
 
-use crate::runtime::legacy_proxy::{stop_legacy_csswitch_python_on_port, LegacyProxyCleanup};
+use crate::runtime::legacy_proxy::{
+    stop_legacy_csswitch_python_on_port, stop_managed_gateway_on_port, LegacyProxyCleanup,
+    ManagedGatewayCleanup,
+};
 use crate::runtime::operation::{self, OperationStage, OperationTrace, POLL_INTERVAL_MS};
 use crate::runtime::provider::{
     assert_format_supported, current_shim_mode_for_adapter, is_native_adapter, is_openai_adapter,
@@ -19,26 +22,166 @@ use crate::runtime::proxy::{health_timeout_reason, should_write_back, ProxyActio
 use crate::runtime::system::{asset_root, log_path, open_log, redact, repo_root, tail_file};
 use crate::{config, lifecycle, lock, proc, SharedAppState};
 
+fn static_gateway_catalog_fp(launch: &FormalGatewayPlan) -> Option<String> {
+    launch
+        .static_model_catalog
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|value| {
+            value
+                .get("catalog_fp")
+                .and_then(|fp| fp.as_str())
+                .map(str::to_string)
+        })
+}
+
+fn interrupted_health_matches(
+    health: &proc::GatewayHealth,
+    target_provider: &str,
+    target_shim: &str,
+    target_catalog_fp: Option<&str>,
+    previous: Option<&config::GatewayRuntimeJournalIdentity>,
+) -> bool {
+    let managed_identity = health.gateway == "rust"
+        && health.intent == "formal"
+        && (24..=128).contains(&health.launch_id.len())
+        && health
+            .launch_id
+            .chars()
+            .all(|value| value.is_ascii_hexdigit());
+    let target_matches = health.provider == target_provider
+        && health.shim == target_shim
+        && target_catalog_fp
+            .map(|expected| health.catalog_fp == expected)
+            .unwrap_or(health.catalog_fp.is_empty());
+    let previous_matches = previous.is_some_and(|expected| {
+        health.provider == expected.provider
+            && health.shim == expected.shim
+            && health.launch_id == expected.launch_id
+            && health.catalog_fp == expected.catalog_fp
+    });
+    managed_identity && (target_matches || previous_matches)
+}
+
+/// Consume an interrupted profile-switch journal after an app restart. An
+/// orphan is never adopted. It is stopped only when the persisted path secret
+/// authenticates a formal Rust Gateway, its public launch/catalog identity
+/// matches either the committed target or the journaled previous Gateway, and
+/// the listener executes this exact packaged sidecar. The normal one-click
+/// path then starts the committed config from a newly tracked child.
+pub(crate) fn recover_interrupted_gateway<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    state: &SharedAppState,
+) -> Result<(), String> {
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+    let Some(journal) = cfg.runtime_transaction.as_ref() else {
+        return Ok(());
+    };
+    {
+        let st = lock(state);
+        if st.proxy.is_some()
+            || !st.launch_id.is_empty()
+            || !st.provider.is_empty()
+            || !st.gateway_kind.is_empty()
+        {
+            // Same-process profile switching owns its Child and recovery.
+            return Ok(());
+        }
+    }
+    if !proc::loopback_port_in_use(cfg.proxy_port, operation::LOCAL_HEALTH_TIMEOUT_MS) {
+        return Ok(());
+    }
+    if cfg.secret.is_empty() {
+        return Err(
+            "检测到未完成的运行事务，但正式端口被占用且配置没有 path secret；已拒绝接管。".into(),
+        );
+    }
+    let active = cfg
+        .active_profile()
+        .ok_or("未完成的运行事务指向不存在的 active profile")?;
+    let formal = crate::runtime::provider::resolve_launch_plan(active)?.formal();
+    let target_shim = current_shim_mode_for_adapter(&formal.adapter);
+    let target_catalog_fp = static_gateway_catalog_fp(&formal);
+    let initial = proc::http_gateway_health(
+        cfg.proxy_port,
+        Some(&cfg.secret),
+        operation::LOCAL_HEALTH_TIMEOUT_MS,
+    )
+    .ok_or("检测到未完成的运行事务，但端口 listener 不接受已提交 path secret；已拒绝接管。")?;
+    if !interrupted_health_matches(
+        &initial,
+        &formal.adapter,
+        target_shim,
+        target_catalog_fp.as_deref(),
+        journal.previous_gateway.as_ref(),
+    ) || !proc::http_health_gateway(
+        cfg.proxy_port,
+        Some(&cfg.secret),
+        operation::LOCAL_HEALTH_TIMEOUT_MS,
+        "rust",
+        Some(&initial.provider),
+        Some(&initial.shim),
+        Some(&initial.launch_id),
+    ) {
+        return Err(
+            "未完成事务的端口 listener 与已提交/上一受管 Gateway 身份不一致；已拒绝结束未知进程。"
+                .into(),
+        );
+    }
+    let binary = gateway_bin_path(app).ok_or("未找到本次应用打包的 Gateway，无法安全恢复事务")?;
+    config::update(&dir, |current| {
+        if let Some(current_journal) = current.runtime_transaction.as_mut() {
+            if current_journal.transaction_id == journal.transaction_id {
+                current_journal.stage = "recover_interrupted_gateway".into();
+            }
+        }
+    })
+    .map_err(|error| error.to_string())?;
+    let initial_for_probe = initial.clone();
+    let cleanup = stop_managed_gateway_on_port(cfg.proxy_port, &binary, || {
+        let Some(current) = proc::http_gateway_health(
+            cfg.proxy_port,
+            Some(&cfg.secret),
+            operation::LOCAL_HEALTH_TIMEOUT_MS,
+        ) else {
+            return false;
+        };
+        current == initial_for_probe
+            && proc::http_health_gateway(
+                cfg.proxy_port,
+                Some(&cfg.secret),
+                operation::LOCAL_HEALTH_TIMEOUT_MS,
+                "rust",
+                Some(&initial_for_probe.provider),
+                Some(&initial_for_probe.shim),
+                Some(&initial_for_probe.launch_id),
+            )
+    });
+    match cleanup {
+        ManagedGatewayCleanup::Stopped(_) => Ok(()),
+        ManagedGatewayCleanup::NotManaged => Err(
+            "未完成事务的 listener 未通过精确 Gateway binary/uid/PID 复核；已拒绝结束进程。".into(),
+        ),
+        ManagedGatewayCleanup::StopFailed(_) => {
+            Err("已确认未完成事务遗留的受管 Gateway，但安全停止失败。".into())
+        }
+    }
+}
+
 fn formal_proxy_env(launch: &FormalGatewayPlan) -> Result<Vec<(String, String)>, String> {
-    let mut env = Vec::new();
+    let mut env = vec![("CSSWITCH_GATEWAY_INTENT".into(), "formal".into())];
     if let FormalCredential::ApiKey { env: key, value } = &launch.credential {
         env.push((key.clone(), value.clone()));
+    }
+    if let Some(catalog) = &launch.static_model_catalog {
+        env.push(("CSSWITCH_STATIC_MODEL_CATALOG_V1".into(), catalog.clone()));
     }
     if launch.endpoint_policy == crate::provider_contracts::EndpointPolicy::ProfileRequired {
         if is_openai_adapter(&launch.adapter) {
             env.push(("CSSWITCH_OPENAI_BASE_URL".into(), launch.endpoint.clone()));
-            if launch.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
-                && !launch.model.is_empty()
-            {
-                env.push(("CSSWITCH_OPENAI_MODEL".into(), launch.model.clone()));
-            }
         } else {
             env.push(("CSSWITCH_RELAY_BASE_URL".into(), launch.endpoint.clone()));
-            if launch.model_policy == crate::provider_contracts::ModelPolicy::RequiredFixed
-                && !launch.model.is_empty()
-            {
-                env.push(("CSSWITCH_RELAY_MODEL".into(), launch.model.clone()));
-            }
             if !launch.thinking_policy.is_empty() {
                 env.push((
                     "CSSWITCH_RELAY_THINKING".into(),
@@ -74,6 +217,21 @@ pub(crate) fn configure_managed_proxy_command(
     cmd.env_remove("CSSWITCH_PROVIDER_CONTRACT_ID")
         .env_remove("CSSWITCH_PROVIDER_CONTRACT_DIGEST")
         .env_remove(csswitch_codex_network::ROUTE_ENV);
+    for inherited in [
+        "CSSWITCH_STATIC_MODEL_CATALOG_V1",
+        "CSSWITCH_GATEWAY_INTENT",
+        "DEEPSEEK_API_KEY",
+        "DASHSCOPE_API_KEY",
+        "CSSWITCH_OPENAI_KEY",
+        "CSSWITCH_RELAY_KEY",
+        "CSSWITCH_OPENAI_BASE_URL",
+        "CSSWITCH_RELAY_BASE_URL",
+        "CSSWITCH_OPENAI_MODEL",
+        "CSSWITCH_RELAY_MODEL",
+        "CSSWITCH_RELAY_THINKING",
+    ] {
+        cmd.env_remove(inherited);
+    }
     if let Some(identity) = crate::provider_contracts::gateway_contract_identity(provider)? {
         cmd.env("CSSWITCH_PROVIDER_CONTRACT_ID", identity.contract_id)
             .env("CSSWITCH_PROVIDER_CONTRACT_DIGEST", identity.catalog_digest);
@@ -443,6 +601,16 @@ pub(crate) fn start_proxy_for<R: Runtime>(
         proxy_fingerprint_with_runtime(profile, &launch, gateway_kind, shim_mode),
         science_context.as_ref(),
     );
+    let expected_catalog_fp = launch
+        .static_model_catalog
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|value| {
+            value
+                .get("catalog_fp")
+                .and_then(|fp| fp.as_str())
+                .map(str::to_string)
+        });
 
     let secret = if !cfg.secret.is_empty() {
         cfg.secret.clone()
@@ -473,6 +641,18 @@ pub(crate) fn start_proxy_for<R: Runtime>(
                 Some(st.shim_mode.as_str()),
                 Some(st.launch_id.as_str()),
             )
+            && proc::http_gateway_health(
+                port,
+                Some(&st.secret),
+                operation::PROXY_REUSE_HEALTH_TIMEOUT_MS,
+            )
+            .is_some_and(|health| {
+                health.intent == "formal"
+                    && expected_catalog_fp
+                        .as_deref()
+                        .map(|expected| health.catalog_fp == expected)
+                        .unwrap_or(health.catalog_fp.is_empty())
+            })
         {
             if let Some(t) = trace {
                 t.stage(
@@ -594,7 +774,15 @@ pub(crate) fn start_proxy_for<R: Runtime>(
             Some(&launch.adapter),
             Some(shim_mode),
             Some(&launch_id),
-        ) {
+        ) && proc::http_gateway_health(port, Some(&secret), operation::LOCAL_HEALTH_TIMEOUT_MS)
+            .is_some_and(|health| {
+                health.intent == "formal"
+                    && expected_catalog_fp
+                        .as_deref()
+                        .map(|expected| health.catalog_fp == expected)
+                        .unwrap_or(health.catalog_fp.is_empty())
+            })
+        {
             ok = true;
             break;
         }
@@ -660,7 +848,7 @@ pub(crate) fn start_proxy_for<R: Runtime>(
 mod tests {
     use super::{
         configure_managed_proxy_command, find_gateway_in, formal_proxy_env, gateway_bin_path_from,
-        skill_install_bridge_token,
+        interrupted_health_matches, skill_install_bridge_token,
     };
     use crate::provider_contracts::{
         CachePolicy, EndpointPolicy, ModelPolicy, TimeoutPolicy, Transport,
@@ -669,6 +857,59 @@ mod tests {
     use std::fs;
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn health(provider: &str, launch_id: &str, catalog_fp: &str) -> crate::proc::GatewayHealth {
+        crate::proc::GatewayHealth {
+            gateway: "rust".into(),
+            provider: provider.into(),
+            shim: "off".into(),
+            launch_id: launch_id.into(),
+            provider_contract_id: String::new(),
+            provider_contract_digest: String::new(),
+            catalog_fp: catalog_fp.into(),
+            intent: "formal".into(),
+        }
+    }
+
+    #[test]
+    fn interrupted_gateway_accepts_only_committed_target_or_exact_previous_identity() {
+        let target = health("qwen", "0123456789abcdef0123456789abcdef", "target-catalog");
+        assert!(interrupted_health_matches(
+            &target,
+            "qwen",
+            "off",
+            Some("target-catalog"),
+            None,
+        ));
+
+        let previous_identity = crate::config::GatewayRuntimeJournalIdentity {
+            provider: "deepseek".into(),
+            shim: "off".into(),
+            launch_id: "abcdef0123456789abcdef0123456789".into(),
+            catalog_fp: "previous-catalog".into(),
+        };
+        let previous = health(
+            "deepseek",
+            "abcdef0123456789abcdef0123456789",
+            "previous-catalog",
+        );
+        assert!(interrupted_health_matches(
+            &previous,
+            "qwen",
+            "off",
+            Some("target-catalog"),
+            Some(&previous_identity),
+        ));
+
+        let spoof = health("deepseek", "not-a-managed-launch-id", "previous-catalog");
+        assert!(!interrupted_health_matches(
+            &spoof,
+            "qwen",
+            "off",
+            Some("target-catalog"),
+            Some(&previous_identity),
+        ));
+    }
 
     fn launch(adapter: &str, model: &str) -> FormalGatewayPlan {
         launch_with_thinking(adapter, model, "")
@@ -683,6 +924,9 @@ mod tests {
             adapter: adapter.to_string(),
             endpoint: "https://upstream.example/api".to_string(),
             model: model.to_string(),
+            static_model_catalog: Some(format!(
+                "{{\"schema_version\":1,\"default_selector_id\":\"selector-test\",\"routes\":[{{\"selector_id\":\"selector-test\",\"display_name\":\"{model}\",\"upstream_model\":\"{model}\",\"supports_tools\":true}}],\"role_bindings\":{{\"sonnet\":\"selector-test\",\"opus\":\"selector-test\",\"haiku\":\"selector-test\",\"fable\":\"selector-test\"}}}}"
+            )),
             credential: FormalCredential::ApiKey {
                 env: if matches!(adapter, "openai-custom" | "openai-responses") {
                     "CSSWITCH_OPENAI_KEY".into()
@@ -691,7 +935,7 @@ mod tests {
                 },
                 value: "test-key".into(),
             },
-            model_policy: ModelPolicy::RequiredFixed,
+            model_policy: ModelPolicy::SavedCatalog,
             transport: if adapter == "openai-custom" {
                 Transport::OpenaiChat
             } else {
@@ -713,13 +957,16 @@ mod tests {
     }
 
     #[test]
-    fn formal_proxy_env_pins_relay_model_only_on_formal_launch() {
+    fn formal_proxy_env_injects_relay_catalog_without_legacy_model_override() {
         let env = formal_proxy_env(&launch("relay", "glm-5.2")).unwrap();
         assert!(env.contains(&(
             "CSSWITCH_RELAY_BASE_URL".to_string(),
             "https://upstream.example/api".to_string()
         )));
-        assert!(env.contains(&("CSSWITCH_RELAY_MODEL".to_string(), "glm-5.2".to_string())));
+        assert!(env.iter().any(|(key, value)| {
+            key == "CSSWITCH_STATIC_MODEL_CATALOG_V1" && value.contains("glm-5.2")
+        }));
+        assert!(!env.iter().any(|(key, _)| key == "CSSWITCH_RELAY_MODEL"));
     }
 
     #[test]
@@ -816,13 +1063,16 @@ mod tests {
     }
 
     #[test]
-    fn formal_proxy_env_pins_openai_model_only_on_formal_launch() {
+    fn formal_proxy_env_injects_openai_catalog_without_legacy_model_override() {
         let env = formal_proxy_env(&launch("openai-custom", "gpt-5.2")).unwrap();
         assert!(env.contains(&(
             "CSSWITCH_OPENAI_BASE_URL".to_string(),
             "https://upstream.example/api".to_string()
         )));
-        assert!(env.contains(&("CSSWITCH_OPENAI_MODEL".to_string(), "gpt-5.2".to_string())));
+        assert!(env.iter().any(|(key, value)| {
+            key == "CSSWITCH_STATIC_MODEL_CATALOG_V1" && value.contains("gpt-5.2")
+        }));
+        assert!(!env.iter().any(|(key, _)| key == "CSSWITCH_OPENAI_MODEL"));
     }
 
     #[test]
@@ -833,12 +1083,12 @@ mod tests {
             value: "test-key".into(),
         };
         native.endpoint_policy = EndpointPolicy::GatewayManagedOfficial;
-        native.model_policy = ModelPolicy::OptionalFixed;
+        native.model_policy = ModelPolicy::SavedCatalog;
         let env = formal_proxy_env(&native).unwrap();
-        assert_eq!(
-            env,
-            vec![("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())]
-        );
+        assert!(env.contains(&("DEEPSEEK_API_KEY".to_string(), "test-key".to_string())));
+        assert!(env
+            .iter()
+            .any(|(key, _)| key == "CSSWITCH_STATIC_MODEL_CATALOG_V1"));
     }
 
     #[test]
@@ -858,11 +1108,13 @@ mod tests {
     #[test]
     fn formal_proxy_env_injects_only_a_validated_codex_route() {
         let mut codex = launch("codex", "");
+        codex.static_model_catalog = None;
         codex.codex_network_route = Some(
             csswitch_codex_network::resolve(
                 &csswitch_codex_network::CodexNetworkSettings {
                     mode: csswitch_codex_network::CodexNetworkMode::Custom,
                     proxy_url: "socks5h://127.0.0.1:7890".into(),
+                    ..Default::default()
                 },
                 &csswitch_codex_network::EnvironmentSnapshot::default(),
             )
