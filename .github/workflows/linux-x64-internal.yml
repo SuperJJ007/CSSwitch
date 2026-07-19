@@ -10,12 +10,14 @@ on:
       - "desktop/**"
       - "scripts/**"
       - "test/**"
+      - "docs/operations/linux-x64-beta-testing.md"
   pull_request:
     paths:
       - ".github/workflows/linux-x64-internal.yml"
       - "desktop/**"
       - "scripts/**"
       - "test/**"
+      - "docs/operations/linux-x64-beta-testing.md"
 
 permissions:
   contents: read
@@ -99,7 +101,7 @@ jobs:
             exit 1
           }
           case "$package_version" in
-            0.9.0-beta.1|0.9.0~beta.1) ;;
+            0.8.0-linux-beta.1|0.8.0~linux-beta.1) ;;
             *) echo "unexpected deb version: $package_version" >&2; exit 1 ;;
           esac
           grep -Eq '(^|, )bubblewrap \(>= 0\.8(\.0)?\)($|, )' <<< "$depends" || {
@@ -141,6 +143,9 @@ jobs:
           deb_name="$(basename "$deb")"
           (cd "$deb_dir" && sha256sum "$deb_name" > "$deb_name.sha256")
           (cd "$deb_dir" && sha256sum -c "$deb_name.sha256")
+          deb_sha256="$(awk 'NR == 1 {print $1}' "$deb_dir/$deb_name.sha256")"
+          [[ "$deb_sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'deb sha256: %s\n' "$deb_sha256"
           sudo apt-get install -y "$deb"
           installed_bin="/usr/bin/$desktop_name"
           installed_gateway="${gateway_bin#$extract}"
@@ -154,6 +159,9 @@ jobs:
           summary="$RUNNER_TEMP/csswitch-linux-x64-test-summary.txt"
           {
             echo "source_sha=$GITHUB_SHA"
+            echo "channel=080-linux-beta"
+            echo "package_version=$package_version"
+            echo "deb_sha256=$deb_sha256"
             echo "runner=ubuntu-24.04"
             echo "architecture=amd64"
             echo "release_ready_gate=pass"
@@ -165,17 +173,29 @@ jobs:
             echo "live_codex_oauth=not_run"
           } > "$summary"
 
-          echo "deb=$deb" >> "$GITHUB_OUTPUT"
-          echo "sha=$deb_dir/$deb_name.sha256" >> "$GITHUB_OUTPUT"
-          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+          {
+            echo "### CSSwitch 080 Linux Beta"
+            echo
+            echo "- Source SHA: \`$GITHUB_SHA\`"
+            echo "- Debian version: \`$package_version\`"
+            echo "- .deb SHA-256: \`$deb_sha256\`"
+            echo "- Scope: limited community test artifact; real desktop, Science, and live OAuth are not established by this job."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          artifact_dir="$RUNNER_TEMP/csswitch-080-linux-beta"
+          install -d -m 0700 "$artifact_dir"
+          install -m 0644 "$deb" "$artifact_dir/$deb_name"
+          install -m 0644 "$deb_dir/$deb_name.sha256" "$artifact_dir/$deb_name.sha256"
+          install -m 0644 "$summary" "$artifact_dir/test-summary.txt"
+          install -m 0644 docs/operations/linux-x64-beta-testing.md "$artifact_dir/README-TESTING.md"
+          test "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l)" -eq 4
+
+          echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
 
       - name: Upload internal package
         uses: actions/upload-artifact@v4
         with:
-          name: csswitch-v0.9.0-beta.1-ubuntu-24.04-amd64
+          name: csswitch-080-linux-beta-ubuntu-24.04-amd64
           retention-days: 14
           if-no-files-found: error
-          path: |
-            ${{ steps.package.outputs.deb }}
-            ${{ steps.package.outputs.sha }}
-            ${{ steps.package.outputs.summary }}
+          path: ${{ steps.package.outputs.artifact_dir }}

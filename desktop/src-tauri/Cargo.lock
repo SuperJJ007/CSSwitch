@@ -818,7 +818,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.9.0-beta.1"
+version = "0.8.0-linux-beta.1"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
