@@ -3,20 +3,14 @@ use std::process::Command;
 use std::thread;
 use std::time::Duration;
 
+use super::platform;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ListenerProcess {
     pid: u32,
     command_name: String,
     uid: u32,
     command: String,
-}
-
-fn system_tool<'a>(absolute: &'a str, fallback: &'a str) -> &'a str {
-    if std::path::Path::new(absolute).is_file() {
-        absolute
-    } else {
-        fallback
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,7 +49,7 @@ fn parse_lsof_records(output: &str) -> Vec<(u32, String)> {
 
 fn listener_records(port: u16) -> Vec<(u32, String)> {
     let filter = format!("-iTCP:{port}");
-    let output = match Command::new(system_tool("/usr/sbin/lsof", "lsof"))
+    let output = match Command::new(platform::lsof_bin())
         .args(["-nP", "-a", &filter, "-sTCP:LISTEN", "-Fpc"])
         .output()
     {
@@ -74,7 +68,7 @@ fn parse_ps_record(output: &str) -> Option<(u32, String)> {
 }
 
 fn process_snapshot(pid: u32, command_name: String) -> Option<ListenerProcess> {
-    let output = Command::new(system_tool("/bin/ps", "ps"))
+    let output = Command::new(platform::ps_bin())
         .args([
             "-ww",
             "-p",
@@ -99,10 +93,7 @@ fn process_snapshot(pid: u32, command_name: String) -> Option<ListenerProcess> {
 }
 
 fn current_uid() -> Option<u32> {
-    let output = Command::new(system_tool("/usr/bin/id", "id"))
-        .arg("-u")
-        .output()
-        .ok()?;
+    let output = Command::new(platform::id_bin()).arg("-u").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -113,7 +104,7 @@ fn current_uid() -> Option<u32> {
 }
 
 fn process_text_files(pid: u32) -> Vec<std::path::PathBuf> {
-    let output = match Command::new(system_tool("/usr/sbin/lsof", "lsof"))
+    let output = match Command::new(platform::lsof_bin())
         .args(["-nP", "-a", "-p", &pid.to_string(), "-d", "txt", "-Fn"])
         .output()
     {
@@ -186,7 +177,7 @@ pub(crate) fn stop_legacy_csswitch_python_on_port(
     let Some(process) = exact_legacy_listener(port, expected_script) else {
         return LegacyProxyCleanup::NotLegacy;
     };
-    let status = Command::new(system_tool("/bin/kill", "kill"))
+    let status = Command::new(platform::kill_bin())
         .args(["-TERM", &process.pid.to_string()])
         .status();
     if !matches!(status, Ok(status) if status.success()) {
@@ -244,7 +235,7 @@ where
     {
         return ManagedGatewayCleanup::NotManaged;
     }
-    let status = Command::new(system_tool("/bin/kill", "kill"))
+    let status = Command::new(platform::kill_bin())
         .args(["-TERM", &pid.to_string()])
         .status();
     if !matches!(status, Ok(status) if status.success()) {

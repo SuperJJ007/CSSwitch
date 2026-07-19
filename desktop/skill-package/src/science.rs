@@ -14,7 +14,10 @@ use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::{active_org, ScienceExecutableFingerprint, ScienceHostContext, AGENT_NAME};
+use crate::{
+    active_org, configure_science_command_environment, ScienceExecutableFingerprint,
+    ScienceHostContext, AGENT_NAME,
+};
 
 #[cfg(not(test))]
 const PROCESS_TIMEOUT: Duration = Duration::from_secs(10);
@@ -396,7 +399,18 @@ fn require_active_org(
 }
 
 fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError> {
-    let temp = context.home.join(".csswitch-skill-tmp");
+    fresh_control_url_for_platform(context, cfg!(target_os = "linux"))
+}
+
+fn fresh_control_url_for_platform(
+    context: &ScienceHostContext,
+    strict_linux: bool,
+) -> Result<String, AttachError> {
+    let temp = if strict_linux {
+        context.home.join(".tmp")
+    } else {
+        context.home.join(".csswitch-skill-tmp")
+    };
     match fs::symlink_metadata(&temp) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
             return Err(AttachError::new(
@@ -434,12 +448,13 @@ fn fresh_control_url(context: &ScienceHostContext) -> Result<String, AttachError
             })?;
     }
     let mut command = Command::new(&context.binary);
+    command.env_clear();
+    configure_science_command_environment(&mut command, &context.home, strict_linux)
+        .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "构造 Science 隔离环境失败"))?;
     command
         .arg("url")
         .arg("--data-dir")
         .arg(&context.data_dir)
-        .env_clear()
-        .env("HOME", &context.home)
         .env("TMPDIR", &temp)
         .env("LC_ALL", "C")
         .stdin(Stdio::null())
@@ -803,7 +818,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        let root = crate::test_temp_root().join(format!(
             "csswitch-science-control-{label}-{}-{suffix}",
             std::process::id()
         ));
@@ -924,25 +939,32 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
 
     #[test]
     fn fresh_url_rejects_symlink_temp_without_changing_target_permissions() {
-        let context = context_with_script(
-            "symlink-temp",
-            "printf '%s\n' 'http://127.0.0.1:18998/?nonce=one'",
-            18_998,
-        );
-        let target = context.home.join("permission-target");
-        fs::create_dir(&target).unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
-        symlink(&target, context.home.join(".csswitch-skill-tmp")).unwrap();
+        for (label, strict_linux, relative_temp) in [
+            ("symlink-temp-macos", false, ".csswitch-skill-tmp"),
+            ("symlink-temp-linux", true, ".tmp"),
+        ] {
+            let context = context_with_script(
+                label,
+                "printf '%s\n' 'http://127.0.0.1:18998/?nonce=one'",
+                18_998,
+            );
+            let target = context.home.join("permission-target");
+            fs::create_dir(&target).unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+            symlink(&target, context.home.join(relative_temp)).unwrap();
 
-        assert_eq!(
-            fresh_control_url(&context).unwrap_err().code,
-            "SCIENCE_CONTROL_FAILED"
-        );
-        assert_eq!(
-            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+            assert_eq!(
+                fresh_control_url_for_platform(&context, strict_linux)
+                    .unwrap_err()
+                    .code,
+                "SCIENCE_CONTROL_FAILED"
+            );
+            assert_eq!(
+                fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+        }
     }
 
     #[test]

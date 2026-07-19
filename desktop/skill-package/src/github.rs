@@ -1474,7 +1474,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let data = std::path::PathBuf::from("/private/tmp").join(format!(
+        let data = crate::test_temp_root().join(format!(
             "csswitch-github-mock-{label}-{}-{suffix}/home/.claude-science",
             std::process::id()
         ));

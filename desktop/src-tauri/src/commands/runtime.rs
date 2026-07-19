@@ -18,8 +18,9 @@ use crate::runtime::provider::{
 };
 use crate::runtime::proxy_lifecycle::ensure_proxy;
 use crate::runtime::science::{
-    sandbox_listener_matches_runtime, sandbox_url, science_runtime_preflight as runtime_preflight,
-    settings_change_needs_teardown, stop_sandbox, SCIENCE_DOWNLOAD_URL,
+    sandbox_listener_matches_runtime, sandbox_url, sandbox_url_display,
+    science_runtime_preflight as runtime_preflight, settings_change_needs_teardown, stop_sandbox,
+    SCIENCE_DOWNLOAD_URL,
 };
 use crate::runtime::settings::{system_ssh_config_path, validate_runtime_ports};
 use crate::runtime::system::open_in_browser;
@@ -82,6 +83,16 @@ fn status_upstream_applicable(adapter: &str) -> bool {
     !adapter.is_empty() && adapter != "codex"
 }
 
+fn validate_mode_for_platform(mode: &str, official_supported: bool) -> Result<(), String> {
+    if mode != "proxy" && mode != "official" {
+        return Err(format!("未知模式：{mode}（只支持 proxy / official）。"));
+    }
+    if mode == "official" && !official_supported {
+        return Err("official_mode_unsupported：Linux beta 不托管真实官方 Claude Science。".into());
+    }
+    Ok(())
+}
+
 pub(crate) fn stop_sandbox_state<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
     st: &mut AppState,
@@ -114,9 +125,7 @@ fn set_mode_inner(
     lifecycle: SharedLifecycle,
     mode: String,
 ) -> Result<(), String> {
-    if mode != "proxy" && mode != "official" {
-        return Err(format!("未知模式：{mode}（只支持 proxy / official）。"));
-    }
+    validate_mode_for_platform(&mode, crate::runtime::platform::official_mode_supported())?;
     // 经串行器（修 P1-b）：切官方的「拆链路 + 落盘」必须与「一键开始」等互斥，否则一键起到一半时
     // 切官方会先停链路、一键随后又把沙箱/OAuth 起起来 → 显示官方却有第三方沙箱在跑。bump_generation
     // 作废任何在途启动，防被停后又拿旧配置写回运行态。
@@ -142,8 +151,11 @@ fn set_mode_inner(
 /// 官方模式：干净地打开用户【真实】的 Claude Science（不碰/复制真实凭证，抹掉 ANTHROPIC_*）。
 #[tauri::command]
 pub(crate) fn open_official() -> Result<(), String> {
+    if !crate::runtime::platform::official_mode_supported() {
+        return Err("official_mode_unsupported：Linux beta 不托管真实官方 Claude Science。".into());
+    }
     let app_path = "/Applications/Claude Science.app";
-    let mut cmd = Command::new("open");
+    let mut cmd = Command::new(crate::runtime::platform::browser_open_bin());
     if Path::new(app_path).is_dir() {
         cmd.arg(app_path);
     } else {
@@ -602,17 +614,21 @@ pub(crate) fn boot_error(state: State<'_, SharedAppState>) -> Option<String> {
     lock(state.inner()).boot_error.clone()
 }
 
-fn manual_open_result(url: String, result: Result<(), String>) -> serde_json::Value {
+fn manual_open_result(port: u16, result: Result<(), String>) -> serde_json::Value {
     match result {
         Ok(()) => json!({
             "status": "ok",
             "message": "已向默认浏览器发出打开 Science 的请求。",
             "fallback_url": null,
+            "fallback_url_display": null,
+            "retryable": false,
         }),
-        Err(error) => json!({
+        Err(_error) => json!({
             "status": "error",
-            "message": format!("打开浏览器失败：{error}"),
-            "fallback_url": url,
+            "message": "打开浏览器失败；请修复默认浏览器后再次尝试。",
+            "fallback_url": null,
+            "fallback_url_display": sandbox_url_display(port),
+            "retryable": true,
         }),
     }
 }
@@ -631,9 +647,9 @@ fn open_url_inner(state: &SharedAppState) -> Result<serde_json::Value, String> {
     }
     // Science 的控制地址可能是短期、一次性的。每次手动打开都重新获取，
     // 不复用 one-click 已消费的内存 URL。成功时不返回 URL；只有系统
-    // opener 失败时才把同一次新 URL 交给 UI，供用户复制或再次打开。
-    let url = sandbox_url(sandbox_port, &runtime);
-    Ok(manual_open_result(url.clone(), open_in_browser(&url)))
+    // opener 失败时只返回脱敏 origin；exact nonce URL 永不进入前端。
+    let url = sandbox_url(sandbox_port, &runtime)?;
+    Ok(manual_open_result(sandbox_port, open_in_browser(&url)))
 }
 
 #[tauri::command]
@@ -665,6 +681,7 @@ mod tests {
     use super::{
         config_last_error_json, manual_open_result, science_failure_stage,
         status_response_for_config_error, status_runtime_identity, status_upstream_applicable,
+        validate_mode_for_platform,
     };
     use crate::{
         config::{self, Config, Profile},
@@ -695,6 +712,16 @@ mod tests {
             err.get("message").and_then(|v| v.as_str()),
             Some("bad config")
         );
+    }
+
+    #[test]
+    fn linux_contract_rejects_official_mode_even_if_the_ui_is_bypassed() {
+        assert!(validate_mode_for_platform("proxy", false).is_ok());
+        assert!(validate_mode_for_platform("official", false)
+            .unwrap_err()
+            .contains("official_mode_unsupported"));
+        assert!(validate_mode_for_platform("official", true).is_ok());
+        assert!(validate_mode_for_platform("unknown", true).is_err());
     }
 
     #[test]
@@ -748,19 +775,23 @@ mod tests {
     }
 
     #[test]
-    fn manual_browser_failure_returns_the_same_fresh_url_for_copy_and_retry() {
-        let url = "http://127.0.0.1:8990/?nonce=fresh".to_string();
-        let failed = manual_open_result(url.clone(), Err("opener rejected".into()));
+    fn manual_browser_failure_returns_only_a_redacted_retryable_origin() {
+        let failed = manual_open_result(8990, Err("opener rejected nonce=fresh".into()));
         assert_eq!(failed["status"], "error");
-        assert_eq!(failed["fallback_url"], url);
+        assert!(failed["fallback_url"].is_null());
+        assert_eq!(failed["fallback_url_display"], "http://127.0.0.1:8990/…");
+        assert_eq!(failed["retryable"], true);
+        assert!(!failed.to_string().contains("nonce=fresh"));
         assert!(failed["message"]
             .as_str()
             .unwrap()
             .contains("打开浏览器失败"));
 
-        let opened = manual_open_result(url, Ok(()));
+        let opened = manual_open_result(8990, Ok(()));
         assert_eq!(opened["status"], "ok");
         assert!(opened["fallback_url"].is_null());
+        assert!(opened["fallback_url_display"].is_null());
+        assert_eq!(opened["retryable"], false);
     }
 
     struct EnvGuard {
@@ -1163,10 +1194,13 @@ esac
         let failed_open = super::open_url_inner(&state)
             .expect("manual opener failure should be a structured UI result");
         assert_eq!(failed_open["status"], "error");
-        assert!(failed_open["fallback_url"]
-            .as_str()
-            .unwrap()
-            .ends_with("/?nonce=6"));
+        assert!(failed_open["fallback_url"].is_null());
+        assert_eq!(
+            failed_open["fallback_url_display"],
+            "http://127.0.0.1:8990/…"
+        );
+        assert_eq!(failed_open["retryable"], true);
+        assert!(!failed_open.to_string().contains("nonce=6"));
         let retried_open = super::open_url_inner(&state)
             .expect("retry should fetch and submit another fresh Science URL");
         assert_eq!(retried_open["status"], "ok");

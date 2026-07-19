@@ -959,6 +959,7 @@ fn spawn_codex_auth_sidecar_at(
         .arg(action.as_str())
         .env_clear()
         .env("HOME", home)
+        .env("PATH", "/usr/local/bin:/usr/bin:/bin")
         .stdin(if action.is_login() {
             Stdio::piped()
         } else {
@@ -966,6 +967,16 @@ fn spawn_codex_auth_sidecar_at(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    for key in [
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     if action.is_login() {
         let operation_id = operation_id
             .filter(|value| is_lower_hex(value, 32))

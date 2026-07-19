@@ -412,7 +412,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = PathBuf::from("/private/tmp").join(format!(
+        let root = crate::test_temp_root().join(format!(
             "csswitch-route-{label}-{}-{suffix}",
             std::process::id()
         ));

@@ -1,9 +1,21 @@
-#!/bin/zsh
+#!/bin/bash
 set -eu
 
 config="${CSSWITCH_SYSTEM_SSH_CONFIG:-}"
 if [[ -z "$config" || "$config" != /* ]]; then
   echo "CSSwitch SSH bridge 缺少有效的系统 SSH config 授权" >&2
+  exit 126
+fi
+probe="$config"
+while [[ "$probe" != "/" ]]; do
+  if [[ -L "$probe" ]]; then
+    echo "CSSwitch SSH bridge 拒绝含符号链接的系统 SSH config" >&2
+    exit 126
+  fi
+  probe="$(dirname "$probe")"
+done
+if [[ ! -f "$config" ]]; then
+  echo "CSSwitch SSH bridge 缺少安全的系统 SSH config" >&2
   exit 126
 fi
 

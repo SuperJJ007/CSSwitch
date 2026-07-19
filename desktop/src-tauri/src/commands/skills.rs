@@ -861,8 +861,10 @@ fn reveal_in_finder(path: &Path) -> SkillResult<()> {
 }
 
 fn reveal_command(path: &Path) -> Command {
-    let mut command = Command::new("/usr/bin/open");
-    command.arg("-R").arg(path);
+    let mut command = Command::new(crate::runtime::platform::browser_open_bin());
+    #[cfg(target_os = "macos")]
+    command.arg("-R");
+    command.arg(path);
     command
 }
 
@@ -916,8 +918,8 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let path = PathBuf::from(format!(
-                "/private/tmp/csswitch-skill-command-{label}-{}-{}",
+            let path = crate::test_temp_root().join(format!(
+                "csswitch-skill-command-{label}-{}-{}",
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));
@@ -1237,10 +1239,19 @@ mod tests {
     fn reveal_command_uses_fixed_system_binary_and_exact_arguments() {
         let path = Path::new("/owned/payload");
         let command = reveal_command(path);
-        assert_eq!(command.get_program(), "/usr/bin/open");
+        assert_eq!(
+            command.get_program(),
+            crate::runtime::platform::browser_open_bin()
+        );
+        #[cfg(target_os = "macos")]
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             vec![std::ffi::OsStr::new("-R"), path.as_os_str()]
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![path.as_os_str()]
         );
     }
 

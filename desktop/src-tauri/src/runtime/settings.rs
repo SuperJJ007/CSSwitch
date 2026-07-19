@@ -5,7 +5,24 @@ fn system_ssh_config_path_for_home(home: &Path) -> Result<PathBuf, String> {
         return Err("无法确认系统 HOME，不能启用系统 SSH 配置。".into());
     }
     let config = home.join(".ssh").join("config");
-    if !config.is_file() {
+    let mut current = PathBuf::new();
+    for component in config.components() {
+        current.push(component.as_os_str());
+        match current.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("系统 ~/.ssh/config 路径包含符号链接，不能启用系统 SSH 配置。".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err("未找到系统 ~/.ssh/config，不能启用系统 SSH 配置。".into());
+            }
+            Err(_) => return Err("无法安全检查系统 ~/.ssh/config。".into()),
+        }
+    }
+    let metadata = config
+        .symlink_metadata()
+        .map_err(|_| "无法安全检查系统 ~/.ssh/config。".to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err("未找到系统 ~/.ssh/config，不能启用系统 SSH 配置。".into());
     }
     Ok(config)
@@ -64,7 +81,10 @@ mod tests {
     #[test]
     fn system_ssh_config_requires_an_absolute_home_and_regular_target() {
         assert!(system_ssh_config_path_for_home(std::path::Path::new("relative-home")).is_err());
-        let home = std::env::temp_dir().join(format!(
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let home = base.join(format!(
             "csswitch-system-ssh-config-test-{}",
             std::process::id()
         ));
@@ -77,5 +97,34 @@ mod tests {
             home.join(".ssh/config")
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_ssh_config_rejects_leaf_and_parent_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let root = base.join(format!(
+            "csswitch-system-ssh-symlink-test-{}",
+            std::process::id()
+        ));
+        let real_home = root.join("real-home");
+        std::fs::create_dir_all(real_home.join(".ssh")).unwrap();
+        std::fs::write(real_home.join(".ssh/config"), "Host test\n").unwrap();
+
+        let leaf_home = root.join("leaf-home");
+        std::fs::create_dir_all(leaf_home.join(".ssh")).unwrap();
+        symlink(real_home.join(".ssh/config"), leaf_home.join(".ssh/config")).unwrap();
+        assert!(system_ssh_config_path_for_home(&leaf_home).is_err());
+
+        let parent_home = root.join("parent-home");
+        std::fs::create_dir_all(&parent_home).unwrap();
+        symlink(real_home.join(".ssh"), parent_home.join(".ssh")).unwrap();
+        assert!(system_ssh_config_path_for_home(&parent_home).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

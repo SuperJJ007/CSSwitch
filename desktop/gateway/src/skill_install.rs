@@ -1460,7 +1460,7 @@ mod tests {
     }
 
     fn temp_dir(label: &str) -> PathBuf {
-        let path = PathBuf::from("/private/tmp").join(format!(
+        let path = crate::test_temp_root().join(format!(
             "csswitch-{label}-{}-{}",
             std::process::id(),
             unique_suffix()
@@ -1551,7 +1551,7 @@ mod tests {
                 "nature-reader".into(),
                 "nature-writing".into(),
             ],
-            manifest_path: PathBuf::from("/private/tmp/bundle.json"),
+            manifest_path: crate::test_temp_root().join("bundle.json"),
         };
         let result = bundle_uninstall_confirmation(&bundle, "nature-reader", false);
         assert_eq!(result["status"], "BUNDLE_UNINSTALL_CONFIRMATION_REQUIRED");

@@ -330,7 +330,7 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let path = PathBuf::from("/private/tmp").join(format!(
+            let path = crate::test_temp_root().join(format!(
                 "csswitch-external-{label}-{}-{}",
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)

@@ -432,7 +432,7 @@ mod tests {
         fn new() -> Self {
             loop {
                 let unique = NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed);
-                let path = PathBuf::from("/private/tmp").join(format!(
+                let path = crate::test_temp_root().join(format!(
                     "csswitch-skill-listing-{}-{unique}",
                     std::process::id()
                 ));

@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/bin/bash
 # 启动 CSSwitch 管理的隔离运行环境。
 # Safety boundaries:
 #   - 独立 HOME + 独立 data-dir + 独立端口，绝不修改/删除真实 ~/.claude-science，绝不用端口 8765
@@ -14,12 +14,27 @@
 set -euo pipefail
 umask 077
 
-PROJ="${0:A:h:h}"
+PROJ="$(cd "$(dirname "$0")/.." && pwd -P)"
 SANDBOX_HOME="${SANDBOX_HOME:-$PROJ/.sandbox/home}"
 DATA_DIR="$SANDBOX_HOME/.claude-science"   # = auth_dir（Science 按 HOME 推导）
 REAL_HOME="$HOME"
 REAL_DATA_DIR="$REAL_HOME/.claude-science"
-APP_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+case "$(uname -s)" in
+  Darwin)
+    PLATFORM="macos"
+    APP_BIN="/Applications/Claude Science.app/Contents/Resources/bin/claude-science"
+    LSOF_BIN="/usr/sbin/lsof"
+    ;;
+  Linux)
+    PLATFORM="linux"
+    APP_BIN="$REAL_HOME/.local/bin/claude-science"
+    LSOF_BIN="/usr/bin/lsof"
+    ;;
+  *)
+    echo "拒绝：当前平台不在 CSSwitch Science 支持范围内"
+    exit 1
+    ;;
+esac
 BIN="${SCIENCE_BIN:-}"
 REUSE_SYSTEM_SSH="${CSSWITCH_REUSE_SYSTEM_SSH:-0}"
 SYSTEM_SSH_CONFIG="$REAL_HOME/.ssh/config"
@@ -33,22 +48,45 @@ SKIP_FORGE=0
 
 is_safe_science_bin() {
   local probe="$1"
-  [[ "$probe" == /* ]] || return 1
+  case "$probe" in /*) ;; *) return 1;; esac
   while [[ "$probe" != "/" ]]; do
     [[ -L "$probe" ]] && return 1
-    probe="${probe:h}"
+    probe="$(dirname "$probe")"
   done
   [[ -f "$1" && -x "$1" ]]
 }
 
+is_safe_regular_file() {
+  local probe="$1"
+  case "$probe" in /*) ;; *) return 1;; esac
+  while [[ "$probe" != "/" ]]; do
+    [[ -L "$probe" ]] && return 1
+    probe="$(dirname "$probe")"
+  done
+  [[ -f "$1" ]]
+}
+
 path_contains_symlink() {
   local probe="$1"
-  [[ "$probe" == /* ]] || return 0
+  case "$probe" in /*) ;; *) return 0;; esac
   while [[ "$probe" != "/" ]]; do
     [[ -L "$probe" ]] && return 0
-    probe="${probe:h}"
+    probe="$(dirname "$probe")"
   done
   return 1
+}
+
+canonical_candidate() {
+  local probe="$1"
+  local suffix=""
+  local leaf
+  while [[ ! -d "$probe" ]]; do
+    leaf="$(basename "$probe")"
+    suffix="${leaf}${suffix:+/$suffix}"
+    probe="$(dirname "$probe")"
+  done
+  probe="$(cd "$probe" && pwd -P)"
+  printf '%s' "$probe${suffix:+/$suffix}"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -63,7 +101,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 # —— 铁律断言：绝不使用真实目录 / 真实端口 ——
-[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "拒绝：端口不是合法整数（$PORT）"; exit 1; }
+[[ "$PORT" =~ ^[0-9]+$ ]] || { echo "拒绝：端口不是合法整数（${PORT}）"; exit 1; }
 if (( 10#${PORT} == 8765 )); then echo "拒绝：端口 8765 是真实实例保留端口"; exit 1; fi
 if (( 10#${PORT} >= 65535 )); then echo "拒绝：Science 端口必须小于 65535，才能分配隔离预览端口"; exit 1; fi
 PREVIEW_PORT=$(( 10#${PORT} + 1 ))
@@ -79,8 +117,8 @@ if [[ "$REUSE_SYSTEM_SSH" != "0" && "$REUSE_SYSTEM_SSH" != "1" ]]; then
   exit 1
 fi
 if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
-  if [[ ! -f "$SYSTEM_SSH_CONFIG" ]]; then
-    echo "拒绝：未找到系统 ~/.ssh/config，不能启用系统 SSH 配置"
+  if ! is_safe_regular_file "$SYSTEM_SSH_CONFIG"; then
+    echo "拒绝：未找到安全的系统 ~/.ssh/config，不能启用系统 SSH 配置"
     exit 1
   fi
   if ! is_safe_science_bin "$SSH_BRIDGE_BIN"; then
@@ -88,7 +126,9 @@ if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
     exit 1
   fi
 fi
-_dd_real="${DATA_DIR:A}"; _real_real="${REAL_DATA_DIR:A}"
+_dd_real="$(canonical_candidate "$DATA_DIR")"
+_real_home="$(cd "$REAL_HOME" && pwd -P)"
+_real_real="$_real_home/.claude-science"
 if [[ "$_dd_real" == "$_real_real" ]]; then echo "拒绝：data-dir 的真实路径指向真实目录"; exit 1; fi
 if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径包含符号链接"
@@ -106,6 +146,44 @@ if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径在初始化期间发生符号链接变化"
   exit 1
 fi
+_SCIENCE_BASE_ENV=("HOME=$SANDBOX_HOME")
+if [[ "$PLATFORM" == "linux" ]]; then
+  XDG_CONFIG_HOME="$SANDBOX_HOME/.config"
+  XDG_DATA_HOME="$SANDBOX_HOME/.local/share"
+  XDG_CACHE_HOME="$SANDBOX_HOME/.cache"
+  XDG_STATE_HOME="$SANDBOX_HOME/.local/state"
+  XDG_RUNTIME_DIR="$SANDBOX_HOME/.xdg-runtime"
+  SCIENCE_TMPDIR="$SANDBOX_HOME/.tmp"
+  for private_dir in "$SANDBOX_HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$SCIENCE_TMPDIR"; do
+    if path_contains_symlink "$private_dir"; then
+      echo "拒绝：Science 隔离环境目录包含符号链接"
+      exit 1
+    fi
+    mkdir -p "$private_dir"
+    chmod 700 "$private_dir"
+  done
+  _SCIENCE_BASE_ENV+=(
+    "PATH=/usr/local/bin:/usr/bin:/bin"
+    "XDG_CONFIG_HOME=$XDG_CONFIG_HOME"
+    "XDG_DATA_HOME=$XDG_DATA_HOME"
+    "XDG_CACHE_HOME=$XDG_CACHE_HOME"
+    "XDG_STATE_HOME=$XDG_STATE_HOME"
+    "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"
+    "TMPDIR=$SCIENCE_TMPDIR"
+  )
+  [[ -n "${LANG:-}" ]] && _SCIENCE_BASE_ENV+=("LANG=$LANG")
+  [[ -n "${LC_ALL:-}" ]] && _SCIENCE_BASE_ENV+=("LC_ALL=$LC_ALL")
+  [[ -n "${LC_CTYPE:-}" ]] && _SCIENCE_BASE_ENV+=("LC_CTYPE=$LC_CTYPE")
+fi
+
+science_run() {
+  if [[ "$PLATFORM" == "linux" ]]; then
+    /usr/bin/env -i "${_SCIENCE_BASE_ENV[@]}" "$@"
+  else
+    /usr/bin/env "${_SCIENCE_BASE_ENV[@]}" "$@"
+  fi
+}
+
 BIN_SOURCE="backend-selected runtime"
 if [[ -z "$BIN" ]]; then
   BIN="$APP_BIN"
@@ -115,31 +193,37 @@ if ! is_safe_science_bin "$BIN"; then
   echo "拒绝：Science binary 必须是无符号链接的绝对可执行文件"
   exit 1
 fi
-if [[ "${CSSWITCH_RUNTIME_VERSION_PRECHECKED:-0}" != "1" ]] && ! HOME="$SANDBOX_HOME" "$BIN" --version >/dev/null 2>&1; then
+if [[ "${CSSWITCH_RUNTIME_VERSION_PRECHECKED:-0}" != "1" ]] && ! science_run "$BIN" --version >/dev/null 2>&1; then
   echo "拒绝：Science binary 未通过非写入版本预检"
   exit 1
 fi
 unset CSSWITCH_RUNTIME_VERSION_PRECHECKED
 
-if /usr/sbin/lsof -nP -iTCP:"$PREVIEW_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
+if [[ ! -x "$LSOF_BIN" ]]; then
+  echo "拒绝：缺少受信任的 lsof，无法确认隔离预览端口"
+  exit 1
+fi
+if "$LSOF_BIN" -nP -iTCP:"$PREVIEW_PORT" -sTCP:LISTEN -t 2>/dev/null | grep -q .; then
   echo "拒绝：隔离预览端口 $PREVIEW_PORT 已被占用"
   exit 1
 fi
 
-# Use a keychain scoped to the isolated HOME.
-SANDBOX_KC="$SANDBOX_HOME/Library/Keychains/login.keychain-db"
-if [[ ! -f "$SANDBOX_KC" ]]; then
-  echo "创建沙箱专属钥匙串（隔离，空密码，不自动锁）…"
-  mkdir -p "$SANDBOX_HOME/Library/Keychains"
-  if ! HOME="$SANDBOX_HOME" security create-keychain -p "" "$SANDBOX_KC" >/dev/null 2>&1; then
-    echo "警告：沙箱专属钥匙串初始化未完成；原始输出因可能含路径而未记录。" >&2
+# macOS uses a keychain scoped to the isolated HOME. Linux Science keeps its
+# package/auth state below the already-isolated HOME and must not call macOS security.
+if [[ "$PLATFORM" == "macos" ]]; then
+  SANDBOX_KC="$SANDBOX_HOME/Library/Keychains/login.keychain-db"
+  if [[ ! -f "$SANDBOX_KC" ]]; then
+    echo "创建沙箱专属钥匙串（隔离，空密码，不自动锁）…"
+    mkdir -p "$SANDBOX_HOME/Library/Keychains"
+    if ! HOME="$SANDBOX_HOME" security create-keychain -p "" "$SANDBOX_KC" >/dev/null 2>&1; then
+      echo "警告：沙箱专属钥匙串初始化未完成；原始输出因可能含路径而未记录。" >&2
+    fi
   fi
+  HOME="$SANDBOX_HOME" security list-keychains -d user -s "$SANDBOX_KC" >/dev/null 2>&1 || true
+  HOME="$SANDBOX_HOME" security default-keychain -d user -s "$SANDBOX_KC" >/dev/null 2>&1 || true
+  HOME="$SANDBOX_HOME" security unlock-keychain -p "" "$SANDBOX_KC" >/dev/null 2>&1 || true
+  HOME="$SANDBOX_HOME" security set-keychain-settings "$SANDBOX_KC" >/dev/null 2>&1 || true
 fi
-# 每次启动都确保：加入沙箱搜索表、设为默认、解锁、关自动锁（全部仅作用于沙箱 HOME）
-HOME="$SANDBOX_HOME" security list-keychains -d user -s "$SANDBOX_KC" >/dev/null 2>&1 || true
-HOME="$SANDBOX_HOME" security default-keychain -d user -s "$SANDBOX_KC" >/dev/null 2>&1 || true
-HOME="$SANDBOX_HOME" security unlock-keychain -p "" "$SANDBOX_KC" >/dev/null 2>&1 || true
-HOME="$SANDBOX_HOME" security set-keychain-settings "$SANDBOX_KC" >/dev/null 2>&1 || true
 
 # 应用必须先在隔离目录中准备本地状态。
 if [[ "$SKIP_FORGE" == "1" ]]; then
@@ -169,16 +253,15 @@ echo "  账号     = $EMAIL （本地假账号，不用真实凭证）"
 # Keep local inference traffic on loopback and fail closed for blocked upstreams.
 _FASTFAIL_PROXY="http://$_PROXY_HOSTPORT"
 _NO_PROXY="127.0.0.1,localhost,::1"
-echo "  外联防卡 = Anthropic HTTPS fast-fail（经 $_FASTFAIL_PROXY，no_proxy=$_NO_PROXY）"
+echo "  外联防卡 = Anthropic HTTPS fast-fail（经 ${_FASTFAIL_PROXY}，no_proxy=${_NO_PROXY}）"
 echo
 
 if path_contains_symlink "$DATA_DIR"; then
   echo "拒绝：Science data-dir 路径在启动前发生符号链接变化"
   exit 1
 fi
-typeset -a _SCIENCE_ENV
 _SCIENCE_ENV=(
-  "HOME=$SANDBOX_HOME"
+  "${_SCIENCE_BASE_ENV[@]}"
   "ANTHROPIC_BASE_URL=$PROXY_URL"
   "https_proxy=$_FASTFAIL_PROXY"
   "HTTPS_PROXY=$_FASTFAIL_PROXY"
@@ -186,18 +269,33 @@ _SCIENCE_ENV=(
   "NO_PROXY=$_NO_PROXY"
 )
 if [[ "$REUSE_SYSTEM_SSH" == "1" ]]; then
+  _SSH_PATH="${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+  [[ "$PLATFORM" == "linux" ]] && _SSH_PATH="/usr/local/bin:/usr/bin:/bin"
   _SCIENCE_ENV+=(
-    "PATH=$SSH_BRIDGE_DIR:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
+    "PATH=$SSH_BRIDGE_DIR:$_SSH_PATH"
     "CSSWITCH_SYSTEM_SSH_CONFIG=$SYSTEM_SSH_CONFIG"
   )
+  if [[ "$PLATFORM" == "linux" && -n "${SSH_AUTH_SOCK:-}" ]]; then
+    case "$SSH_AUTH_SOCK" in /*) ;; *) echo "拒绝：系统 SSH agent socket 不是绝对路径"; exit 1;; esac
+    if [[ -L "$SSH_AUTH_SOCK" || ! -S "$SSH_AUTH_SOCK" ]]; then
+      echo "拒绝：系统 SSH agent socket 不是安全的 Unix socket"
+      exit 1
+    fi
+    _SCIENCE_ENV+=("SSH_AUTH_SOCK=$SSH_AUTH_SOCK")
+  fi
 fi
-if ! /usr/bin/env "${_SCIENCE_ENV[@]}" "$BIN" serve \
-    --data-dir "$DATA_DIR" \
-    --host 127.0.0.1 \
-    --port "$PORT" \
-    --sandbox-port "$PREVIEW_PORT" \
-    --no-browser --no-auto-update --detached \
-    >/dev/null 2>&1; then
+if [[ "$PLATFORM" == "linux" ]]; then
+  _SERVE_ENV=(/usr/bin/env -i)
+else
+  _SERVE_ENV=(/usr/bin/env)
+fi
+if ! "${_SERVE_ENV[@]}" "${_SCIENCE_ENV[@]}" "$BIN" serve \
+  --data-dir "$DATA_DIR" \
+  --host 127.0.0.1 \
+  --port "$PORT" \
+  --sandbox-port "$PREVIEW_PORT" \
+  --no-browser --no-auto-update --detached \
+  >/dev/null 2>&1; then
   echo "Science 启动命令失败（原始输出可能含临时链接或路径，未写入 CSSwitch 日志）" >&2
   exit 1
 fi

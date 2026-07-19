@@ -442,7 +442,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let path = PathBuf::from("/private/tmp").join(format!(
+        let path = crate::test_temp_root().join(format!(
             "csswitch-mcp-{label}-{}-{suffix}",
             std::process::id()
         ));

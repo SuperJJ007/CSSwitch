@@ -124,6 +124,10 @@ impl AuthCommands for ProductionCommands {
 }
 
 pub fn run_cli(args: &[String]) -> CliRun {
+    debug_assert_eq!(
+        super::platform::supported(),
+        cfg!(any(target_os = "macos", target_os = "linux"))
+    );
     let Some(command) = Command::parse(args) else {
         return error_run(
             None,
@@ -134,7 +138,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         );
     };
 
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         return oauth_error_run(
             command,
@@ -142,7 +146,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
         );
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let state_root = match production_state_root() {
             Ok(root) => root,
@@ -171,7 +175,7 @@ pub fn run_cli(args: &[String]) -> CliRun {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn production_state_root() -> Result<PathBuf, StorageError> {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -399,12 +403,12 @@ pub fn run_streaming_cli(args: &[String]) -> Option<i32> {
         }
         _ => return Some(2),
     };
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = operation_id;
         return Some(6);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         let state_root = match production_state_root() {
             Ok(root) => root,

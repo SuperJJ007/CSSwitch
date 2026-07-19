@@ -20,8 +20,8 @@ fn temp_dir(label: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = PathBuf::from("/private/tmp")
-        .join(format!("csswitch-{label}-{}-{suffix}", std::process::id()));
+    let path =
+        crate::test_temp_root().join(format!("csswitch-{label}-{}-{suffix}", std::process::id()));
     fs::create_dir_all(&path).unwrap();
     path
 }
@@ -66,7 +66,7 @@ fn safe_command(program: &Path, sandbox_home: &Path, safe_bin: &Path) -> Command
                 safe_bin.display()
             ),
         )
-        .env("TMPDIR", "/private/tmp")
+        .env("TMPDIR", crate::test_temp_root())
         .env(
             "DEVELOPER_DIR",
             "/Applications/Xcode.app/Contents/Developer",

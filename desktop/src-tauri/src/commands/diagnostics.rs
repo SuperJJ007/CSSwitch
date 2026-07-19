@@ -56,7 +56,8 @@ fn run_doctor_inner_cmd(app: &tauri::AppHandle) -> Result<String, String> {
         }
         None => (String::new(), String::new(), "", false),
     };
-    let mut cmd = Command::new("bash");
+    let mut cmd = Command::new(crate::runtime::platform::bash_bin());
+    crate::runtime::platform::configure_runtime_script_command(&mut cmd, false)?;
     // 多 profile：传 template_id + adapter + key 有无（布尔）。doctor 不再按 provider 名写死、
     // 不再去 shell 环境找 key（key 存 config.json）。绝不把真实 key 值传进其环境。
     cmd.arg(&doctor)
@@ -140,7 +141,7 @@ pub(crate) fn report_bug() -> Result<(), String> {
 pub(crate) fn open_logs() -> Result<(), String> {
     let dir = config::default_dir().join("logs");
     let _ = std::fs::create_dir_all(&dir);
-    Command::new("open")
+    Command::new(crate::runtime::platform::browser_open_bin())
         .arg(&dir)
         .status()
         .map_err(|e| format!("打开日志目录失败：{e}"))?;

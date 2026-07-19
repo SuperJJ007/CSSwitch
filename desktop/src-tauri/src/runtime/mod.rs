@@ -4,6 +4,7 @@ pub(crate) mod external_skill_route;
 pub(crate) mod legacy_proxy;
 pub(crate) mod model_discovery;
 pub(crate) mod operation;
+pub(crate) mod platform;
 pub(crate) mod profile;
 pub(crate) mod profile_switch;
 pub(crate) mod provider;

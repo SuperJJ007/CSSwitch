@@ -315,7 +315,9 @@ function mockInvoke(cmd, args) {
         ? {
             msg: "（预览模式：服务已就绪；自动打开失败。）",
             action: "started", stage: "complete", status: "ok", recovery_status: "not_needed",
-            fallback_url: "http://127.0.0.1:8990/?nonce=preview-fallback",
+            fallback_url: null,
+            fallback_url_display: "http://127.0.0.1:8990/…",
+            retryable: true,
           }
         : { msg: "（预览模式：假装已就绪）", action: "started", stage: "complete", status: "ok", recovery_status: "not_needed", fallback_url: null });
     case "science_runtime_preflight":
@@ -363,6 +365,7 @@ let skillPage = null;
 let runtimeChoiceActiveId = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
 let officialRuntimeState = "gray";
+let officialModeSupported = true;
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
 let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
 let codexAuthState = null;          // 仅保存后端脱敏状态；绝不包含 token / email
@@ -642,10 +645,11 @@ function setMsg(text, kind) {
   els.msg.parentElement.hidden = !t && (!els.browserFallback || els.browserFallback.hidden);
 }
 
-function setBrowserFallback(url) {
+function setBrowserFallback(url, retryable) {
   const value = typeof url === "string" ? url.trim() : "";
   els.browserFallbackUrl.value = value;
   els.browserFallback.hidden = !value;
+  els.browserFallbackRetryBtn.hidden = !value || !retryable;
   els.msg.parentElement.hidden = !value && !els.msg.textContent;
 }
 
@@ -1463,13 +1467,17 @@ async function loadConfig(options) {
     configState.experimental_codex_enabled = !!cfg.experimental_codex_enabled;
     configState.codex_network = cfg.codex_network || { mode: "auto", proxy_url: "" };
     configState.codex_network_resolved = cfg.codex_network_resolved || { source: "direct", proxy_scheme: null };
+    configState.platform = cfg.platform || { os: "macos", arch: "unknown", support_tier: "stable", official_mode_supported: true };
+    officialModeSupported = configState.platform.official_mode_supported !== false;
+    const officialModeButton = els.modeSeg.querySelector('[data-mode="official"]');
+    if (officialModeButton) officialModeButton.hidden = !officialModeSupported;
     els.proxyPort.value = configState.proxy_port;
     els.sandboxPort.value = configState.sandbox_port;
     els.reuseSystemSsh.checked = configState.reuse_system_ssh;
     refreshCodexProfileRepairState();
     renderCodexAuthState();
     renderCodexNetwork();
-    applyMode(cfg.mode === "official" ? "official" : "proxy");
+    applyMode(cfg.mode === "official" && officialModeSupported ? "official" : "proxy");
     renderList();
     showView("list");
     // 一次性迁移提示（#9 甲）：后端 get_config 读后已清盘，只会出现一次。
@@ -1570,7 +1578,7 @@ function renderList() {
 
 // ── 模式（第三方 / 官方）──
 function applyMode(m) {
-  const nextMode = m === "official" ? "official" : "proxy";
+  const nextMode = m === "official" && officialModeSupported ? "official" : "proxy";
   if (nextMode !== mode && nextMode === "official") officialRuntimeState = "gray";
   mode = nextMode;
   els.panel.classList.toggle("mode-official", mode === "official");
@@ -1583,6 +1591,10 @@ function applyMode(m) {
 }
 
 async function switchMode(m) {
+  if (m === "official" && !officialModeSupported) {
+    setMsg("Linux beta 不托管真实官方 Claude Science。", "err");
+    return;
+  }
   if (m === mode) return;
   if (busy) return; // 忙碌中不切模式（防与「一键开始」竞态；按钮亦已禁用，此为双保险）。修 P1-b
   skillPage?.invalidate();
@@ -1609,6 +1621,10 @@ async function switchMode(m) {
 }
 
 async function openOfficial() {
+  if (!officialModeSupported) {
+    setMsg("Linux beta 不托管真实官方 Claude Science。", "err");
+    return;
+  }
   setBusy(true);
   setMsg("正在打开官方 Claude Science…");
   try {
@@ -2233,7 +2249,7 @@ async function activate(id, skipVerify) {
       await loadConfig(); // 反映未变（仍是原 active）
       const recovery = r && r.recovery_status === "degraded" ? "；恢复未完全成功" : r && r.recovery_status === "restored" ? "；旧链路已恢复" : "";
       setMsg((r && (r.message || r.hint) || "校验未通过，未切换。") + recovery + (r && r.stage ? "（阶段：" + r.stage + "）" : ""), "err");
-      setBrowserFallback(r && r.fallback_url);
+      setBrowserFallback(r && r.fallback_url_display, !!(r && r.retryable));
       if (r && r.can_skip) { pendingSkipActivateId = id; showSkip(); }
     }
   } catch (e) {
@@ -2256,8 +2272,8 @@ function showRuntimeChoice(preflight) {
   const canUseCache = preflight && preflight.status === "cached_choice_required" && !!cachedVersion;
   els.runtimeUseCacheBtn.hidden = !canUseCache;
   els.runtimeChoiceText.textContent = canUseCache
-    ? "未找到通过安全预检的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
-    : "未找到通过安全预检的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
+    ? "未找到通过安全预检的 Claude Science 安装。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
+    : "未找到通过安全预检的 Claude Science 安装，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
   els.runtimeChoiceSec.hidden = false;
   runtimeChoiceActiveId = configState.active_id || null;
 }
@@ -2302,7 +2318,7 @@ async function runOneClick(runtimeChoice) {
         ? "；刷新未完成，安全事务记录已保留，可修正问题后重试"
         : "";
       setMsg((r.message || "一键开始未完成") + recovery + "（阶段：" + (r.stage || "unknown") + "）", "err");
-      setBrowserFallback(r.fallback_url);
+      setBrowserFallback(r.fallback_url_display, !!r.retryable);
       await refreshStatus();
       return;
     }
@@ -2312,7 +2328,7 @@ async function runOneClick(runtimeChoice) {
     setMsg(message + (isCodexSource(active)
       ? " 请在 Science 的 More models 中选择 Codex / … 后再发第一条消息；默认 Claude 壳会被明确拒绝。"
       : ""), "ok");
-    setBrowserFallback(r.fallback_url);
+    setBrowserFallback(r.fallback_url_display, !!r.retryable);
     await refreshStatus();
   } catch (e) {
     setMsg("一键开始失败：" + runtimeCommandErrorText(e), "err");
@@ -2362,10 +2378,18 @@ async function oneClick() {
       await runOneClick(null);
       return;
     }
+    if (preflight && preflight.status === "environment_blocked") {
+      hideRuntimeChoice();
+      const blockers = Array.isArray(preflight.blockers)
+        ? preflight.blockers.map((item) => item && item.message).filter(Boolean)
+        : [];
+      setMsg("Linux Science 运行环境未通过安全预检：" + (blockers.join(" ") || "环境依赖不可用。"), "err");
+      return;
+    }
     showRuntimeChoice(preflight || { status: "missing" });
     setMsg(preflight && preflight.status === "cached_choice_required"
-      ? "Claude Science App 不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
-      : "Claude Science App 不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
+      ? "Claude Science 安装不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
+      : "Claude Science 安装不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
   } catch (e) {
     setMsg("Science 运行环境检查失败：" + e, "err");
   } finally {
@@ -2411,8 +2435,8 @@ async function openBrowser() {
   try {
     const result = await call("open_url");
     if (result && result.status === "error") {
-      setBrowserFallback(result.fallback_url);
-      setMsg(result.message || "打开浏览器失败；请复制 URL 手动打开。", "err");
+      setBrowserFallback(result.fallback_url_display, !!result.retryable);
+      setMsg(result.message || "打开浏览器失败；请修复默认浏览器后再次打开。", "err");
     } else {
       setBrowserFallback("");
       setMsg((result && result.message) || "已向默认浏览器发出打开 Science 的请求；若窗口没有切到前台，请从 Dock 或其他桌面切回默认浏览器。", "ok");
@@ -2506,7 +2530,7 @@ function wire() {
   [
     "oneClickBtn", "stopBtn", "importSkillBtn", "refreshSkillsBtn", "ltProxy", "ltSandbox", "ltUpstream",
     "runtimeChoiceSec", "runtimeChoiceText", "runtimeUseCacheBtn", "runtimeDownloadBtn", "runtimeChoiceCancelBtn",
-    "msg", "browserFallback", "browserFallbackUrl", "browserFallbackCopyBtn", "browserFallbackRetryBtn", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
+    "msg", "browserFallback", "browserFallbackUrl", "browserFallbackRetryBtn", "brandDot", "openBrowserBtn", "doctorBtn", "updateBtn", "verLabel",
     "reportBtn", "logsBtn", "quitBtn", "modeSeg", "proxyPort", "sandboxPort", "reuseSystemSsh", "advSec",
     "codexEnabled", "codexAuthStatus", "codexStatusBtn", "codexLoginBtn", "codexCancelBtn", "codexLogoutBtn", "codexProfileRepairBox", "codexRepairProfileBtn",
     "codexNetworkMode", "codexProxyUrl", "codexNetworkResolved", "codexNetworkSaveBtn", "codexDowngradeBox", "codexDowngradeBtn",
@@ -2613,15 +2637,6 @@ function wire() {
   els.importSkillBtn.addEventListener("click", importLocalSkill);
   els.openBrowserBtn.addEventListener("click", openBrowser);
   els.browserFallbackRetryBtn.addEventListener("click", openBrowser);
-  els.browserFallbackCopyBtn.addEventListener("click", async () => {
-    try {
-      await navigator.clipboard.writeText(els.browserFallbackUrl.value);
-      setMsg("Science URL 已复制。", "ok");
-    } catch (_) {
-      els.browserFallbackUrl.select();
-      setMsg("无法自动写入剪贴板；已选中 URL，请手动复制。", "err");
-    }
-  });
   els.doctorBtn.addEventListener("click", runDoctor);
   els.updateBtn.addEventListener("click", checkUpdate);
   els.reportBtn.addEventListener("click", () =>

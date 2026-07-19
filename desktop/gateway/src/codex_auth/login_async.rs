@@ -712,9 +712,9 @@ fn build_authorization_url(
 }
 
 async fn open_browser(url: &str, control: &LoginControl) -> Result<(), OAuthFlowError> {
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
-        let mut child = Command::new("/usr/bin/open")
+        let mut child = Command::new(super::platform::browser_open_bin())
             .arg(url)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -762,13 +762,13 @@ async fn open_browser(url: &str, control: &LoginControl) -> Result<(), OAuthFlow
             }
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = (url, control);
         Err(OAuthFlowError::new(
             OAuthErrorCode::BrowserOpenFailed,
             false,
-            "Codex browser login is supported only on macOS",
+            "Codex browser login is supported only on macOS and Linux",
         )
         .at_stage("browser_open"))
     }

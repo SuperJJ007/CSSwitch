@@ -18,3 +18,15 @@ pub mod science_control;
 pub mod server;
 pub mod skill_install;
 pub mod static_profile;
+
+#[cfg(test)]
+pub(crate) fn test_temp_root() -> std::path::PathBuf {
+    let private_tmp = std::path::PathBuf::from("/private/tmp");
+    if private_tmp.is_dir() {
+        private_tmp
+    } else {
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+    }
+}

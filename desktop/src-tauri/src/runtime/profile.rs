@@ -142,6 +142,7 @@ pub(crate) fn build_get_config(dir: &Path) -> Result<serde_json::Value, String> 
         "experimental_codex_enabled": cfg.experimental_codex_enabled,
         "codex_network": cfg.codex_network,
         "codex_network_resolved": resolved_codex_network,
+        "platform": crate::runtime::platform::platform_capabilities(),
         "mode": cfg.mode, "pending_notice": notice,
     }))
 }
@@ -1203,6 +1204,9 @@ mod tests {
         .unwrap();
         let v = build_get_config(&d).unwrap();
         assert_eq!(v["schema_version"], 4);
+        assert_eq!(v["platform"]["os"], std::env::consts::OS);
+        assert_eq!(v["platform"]["arch"], std::env::consts::ARCH);
+        assert!(v["platform"]["official_mode_supported"].is_boolean());
         let arr = v["profiles"].as_array().unwrap();
         let p = arr.iter().find(|p| p["id"] == id).unwrap();
         assert!(p["key"].as_str().unwrap().ends_with("9999"));

@@ -159,7 +159,10 @@ fn import_candidate(
     workspace_name: &str,
     file_name: &str,
 ) -> SkillResult<(SkillId, bool)> {
-    let staging = Path::new("/private/tmp").join(format!(
+    let staging_root = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|_| io_error())?;
+    let staging = staging_root.join(format!(
         "csswitch-workspace-skill-{}-{}",
         std::process::id(),
         unique_suffix()
@@ -259,7 +262,7 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let path = Path::new("/private/tmp").join(format!(
+            let path = crate::test_temp_root().join(format!(
                 "csswitch-workspace-ingress-{label}-{}-{}",
                 std::process::id(),
                 unique_suffix()

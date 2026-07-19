@@ -205,9 +205,9 @@ pub struct SystemBrowser;
 
 impl BrowserOpener for SystemBrowser {
     fn open(&self, authorization_url: &str, login_deadline: Instant) -> Result<(), OAuthFlowError> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
-            let mut child = Command::new("/usr/bin/open")
+            let mut child = Command::new(super::platform::browser_open_bin())
                 .arg(authorization_url)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -246,13 +246,13 @@ impl BrowserOpener for SystemBrowser {
                 }
             }
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
             let _ = (authorization_url, login_deadline);
             Err(OAuthFlowError::new(
                 OAuthErrorCode::BrowserOpenFailed,
                 false,
-                "Codex browser login is supported only on macOS",
+                "Codex browser login is supported only on macOS and Linux",
             ))
         }
     }

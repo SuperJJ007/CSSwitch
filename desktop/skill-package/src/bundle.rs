@@ -1017,7 +1017,7 @@ mod tests {
     use super::*;
 
     fn test_data_dir(label: &str) -> PathBuf {
-        let root = PathBuf::from("/private/tmp").join(format!(
+        let root = crate::test_temp_root().join(format!(
             "csswitch-bundle-{label}-{}-{}",
             std::process::id(),
             unique_suffix()

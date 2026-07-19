@@ -5,6 +5,7 @@ use std::process::{Child, Command};
 use tauri::{Manager, Runtime};
 
 use crate::config;
+use crate::runtime::platform;
 
 const OPERATION_LOG_MAX_BYTES: u64 = 1_048_576;
 #[cfg(all(not(test), feature = "acceptance-build"))]
@@ -168,10 +169,10 @@ pub(crate) fn kill_child(slot: &mut Option<Child>) {
     }
 }
 
-/// Open a URL with the system browser (macOS `open`) and verify exit status.
+/// Open a URL with the trusted platform browser launcher and verify exit status.
 fn select_browser_open_binary(override_bin: Option<std::ffi::OsString>) -> Result<PathBuf, String> {
     let Some(raw) = override_bin else {
-        return Ok(PathBuf::from("/usr/bin/open"));
+        return Ok(platform::browser_open_bin());
     };
     let path = PathBuf::from(raw);
     if !path.is_absolute() {
@@ -212,7 +213,7 @@ pub(crate) fn open_in_browser(url: &str) -> Result<(), String> {
         .status()
         .map_err(|e| format!("打开浏览器失败：{e}"))?;
     if !st.success() {
-        return Err(format!("open 非零退出（{:?}）", st.code()));
+        return Err(format!("系统浏览器启动器非零退出（{:?}）", st.code()));
     }
     Ok(())
 }
@@ -228,7 +229,7 @@ mod tests {
     fn browser_open_defaults_to_system_binary_and_rejects_relative_override() {
         assert_eq!(
             select_browser_open_binary(None).unwrap(),
-            Path::new("/usr/bin/open")
+            super::platform::browser_open_bin()
         );
         assert!(select_browser_open_binary(Some("open".into())).is_err());
     }

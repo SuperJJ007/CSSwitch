@@ -3160,8 +3160,8 @@ mod tests {
 
     impl TestDir {
         fn new(label: &str) -> Self {
-            let path = PathBuf::from(format!(
-                "/private/tmp/csswitch-skill-store-{label}-{}-{}",
+            let path = crate::test_temp_root().join(format!(
+                "csswitch-skill-store-{label}-{}-{}",
                 std::process::id(),
                 NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
             ));

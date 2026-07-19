@@ -14,7 +14,8 @@ use crate::runtime::proxy_lifecycle::{
 };
 use crate::runtime::science::{
     probe_known_runtime, probe_sandbox_runtime_cached, sandbox_data_dir, sandbox_home,
-    sandbox_listener_matches_runtime, sandbox_url, select_science_runtime_cached, stop_sandbox,
+    sandbox_listener_matches_runtime, sandbox_url, sandbox_url_display,
+    select_science_runtime_cached, stop_sandbox, validate_science_loopback_url,
     SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource,
 };
 use crate::runtime::skill_install_bridge::{
@@ -41,32 +42,43 @@ fn stop_sandbox_state<R: Runtime>(
 fn open_science_surface<R: Runtime>(
     app: &tauri::AppHandle<R>,
     url: &str,
+    expected_port: u16,
 ) -> Result<&'static str, String> {
-    if std::env::var("CSSWITCH_SCIENCE_WEBVIEW_SPIKE")
-        .ok()
-        .as_deref()
-        == Some("1")
+    validate_science_loopback_url(url, expected_port)?;
+    #[cfg(not(target_os = "linux"))]
     {
-        if let Some(win) = app.get_webview_window("science") {
-            let _ = win.close();
-        }
-        let parsed = url
-            .parse()
-            .map_err(|e| format!("Science URL 解析失败：{e}"))?;
-        match tauri::WebviewWindowBuilder::new(app, "science", tauri::WebviewUrl::External(parsed))
+        if std::env::var("CSSWITCH_SCIENCE_WEBVIEW_SPIKE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            if let Some(win) = app.get_webview_window("science") {
+                let _ = win.close();
+            }
+            let parsed = url
+                .parse()
+                .map_err(|e| format!("Science URL 解析失败：{e}"))?;
+            match tauri::WebviewWindowBuilder::new(
+                app,
+                "science",
+                tauri::WebviewUrl::External(parsed),
+            )
             .title("Claude Science")
             .inner_size(1100.0, 800.0)
             .build()
-        {
-            Ok(win) => {
-                let _ = win.set_focus();
-                return Ok("webview");
-            }
-            Err(_) => {
-                // Spike-only path: construction failure falls through to the existing browser surface.
+            {
+                Ok(win) => {
+                    let _ = win.set_focus();
+                    return Ok("webview");
+                }
+                Err(_) => {
+                    // Spike-only path: construction failure falls through to the browser surface.
+                }
             }
         }
     }
+    #[cfg(target_os = "linux")]
+    let _ = app;
     open_in_browser(url)?;
     Ok("browser")
 }
@@ -166,7 +178,10 @@ fn configure_third_party_best_effort<R: Runtime>(
     if let Err(error) = invalidate_route_configuration(data_dir) {
         return RegistrationStatus::Warning(error);
     }
-    let control_url = sandbox_url(port, runtime);
+    let control_url = match sandbox_url(port, runtime) {
+        Ok(url) => url,
+        Err(error) => return RegistrationStatus::Warning(error),
+    };
     if let Err(error) = configure_third_party_after_science_start(app, &control_url) {
         return RegistrationStatus::Warning(error);
     }
@@ -458,7 +473,7 @@ fn one_click_login_with_options<R: Runtime>(
                     &running_runtime,
                     false,
                 );
-                let url = sandbox_url(sport, &running_runtime);
+                let url = sandbox_url(sport, &running_runtime)?;
                 {
                     let mut st = lock(&state);
                     st.sandbox_port = sport;
@@ -483,17 +498,20 @@ fn one_click_login_with_options<R: Runtime>(
                     ProxyAction::Reused => "已在运行",
                     ProxyAction::Restarted => "已用新配置重启代理，Science 沿用不变",
                 };
-                let (msg, fallback_url) = if open_surface {
-                    match open_science_surface(&app, &url) {
-                        Ok("webview") => (format!("{base}，已重新打开 Science 窗口。"), None),
-                        Ok(_) => (format!("{base}，已向系统浏览器发送打开请求。"), None),
+                let (msg, fallback_url_display, retryable) = if open_surface {
+                    match open_science_surface(&app, &url, sport) {
+                        Ok("webview") => {
+                            (format!("{base}，已重新打开 Science 窗口。"), None, false)
+                        }
+                        Ok(_) => (format!("{base}，已向系统浏览器发送打开请求。"), None, false),
                         Err(_) => (
                             format!("{base}，服务已就绪；自动打开失败。"),
-                            Some(url.clone()),
+                            Some(sandbox_url_display(sport)),
+                            true,
                         ),
                     }
                 } else {
-                    (format!("{base}，Science 绑定保持不变。"), None)
+                    (format!("{base}，Science 绑定保持不变。"), None, false)
                 };
                 let msg = append_installer_note(msg, &installer);
                 trace.finish(format!(
@@ -506,7 +524,9 @@ fn one_click_login_with_options<R: Runtime>(
                     "stage": "complete",
                     "status": "ok",
                     "recovery_status": "not_needed",
-                    "fallback_url": fallback_url,
+                    "fallback_url": null,
+                    "fallback_url_display": fallback_url_display,
+                    "retryable": retryable,
                     "external_skill_installer": installer_status_json(&installer)
                 }));
             }
@@ -624,7 +644,12 @@ fn one_click_login_with_options<R: Runtime>(
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
     trace.stage(OperationStage::SandboxLaunch, format!("port={sport}"));
-    let status = Command::new("zsh")
+    let mut launch_command = Command::new(crate::runtime::platform::bash_bin());
+    crate::runtime::platform::configure_runtime_script_command(
+        &mut launch_command,
+        cfg.reuse_system_ssh,
+    )?;
+    let status = launch_command
         .arg(&launch)
         .arg("--port")
         .arg(sport.to_string())
@@ -716,7 +741,7 @@ fn one_click_login_with_options<R: Runtime>(
         &launch_runtime,
         false,
     );
-    let url = sandbox_url(sport, &launch_runtime);
+    let url = sandbox_url(sport, &launch_runtime)?;
     {
         let mut st = lock(&state);
         st.sandbox_port = sport;
@@ -741,17 +766,26 @@ fn one_click_login_with_options<R: Runtime>(
         cfg.runtime_transaction = None;
     })
     .map_err(|error| error.to_string())?;
-    let (msg, fallback_url) = if open_surface {
-        match open_science_surface(&app, &url) {
-            Ok("webview") => (format!("{started}，已打开 Science 窗口。"), None),
-            Ok(_) => (format!("{started}，已向系统浏览器发送打开请求。"), None),
+    let (msg, fallback_url_display, retryable) = if open_surface {
+        match open_science_surface(&app, &url, sport) {
+            Ok("webview") => (format!("{started}，已打开 Science 窗口。"), None, false),
+            Ok(_) => (
+                format!("{started}，已向系统浏览器发送打开请求。"),
+                None,
+                false,
+            ),
             Err(_) => (
                 format!("{started}，服务已就绪；自动打开失败。"),
-                Some(url.clone()),
+                Some(sandbox_url_display(sport)),
+                true,
             ),
         }
     } else {
-        (format!("{started}，Science 已按新模型目录刷新。"), None)
+        (
+            format!("{started}，Science 已按新模型目录刷新。"),
+            None,
+            false,
+        )
     };
     let msg = append_installer_note(msg, &installer);
     trace.stage(OperationStage::OpenBrowser, "done");
@@ -765,7 +799,9 @@ fn one_click_login_with_options<R: Runtime>(
         "stage": "complete",
         "status": "ok",
         "recovery_status": "not_needed",
-        "fallback_url": fallback_url,
+        "fallback_url": null,
+        "fallback_url_display": fallback_url_display,
+        "retryable": retryable,
         "external_skill_installer": installer_status_json(&installer)
     }))
 }

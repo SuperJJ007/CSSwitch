@@ -4,10 +4,23 @@ mod github;
 mod install;
 mod listing;
 mod science;
+mod science_env;
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+#[cfg(test)]
+pub(crate) fn test_temp_root() -> PathBuf {
+    let private_tmp = PathBuf::from("/private/tmp");
+    if private_tmp.is_dir() {
+        private_tmp
+    } else {
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+    }
+}
 
 pub use bundle::{
     find_bundle_for_skill, quarantine_bundle, BundleCommit, BundleMemberCommit, BundleUninstall,
@@ -29,6 +42,7 @@ pub use science::{
     attach_skill, read_agent_skill_names, update_agent_skills, verify_attach_control_ready,
     AttachError, AttachResult, BatchSkillUpdate,
 };
+pub use science_env::configure_science_command_environment;
 
 pub const SCHEMA_VERSION: u64 = 2;
 pub const AGENT_NAME: &str = "OPERON";

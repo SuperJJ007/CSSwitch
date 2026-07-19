@@ -31,6 +31,18 @@ use tauri::{Emitter, Manager};
 
 use runtime::{science::stop_sandbox, system::kill_child};
 
+#[cfg(test)]
+pub(crate) fn test_temp_root() -> std::path::PathBuf {
+    let private_tmp = std::path::PathBuf::from("/private/tmp");
+    if private_tmp.is_dir() {
+        private_tmp
+    } else {
+        std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir())
+    }
+}
+
 use codex_auth_supervisor::{CodexAuthSupervisor, SharedCodexAuthSupervisor};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -67,6 +79,35 @@ fn decide_launch(cfg: &config::Config) -> LaunchPath {
         .as_deref()
         == Some("1");
     decide_launch_with_auto_boot(cfg, auto_boot)
+}
+
+fn normalize_platform_mode_config(current: &mut config::Config, official_supported: bool) -> bool {
+    if official_supported || current.mode != "official" {
+        return false;
+    }
+    current.mode = "proxy".into();
+    let note = "Linux beta 不支持托管官方 Claude Science，已切回第三方隔离模式。";
+    current.pending_notice = Some(match current.pending_notice.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing} {note}"),
+        _ => note.into(),
+    });
+    true
+}
+
+fn normalize_unsupported_platform_mode() -> Result<(), String> {
+    if runtime::platform::official_mode_supported() {
+        return Ok(());
+    }
+    let dir = config::default_dir();
+    let cfg = config::load_from(&dir).map_err(|error| error.to_string())?;
+    if cfg.mode != "official" {
+        return Ok(());
+    }
+    config::update(&dir, |current| {
+        let _ = normalize_platform_mode_config(current, false);
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -391,6 +432,15 @@ pub fn run() {
             // v1/v2/v3 的版本备份由 config::load_from 按不可覆盖合同保存；
             // 悬空 active 归一化为空。迁移逻辑并入 config::load_from（不再单独跑 relay_presets）。
             let _ = config::load_from(&config::default_dir());
+            let platform_mode_ready = match normalize_unsupported_platform_mode() {
+                Ok(()) => true,
+                Err(error) => {
+                    let mut state = lock(app.state::<SharedAppState>().inner());
+                    state.boot = BootState::Failed;
+                    state.boot_error = Some(format!("平台模式归一化失败，已拒绝自动启动：{error}"));
+                    false
+                }
+            };
 
             // 关窗隐藏配置面板，不销毁窗口、不停止后台链路。显式退出清理代理与沙箱。
             if let Some(win) = app.get_webview_window("main") {
@@ -402,7 +452,11 @@ pub fn run() {
                     }
                 });
             }
-            run_boot_coordinator(app.handle().clone());
+            if platform_mode_ready {
+                run_boot_coordinator(app.handle().clone());
+            } else {
+                show_main_window(app.handle());
+            }
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -422,8 +476,8 @@ mod tests {
     use crate::config::{Config, Profile};
     use crate::runtime::system::redact;
     use crate::{
-        boot_result_error, decide_launch_with_auto_boot, should_begin_boot, AppState, BootState,
-        LaunchPath,
+        boot_result_error, decide_launch_with_auto_boot, normalize_platform_mode_config,
+        should_begin_boot, AppState, BootState, LaunchPath,
     };
 
     #[test]
@@ -437,6 +491,25 @@ mod tests {
             Some("gateway recovery degraded")
         );
         assert!(boot_result_error(&serde_json::json!({"status": "ok"})).is_none());
+    }
+
+    #[test]
+    fn unsupported_official_mode_normalizes_once_without_schema_change() {
+        let mut cfg = Config {
+            mode: "official".into(),
+            pending_notice: Some("existing".into()),
+            ..Config::default()
+        };
+        assert!(normalize_platform_mode_config(&mut cfg, false));
+        assert_eq!(cfg.mode, "proxy");
+        assert_eq!(cfg.schema_version, 4);
+        assert!(cfg.pending_notice.as_deref().unwrap().contains("existing"));
+        assert!(cfg
+            .pending_notice
+            .as_deref()
+            .unwrap()
+            .contains("Linux beta"));
+        assert!(!normalize_platform_mode_config(&mut cfg, false));
     }
 
     #[test]

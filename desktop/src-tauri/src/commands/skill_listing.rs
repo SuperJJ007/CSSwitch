@@ -373,7 +373,12 @@ mod tests {
     #[ignore = "explicit temp-HOME Acceptance command proof"]
     fn isolated_acceptance_command_lists_only_temp_home_skills() {
         let home = std::env::var("HOME").expect("explicit test HOME");
-        assert!(home.starts_with("/private/tmp/csswitch-skill-list-tauri-"));
+        let home_path = std::path::Path::new(&home);
+        assert_eq!(home_path.parent(), Some(crate::test_temp_root().as_path()));
+        assert!(home_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("csswitch-skill-list-tauri-")));
         let data_dir = sandbox_data_dir();
         assert!(data_dir.starts_with(&home));
         std::fs::create_dir_all(data_dir.join("orgs/org-test/skills/demo")).unwrap();

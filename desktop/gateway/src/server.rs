@@ -2986,7 +2986,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        let root = crate::test_temp_root().join(format!(
             "csswitch-bridge-{label}-{}-{suffix}",
             std::process::id()
         ));
@@ -3102,7 +3102,7 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root = std::path::PathBuf::from("/private/tmp").join(format!(
+        let root = crate::test_temp_root().join(format!(
             "csswitch-bridge-reader-{}-{suffix}",
             std::process::id()
         ));

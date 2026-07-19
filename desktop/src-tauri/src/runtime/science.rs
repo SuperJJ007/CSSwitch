@@ -10,10 +10,9 @@ use tauri::Runtime;
 
 use crate::{config, proc};
 
+use super::platform;
 use super::system::{asset_root, kill_child};
 
-pub(crate) const SCIENCE_BIN: &str =
-    "/Applications/Claude Science.app/Contents/Resources/bin/claude-science";
 pub(crate) const SCIENCE_DOWNLOAD_URL: &str = "https://claude.com/download";
 pub(crate) const CACHED_ONCE_CHOICE: &str = "cached_once";
 
@@ -171,6 +170,14 @@ pub(crate) fn sandbox_data_dir() -> PathBuf {
     sandbox_home().join(".claude-science")
 }
 
+fn installed_science_bin() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from("/__csswitch_missing_home__"));
+    platform::installed_science_bin(&home)
+}
+
 /// 端口变更是否需要拆掉现有链路（纯函数，P1-c）。代理/沙箱任一端口变了，正在跑的代理就绑在
 /// 旧端口、正在跑的沙箱又把旧代理 URL 烘死了，二者与新配置不一致 → 拆掉逼下次「一键开始」按新端口重建。
 pub(crate) fn settings_change_needs_teardown(
@@ -182,16 +189,51 @@ pub(crate) fn settings_change_needs_teardown(
     old_proxy != new_proxy || old_sandbox != new_sandbox
 }
 
-/// 从 `claude-science url` 的 stdout 里取**第一条**合法 http(s) URL。
-pub(crate) fn first_http_url(stdout: &str) -> Option<String> {
+const MAX_SCIENCE_URL_BYTES: usize = 2_048;
+
+pub(crate) fn validate_science_loopback_url(
+    raw: &str,
+    expected_port: u16,
+) -> Result<String, String> {
+    if raw.is_empty()
+        || raw.len() > MAX_SCIENCE_URL_BYTES
+        || raw.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err("Science URL 长度或字符不安全".into());
+    }
+    let parsed = url::Url::parse(raw).map_err(|_| "Science URL 解析失败")?;
+    if parsed.scheme() != "http" {
+        return Err("Science URL 必须使用 loopback HTTP".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err("Science URL 含不允许的 userinfo 或 fragment".into());
+    }
+    if !matches!(parsed.host_str(), Some("127.0.0.1" | "localhost")) {
+        return Err("Science URL 不是受信任的 loopback host".into());
+    }
+    if parsed.port_or_known_default() != Some(expected_port) {
+        return Err("Science URL 端口与当前隔离 runtime 不一致".into());
+    }
+    Ok(parsed.into())
+}
+
+/// 从 `claude-science url` 的 stdout 里取第一条 URL，并严格绑定当前 loopback port。
+pub(crate) fn first_science_loopback_url(
+    stdout: &str,
+    expected_port: u16,
+) -> Result<Option<String>, String> {
     for line in stdout.lines() {
         let t = line.trim();
         if t.starts_with("http://") || t.starts_with("https://") {
             let url = t.split_whitespace().next().unwrap_or(t);
-            return Some(url.to_string());
+            return validate_science_loopback_url(url, expected_port).map(Some);
         }
     }
-    None
+    Ok(None)
+}
+
+pub(crate) fn sandbox_url_display(port: u16) -> String {
+    format!("http://127.0.0.1:{port}/…")
 }
 
 fn is_executable_file(path: &Path) -> bool {
@@ -238,11 +280,10 @@ fn cached_science_bin(data_dir: &Path) -> PathBuf {
 }
 
 fn safe_science_version(path: &Path) -> Option<String> {
-    let output = Command::new(path)
-        .arg("--version")
-        .env("HOME", sandbox_home())
-        .output()
-        .ok()?;
+    let home = sandbox_home();
+    let mut command = Command::new(path);
+    platform::configure_science_command(&mut command, &home).ok()?;
+    let output = command.arg("--version").output().ok()?;
     if !output.status.success() {
         return None;
     }
@@ -350,6 +391,17 @@ pub(crate) fn science_runtime_preflight(
     version_cache: &ScienceVersionCache,
     confirmed_stopped: Option<&ScienceRuntimeIdentity>,
 ) -> Result<Value, String> {
+    let blockers = platform::science_environment_blockers();
+    if !blockers.is_empty() {
+        return Ok(json!({
+            "status": "environment_blocked",
+            "selected_source": Value::Null,
+            "selected_version": Value::Null,
+            "cached_version": Value::Null,
+            "download_url": SCIENCE_DOWNLOAD_URL,
+            "blockers": blockers,
+        }));
+    }
     if let Ok(cfg) = config::load_from(&config::default_dir()) {
         if let Some(runtime) = confirmed_stopped {
             if runtime.source != ScienceRuntimeSource::CachedOnce
@@ -383,7 +435,7 @@ pub(crate) fn science_runtime_preflight(
     science_runtime_preflight_for_paths_cached(
         &data_dir,
         explicit.as_deref(),
-        Path::new(SCIENCE_BIN),
+        &installed_science_bin(),
         version_cache,
     )
 }
@@ -445,19 +497,20 @@ fn select_science_runtime_for_paths_cached(
     if cached_version.is_some() {
         return Err("SCIENCE_RUNTIME_CHOICE_REQUIRED：请明确选择仅本次使用缓存版本，或安装/更新 Claude Science".into());
     }
-    Err("找不到可用的 Claude Science App；请先安装或更新 Claude Science".into())
+    Err("找不到可用的 Claude Science executable；请先安装或更新 Claude Science".into())
 }
 
 pub(crate) fn select_science_runtime_cached(
     choice: Option<&str>,
     version_cache: &ScienceVersionCache,
 ) -> Result<ScienceRuntimeIdentity, String> {
+    platform::require_science_environment()?;
     let data_dir = sandbox_data_dir();
     let explicit = explicit_science_bin()?;
     select_science_runtime_for_paths_cached(
         &data_dir,
         explicit.as_deref(),
-        Path::new(SCIENCE_BIN),
+        &installed_science_bin(),
         choice,
         version_cache,
     )
@@ -474,7 +527,7 @@ fn runtime_probe_candidates(
         )]);
     }
     let mut candidates = Vec::new();
-    let app = PathBuf::from(SCIENCE_BIN);
+    let app = installed_science_bin();
     if version_cache.version(&app).is_some() {
         candidates.push(runtime_identity(
             app,
@@ -573,7 +626,7 @@ fn loopback_port_accepts_tcp(port: u16) -> bool {
 }
 
 fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
-    let listener = Command::new("/usr/sbin/lsof")
+    let listener = Command::new(platform::lsof_bin())
         .args(["-nP", &format!("-iTCP:{port}"), "-sTCP:LISTEN", "-t"])
         .output();
     let Ok(listener) = listener else {
@@ -599,7 +652,7 @@ fn listener_uses_runtime(port: u16, runtime: &ScienceRuntimeIdentity) -> bool {
     let Ok(expected) = runtime.path.canonicalize() else {
         return false;
     };
-    let text_files = Command::new("/usr/sbin/lsof")
+    let text_files = Command::new(platform::lsof_bin())
         .args(["-nP", "-a", "-p", pid, "-d", "txt", "-Fn"])
         .output();
     let Ok(text_files) = text_files else {
@@ -635,31 +688,29 @@ fn test_listener_marker_matches(pid: &str, runtime: &ScienceRuntimeIdentity) -> 
         .is_some_and(|recorded| recorded.trim() == pid)
 }
 
-/// Return the sandbox UI URL, falling back to the plain localhost port.
-pub(crate) fn sandbox_url(port: u16, runtime: &ScienceRuntimeIdentity) -> String {
+/// Return a validated sandbox UI URL, falling back only when the CLI emits no URL.
+pub(crate) fn sandbox_url(port: u16, runtime: &ScienceRuntimeIdentity) -> Result<String, String> {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
-    if let Ok(out) = Command::new(&runtime.path)
-        .arg("url")
-        .arg("--data-dir")
-        .arg(&data_dir)
-        .env("HOME", &home)
-        .output()
-    {
+    let mut command = Command::new(&runtime.path);
+    platform::configure_science_command(&mut command, &home)?;
+    if let Ok(out) = command.arg("url").arg("--data-dir").arg(&data_dir).output() {
         let s = String::from_utf8_lossy(&out.stdout);
-        if let Some(url) = first_http_url(&s) {
-            return url;
+        if let Some(url) = first_science_loopback_url(&s, port)? {
+            return Ok(url);
         }
     }
-    format!("http://127.0.0.1:{port}")
+    Ok(format!("http://127.0.0.1:{port}"))
 }
 
 fn runtime_status(runtime: &ScienceRuntimeIdentity) -> Option<bool> {
-    let out = Command::new(&runtime.path)
+    let home = sandbox_home();
+    let mut command = Command::new(&runtime.path);
+    platform::configure_science_command(&mut command, &home).ok()?;
+    let out = command
         .arg("status")
         .arg("--data-dir")
         .arg(sandbox_data_dir())
-        .env("HOME", sandbox_home())
         .output()
         .ok()?;
     // Some Science builds use a non-zero exit to mean "not running" while
@@ -792,7 +843,14 @@ pub(crate) fn stop_sandbox<R: Runtime>(
         Some(root) => {
             let stop = root.join("scripts/stop-science-sandbox.sh");
             if stop.is_file() {
-                match Command::new("zsh")
+                let mut stop_command = Command::new(platform::bash_bin());
+                if let Err(error) =
+                    platform::configure_runtime_script_command(&mut stop_command, false)
+                {
+                    *sandbox_url = None;
+                    return Err(format!("准备停止沙箱环境失败：{error}。"));
+                }
+                match stop_command
                     .arg(&stop)
                     .env("SANDBOX_HOME", sandbox_home())
                     .env("SCIENCE_BIN", &runtime.path)
@@ -834,13 +892,13 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
-        sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
-        science_runtime_preflight_for_paths_cached, science_status_running,
-        select_science_runtime_for_paths, select_science_runtime_for_paths_cached,
-        settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
-        SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource, ScienceVersionCache,
-        CACHED_ONCE_CHOICE,
+        classify_known_runtime_state, classify_sandbox_state, first_science_loopback_url,
+        runtime_status_value, sandbox_home, sandbox_running_ours, sandbox_url,
+        science_runtime_preflight_for_paths, science_runtime_preflight_for_paths_cached,
+        science_status_running, select_science_runtime_for_paths,
+        select_science_runtime_for_paths_cached, settings_change_needs_teardown,
+        stop_runtime_from_probe, trusted_science_status, SandboxScienceState,
+        ScienceRuntimeIdentity, ScienceRuntimeSource, ScienceVersionCache, CACHED_ONCE_CHOICE,
     };
 
     // ---------- P1-c: 端口变更是否需拆链路（纯函数，4 组合） ----------
@@ -865,28 +923,39 @@ mod tests {
     }
 
     #[test]
-    fn first_http_url_takes_only_first_valid_url() {
+    fn science_url_accepts_only_the_expected_loopback_origin() {
         let multi = "http://127.0.0.1:8990/setup?nonce=abc123\n\
                      This is a single-use link, expires in 60 seconds.";
         assert_eq!(
-            first_http_url(multi).as_deref(),
+            first_science_loopback_url(multi, 8990).unwrap().as_deref(),
             Some("http://127.0.0.1:8990/setup?nonce=abc123"),
         );
-        let inline = "https://x.example/y?z=1  (single-use)";
         assert_eq!(
-            first_http_url(inline).as_deref(),
-            Some("https://x.example/y?z=1")
+            first_science_loopback_url(
+                "Open this link in your browser:\nhttp://localhost:8990/a",
+                8990
+            )
+            .unwrap()
+            .as_deref(),
+            Some("http://localhost:8990/a")
         );
-        let lead = "Open this link in your browser:\nhttp://127.0.0.1:8990/a";
         assert_eq!(
-            first_http_url(lead).as_deref(),
-            Some("http://127.0.0.1:8990/a")
+            first_science_loopback_url("no url here\nnor here", 8990).unwrap(),
+            None
         );
-        assert_eq!(first_http_url("no url here\nnor here"), None);
-        assert_eq!(
-            first_http_url("http://127.0.0.1:8990").as_deref(),
-            Some("http://127.0.0.1:8990")
-        );
+        for rejected in [
+            "https://127.0.0.1:8990/",
+            "http://x.example:8990/",
+            "http://127.0.0.1:8991/",
+            "http://user@127.0.0.1:8990/",
+            "http://127.0.0.1:8990/#secret",
+            "http://127.0.0.1:not-a-port/",
+        ] {
+            assert!(
+                first_science_loopback_url(rejected, 8990).is_err(),
+                "must reject {rejected}"
+            );
+        }
     }
 
     #[test]
@@ -1216,7 +1285,10 @@ mod tests {
             source: ScienceRuntimeSource::InstalledApp,
             version: None,
         };
-        assert_eq!(sandbox_url(8990, &runtime), "http://127.0.0.1:8990");
+        assert_eq!(
+            sandbox_url(8990, &runtime).unwrap(),
+            "http://127.0.0.1:8990"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

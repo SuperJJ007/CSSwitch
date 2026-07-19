@@ -1,6 +1,7 @@
 mod cli;
 mod login_async;
 mod oauth;
+mod platform;
 mod storage;
 
 use std::path::{Path, PathBuf};
