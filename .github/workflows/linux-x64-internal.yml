@@ -1,4 +1,4 @@
-name: Linux x64 internal beta
+name: Linux x64 release candidate
 
 on:
   workflow_dispatch:
@@ -100,10 +100,10 @@ jobs:
             echo "unexpected deb architecture: $architecture" >&2
             exit 1
           }
-          case "$package_version" in
-            0.8.0-linux-beta.1|0.8.0~linux-beta.1) ;;
-            *) echo "unexpected deb version: $package_version" >&2; exit 1 ;;
-          esac
+          test "$package_version" = "0.8.1" || {
+            echo "unexpected deb version: $package_version" >&2
+            exit 1
+          }
           grep -Eq '(^|, )bubblewrap \(>= 0\.8(\.0)?\)($|, )' <<< "$depends" || {
             echo "deb dependency contract missing bubblewrap >= 0.8" >&2
             exit 1
@@ -159,7 +159,7 @@ jobs:
           summary="$RUNNER_TEMP/csswitch-linux-x64-test-summary.txt"
           {
             echo "source_sha=$GITHUB_SHA"
-            echo "channel=080-linux-beta"
+            echo "channel=081-linux-x64"
             echo "package_version=$package_version"
             echo "deb_sha256=$deb_sha256"
             echo "runner=ubuntu-24.04"
@@ -174,7 +174,7 @@ jobs:
           } > "$summary"
 
           {
-            echo "### CSSwitch 080 Linux Beta"
+            echo "### CSSwitch 0.8.1 Linux x64"
             echo
             echo "- Source SHA: \`$GITHUB_SHA\`"
             echo "- Debian version: \`$package_version\`"
@@ -182,20 +182,19 @@ jobs:
             echo "- Scope: limited community test artifact; real desktop, Science, and live OAuth are not established by this job."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          artifact_dir="$RUNNER_TEMP/csswitch-080-linux-beta"
+          artifact_dir="$RUNNER_TEMP/csswitch-081-linux-x64"
           install -d -m 0700 "$artifact_dir"
           install -m 0644 "$deb" "$artifact_dir/$deb_name"
           install -m 0644 "$deb_dir/$deb_name.sha256" "$artifact_dir/$deb_name.sha256"
           install -m 0644 "$summary" "$artifact_dir/test-summary.txt"
-          install -m 0644 docs/operations/linux-x64-beta-testing.md "$artifact_dir/README-TESTING.md"
-          test "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l)" -eq 4
+          test "$(find "$artifact_dir" -maxdepth 1 -type f | wc -l)" -eq 3
 
           echo "artifact_dir=$artifact_dir" >> "$GITHUB_OUTPUT"
 
       - name: Upload internal package
         uses: actions/upload-artifact@v4
         with:
-          name: csswitch-080-linux-beta-ubuntu-24.04-amd64
+          name: csswitch-081-linux-x64-ubuntu-24.04-amd64
           retention-days: 14
           if-no-files-found: error
           path: ${{ steps.package.outputs.artifact_dir }}
