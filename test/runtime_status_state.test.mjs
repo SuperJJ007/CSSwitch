@@ -13,8 +13,39 @@ test("Codex 无独立 upstream 时只聚合适用层", () => {
   assert.equal(aggregateRuntimeStatus({ proxy: "amber", sandbox: "amber", upstream: "gray" }), "amber");
 });
 
-test("官方模式不把打开请求当作健康证明", () => {
-  assert.equal(aggregateRuntimeStatus({}, { mode: "official", officialState: "gray" }), "gray");
+test("官方视图仍聚合第三方状态且不把打开请求当作健康证明", () => {
+  assert.equal(
+    aggregateRuntimeStatus(
+      { proxy: "green", sandbox: "green", upstream: "gray" },
+      { mode: "official", officialState: "green" },
+    ),
+    "green",
+  );
+  assert.equal(
+    aggregateRuntimeStatus(
+      { proxy: "red", sandbox: "green", upstream: "gray" },
+      { mode: "official", officialState: "green" },
+    ),
+    "red",
+  );
+});
+
+test("官方与第三方并存 UI 保留 managed 状态和显式停止边界", () => {
+  const html = readFileSync(new URL("../desktop/src/index.html", import.meta.url), "utf8");
+  const js = readFileSync(new URL("../desktop/src/main.js", import.meta.url), "utf8");
+  const runtime = readFileSync(
+    new URL("../desktop/src-tauri/src/commands/runtime.rs", import.meta.url),
+    "utf8",
+  );
+  const statusList = html.match(/<div class="status-list([^\"]*)">/)?.[1] || "";
+  assert.doesNotMatch(statusList, /tp-only/);
+  assert.match(html, /id="stopBtn">停止第三方实例</);
+  assert.match(html, /官方实例可与第三方隔离实例同时运行/);
+  assert.doesNotMatch(js, /第三方代理\/沙箱已停|停止第三方代理\/沙箱并保存模式/);
+
+  const setMode = runtime.slice(runtime.indexOf("fn set_mode_inner("), runtime.indexOf("/// 官方模式"));
+  assert.doesNotMatch(setMode, /stop_sandbox_state|stop_proxy|bump_generation/);
+  assert.match(setMode, /lifecycle\.with_serialized/);
 });
 
 test("未知状态保持中性，明确失败才变红", () => {

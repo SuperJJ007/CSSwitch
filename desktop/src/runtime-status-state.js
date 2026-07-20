@@ -12,8 +12,7 @@ export function normalizeRuntimeLight(value) {
   return RUNTIME_LIGHTS.has(value) ? value : "unknown";
 }
 
-export function aggregateRuntimeStatus(status, { mode = "proxy", officialState = "gray" } = {}) {
-  if (mode === "official") return normalizeRuntimeLight(officialState);
+export function aggregateRuntimeStatus(status) {
   const values = [status?.proxy, status?.sandbox, status?.upstream].map(normalizeRuntimeLight);
   if (values.includes("red")) return "red";
   if (values.includes("unknown")) return "gray";

@@ -635,7 +635,25 @@ fn test_listener_marker_matches(pid: &str, runtime: &ScienceRuntimeIdentity) -> 
         .is_some_and(|recorded| recorded.trim() == pid)
 }
 
-/// Return the sandbox UI URL, falling back to the plain localhost port.
+/// Put the CSSwitch-managed browser session on a distinct cookie origin from
+/// the official Science instance. Browser cookies are scoped by host, not by
+/// port, so opening both instances as `localhost:<port>` lets either login
+/// replace the other's session cookie even though their daemons and data dirs
+/// are isolated.
+fn isolate_sandbox_browser_origin(raw: &str, port: u16) -> Option<String> {
+    let localhost = format!("http://localhost:{port}");
+    let loopback = format!("http://127.0.0.1:{port}");
+    let suffix = raw
+        .strip_prefix(&localhost)
+        .or_else(|| raw.strip_prefix(&loopback))?;
+    if !suffix.is_empty() && !suffix.starts_with('/') && !suffix.starts_with('?') {
+        return None;
+    }
+    Some(format!("{loopback}{suffix}"))
+}
+
+/// Return the sandbox UI URL on the dedicated `127.0.0.1` browser origin,
+/// falling back to the plain loopback port when the CLI emits no usable URL.
 pub(crate) fn sandbox_url(port: u16, runtime: &ScienceRuntimeIdentity) -> String {
     let home = sandbox_home();
     let data_dir = sandbox_data_dir();
@@ -648,7 +666,9 @@ pub(crate) fn sandbox_url(port: u16, runtime: &ScienceRuntimeIdentity) -> String
     {
         let s = String::from_utf8_lossy(&out.stdout);
         if let Some(url) = first_http_url(&s) {
-            return url;
+            if let Some(isolated) = isolate_sandbox_browser_origin(&url, port) {
+                return isolated;
+            }
         }
     }
     format!("http://127.0.0.1:{port}")
@@ -834,8 +854,9 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
-        sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
+        classify_known_runtime_state, classify_sandbox_state, first_http_url,
+        isolate_sandbox_browser_origin, runtime_status_value, sandbox_home, sandbox_running_ours,
+        sandbox_url, science_runtime_preflight_for_paths,
         science_runtime_preflight_for_paths_cached, science_status_running,
         select_science_runtime_for_paths, select_science_runtime_for_paths_cached,
         settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
@@ -886,6 +907,32 @@ mod tests {
         assert_eq!(
             first_http_url("http://127.0.0.1:8990").as_deref(),
             Some("http://127.0.0.1:8990")
+        );
+    }
+
+    #[test]
+    fn sandbox_browser_origin_is_distinct_from_official_localhost_cookie_scope() {
+        assert_eq!(
+            isolate_sandbox_browser_origin("http://localhost:8990/?nonce=single-use-token", 8990)
+                .as_deref(),
+            Some("http://127.0.0.1:8990/?nonce=single-use-token")
+        );
+        assert_eq!(
+            isolate_sandbox_browser_origin("http://127.0.0.1:8990/project/one?nonce=token", 8990)
+                .as_deref(),
+            Some("http://127.0.0.1:8990/project/one?nonce=token")
+        );
+        assert!(
+            isolate_sandbox_browser_origin("http://localhost:8765/?nonce=official", 8990).is_none()
+        );
+        assert!(isolate_sandbox_browser_origin(
+            "http://localhost:8990.evil.invalid/?nonce=bad",
+            8990
+        )
+        .is_none());
+        assert!(
+            isolate_sandbox_browser_origin("https://localhost:8990/?nonce=wrong-scheme", 8990)
+                .is_none()
         );
     }
 
@@ -1207,7 +1254,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_url_falls_back_to_localhost_when_cli_absent() {
+    fn sandbox_url_falls_back_to_loopback_ip_when_cli_absent() {
         let root = unique_temp_dir("science-url-fallback").unwrap();
         let bin = root.join("claude-science");
         write_fake_bin(&bin, 0o755).unwrap();
@@ -1217,6 +1264,28 @@ mod tests {
             version: None,
         };
         assert_eq!(sandbox_url(8990, &runtime), "http://127.0.0.1:8990");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sandbox_url_normalizes_cli_localhost_nonce_to_loopback_ip() {
+        let root = unique_temp_dir("science-url-cookie-origin").unwrap();
+        let bin = root.join("claude-science");
+        fs::write(
+            &bin,
+            "#!/bin/sh\nprintf '%s\\n' 'http://localhost:8990/?nonce=one-time'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = ScienceRuntimeIdentity {
+            path: bin,
+            source: ScienceRuntimeSource::InstalledApp,
+            version: None,
+        };
+        assert_eq!(
+            sandbox_url(8990, &runtime),
+            "http://127.0.0.1:8990/?nonce=one-time"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

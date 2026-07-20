@@ -69,13 +69,13 @@
                   <div class="connection-actions">
                     <button class="hero" id="oneClickBtn">一键开始</button>
                     <button class="btn" id="openBrowserBtn">浏览器打开</button>
-                    <button class="btn" id="stopBtn">全部停止</button>
+                    <button class="btn" id="stopBtn">停止第三方实例</button>
                   </div>
                 </section>
 
                 <aside class="connection-controls">
                   <section class="surface mode-surface modeseg">
-                    <h2>连接方式</h2>
+                    <h2>操作对象</h2>
                     <div class="seg" id="modeSeg">
                       <button type="button" class="seg-btn active" data-mode="proxy">第三方模型</button>
                       <button type="button" class="seg-btn" data-mode="official">官方 Claude</button>
@@ -83,7 +83,7 @@
                   </section>
                   <section class="surface status-overview">
                     <h2>运行状态</h2>
-                    <div class="status-list tp-only">
+                    <div class="status-list">
                       <div class="status-row"><span><i id="ltProxy" class="lt a"></i>代理</span><strong id="proxyStateText">检查中</strong></div>
                       <div class="status-row"><span><i id="ltSandbox" class="lt a"></i>Science</span><strong id="sandboxStateText">检查中</strong></div>
                       <div class="status-row"><span><i id="ltUpstream" class="lt a"></i>上游</span><strong id="upstreamStateText">检查中</strong></div>
@@ -194,9 +194,9 @@
 
           <section class="app-page" data-page="status" aria-label="状态">
             <div class="status-page-grid">
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">PROXY</div><h2>本地代理</h2><p>负责把 Claude Science 请求路由到当前第三方模型。</p><div class="large-state"><i class="lt a" data-mirror-light="ltProxy"></i><span data-mirror-text="proxyStateText">检查中</span></div></section>
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">SANDBOX</div><h2>隔离 Science</h2><p>运行在 CSSwitch 管理的独立 HOME 与数据目录中。</p><div class="large-state"><i class="lt a" data-mirror-light="ltSandbox"></i><span data-mirror-text="sandboxStateText">检查中</span></div></section>
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">UPSTREAM</div><h2>模型上游</h2><p>仅代表当前代理探测到的连接健康状态。</p><div class="large-state"><i class="lt a" data-mirror-light="ltUpstream"></i><span data-mirror-text="upstreamStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">PROXY</div><h2>本地代理</h2><p>负责把 Claude Science 请求路由到当前第三方模型。</p><div class="large-state"><i class="lt a" data-mirror-light="ltProxy"></i><span data-mirror-text="proxyStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">SANDBOX</div><h2>隔离 Science</h2><p>运行在 CSSwitch 管理的独立 HOME 与数据目录中。</p><div class="large-state"><i class="lt a" data-mirror-light="ltSandbox"></i><span data-mirror-text="sandboxStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">UPSTREAM</div><h2>模型上游</h2><p>仅代表当前代理探测到的连接健康状态。</p><div class="large-state"><i class="lt a" data-mirror-light="ltUpstream"></i><span data-mirror-text="upstreamStateText">检查中</span></div></section>
             </div>
             <section class="surface diagnostics-card">
               <div class="section-heading"><div><div class="section-kicker">DIAGNOSTICS</div><h2>诊断与支持</h2><p>这些动作沿用现有后端能力，不会改变 Skill 或 MCP 配置。</p></div></div>
@@ -260,7 +260,7 @@
               </section>
             </section>
 
-            <section class="surface official-only"><div class="empty-state"><h2>官方模式沿用 Claude Science 设置</h2><p>切换回第三方模式可调整 CSSwitch 代理与沙箱端口。</p></div></section>
+            <section class="surface official-only"><div class="empty-state"><h2>官方实例由 Claude Science 管理</h2><p>官方实例可与第三方隔离实例同时运行；切换操作对象不会停止任何实例。</p></div></section>
           </section>
         </div>
 

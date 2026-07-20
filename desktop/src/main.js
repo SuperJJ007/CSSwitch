@@ -379,7 +379,6 @@ let statusRecoveryMsg = "";
 let skillPage = null;
 let runtimeChoiceActiveId = null;
 let mode = "proxy"; // "proxy" 第三方 | "official" 官方
-let officialRuntimeState = "gray";
 // 当前配置快照（get_config 结果）。全 key 绝不在此，只有掩码。
 let configState = { profiles: [], templates: [], active_id: "", proxy_port: 18991, sandbox_port: 8990, reuse_system_ssh: false, experimental_codex_enabled: false, codex_network: { mode: "auto", proxy_url: "" }, codex_network_resolved: { source: "direct", proxy_scheme: null } };
 let codexAuthState = null;          // 仅保存后端脱敏状态；绝不包含 token / email
@@ -809,11 +808,11 @@ function startSwitchModeFeedback(targetMode) {
   clearBusyMsgTimers();
   const toOfficial = targetMode === "official";
   setMsg(toOfficial
-    ? "正在切到官方模式：停止第三方代理/沙箱并保存模式…"
-    : "正在切到第三方模式：保存模式，完成后可选择配置并一键开始…");
+    ? "正在切到官方操作视图：第三方实例保持原状态…"
+    : "正在切到第三方操作视图：官方实例保持原状态…");
   scheduleBusyMsg(3500, { kind: "switchMode", id: targetMode }, toOfficial
-    ? "仍在停止第三方链路。真实 Claude Science 实例不会被触碰。"
-    : "仍在保存模式切换。当前不会自动启动第三方代理。");
+    ? "仍在等待当前运行操作完成并保存视图；不会停止第三方实例。"
+    : "仍在等待当前运行操作完成并保存视图；不会停止官方实例。");
 }
 
 function startPortSaveFeedback(changed) {
@@ -860,7 +859,7 @@ function setBusy(on, op) {
   syncOpenBrowserControl();
   if (skillPage) skillPage.setGlobalBusy(on);
   if (els.doctorBtn) els.doctorBtn.disabled = on && !activationBusy;
-  // 模式切换按钮同样禁用：忙碌中切官方会与「一键开始」竞态（修 P1-b 前端侧）。
+  // 操作视图切换仍与「一键开始」互斥，等待当前运行事务完成后再保存视图。
   if (els.modeSeg) els.modeSeg.querySelectorAll(".seg-btn").forEach((b) => (b.disabled = on));
   syncProfileBusyState();
   // 松开忙碌时，把模型必填保存门控交回门（避免 setBusy(false) 覆盖门控）。
@@ -872,7 +871,8 @@ function setBusy(on, op) {
 function syncOpenBrowserControl() {
   if (!els.openBrowserBtn) return;
   els.openBrowserBtn.disabled = busy || browserOpenInFlight;
-  els.openBrowserBtn.textContent = browserOpenInFlight ? "打开中…" : "浏览器打开";
+  const idleLabel = mode === "official" ? "打开第三方 Science" : "浏览器打开";
+  els.openBrowserBtn.textContent = browserOpenInFlight ? "打开中…" : idleLabel;
 }
 
 function syncActivationControls() {
@@ -1619,10 +1619,9 @@ function renderList() {
   syncProfileBusyState();
 }
 
-// ── 模式（第三方 / 官方）──
+// ── 操作视图（第三方 / 官方）；不代表 runtime 互斥 ──
 function applyMode(m) {
   const nextMode = m === "official" ? "official" : "proxy";
-  if (nextMode !== mode && nextMode === "official") officialRuntimeState = "gray";
   mode = nextMode;
   els.panel.classList.toggle("mode-official", mode === "official");
   els.modeSeg.querySelectorAll(".seg-btn").forEach((b) =>
@@ -1630,6 +1629,7 @@ function applyMode(m) {
   );
   els.oneClickBtn.textContent =
     mode === "official" ? "打开官方 Claude Science" : "一键开始";
+  syncOpenBrowserControl();
   renderCurrentSummary();
 }
 
@@ -1653,8 +1653,8 @@ async function switchMode(m) {
   showView("list");
   setMsg(
     mode === "official"
-      ? "已切到官方模式：第三方代理/沙箱已停，点上方按钮打开你真实的 Claude Science。"
-      : "已切到第三方模式：选一条配置「设为当前」后点「一键开始」。"
+      ? "已切到官方操作视图：第三方实例保持原状态，可与官方 Claude Science 同时运行。"
+      : "已切到第三方操作视图：官方实例保持原状态，可继续配置或打开隔离 Science。"
   );
   await refreshStatus();
   await skillPage?.refreshIfLoaded();
@@ -1665,12 +1665,8 @@ async function openOfficial() {
   setMsg("正在打开官方 Claude Science…");
   try {
     await call("open_official");
-    officialRuntimeState = "gray";
-    els.brandDot.className = "dot gray";
-    setMsg("已发起打开官方 Claude Science；运行、登录与订阅状态由 Science 管理。", "ok");
+    setMsg("已发起打开官方 Claude Science；第三方实例保持原状态，官方运行、登录与订阅状态由 Science 管理。", "ok");
   } catch (e) {
-    officialRuntimeState = "gray";
-    els.brandDot.className = "dot gray";
     setMsg("打开失败：" + e, "err");
   } finally {
     setBusy(false);
@@ -2562,10 +2558,10 @@ function cancelRuntimeChoice() {
 async function stopAll() {
   skillPage?.invalidate();
   setBusy(true);
-  setMsg("停止中…");
+  setMsg("正在停止第三方实例…");
   try {
     await call("stop_all");
-    setMsg("已停止代理与沙箱。", "ok");
+    setMsg("已停止第三方代理与隔离 Science；官方实例未受影响。", "ok");
     await refreshStatus();
   } catch (e) {
     setMsg("停止失败：" + e, "err");
@@ -2665,7 +2661,7 @@ async function refreshStatus() {
     setStatusText("proxyStateText", s.proxy);
     setStatusText("sandboxStateText", s.sandbox);
     setStatusText("upstreamStateText", s.upstream);
-    els.brandDot.className = "dot " + aggregateRuntimeStatus(s, { mode, officialState: officialRuntimeState });
+    els.brandDot.className = "dot " + aggregateRuntimeStatus(s);
     setStatusRecoveryMsg(proxyRecoveryMessage(s));
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "unknown"));
@@ -2815,7 +2811,7 @@ function wire() {
     setMsg("正在停止代理与隔离 Science…");
     call("quit_app").catch((e) => {
       setBusy(false);
-      setMsg("退出失败：" + e + "请先使用“全部停止”重试。", "err");
+      setMsg("退出失败：" + e + "请先使用“停止第三方实例”重试。", "err");
     });
   });
 }
