@@ -928,17 +928,36 @@ fn login_intact_guarded(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
 
     static CTR: AtomicU32 = AtomicU32::new(0);
+    static TEST_BASE: OnceLock<PathBuf> = OnceLock::new();
+
+    fn test_base() -> &'static Path {
+        TEST_BASE.get_or_init(|| loop {
+            let nonce = hex(&rand_bytes(8).unwrap());
+            let base = std::env::temp_dir().join(format!(
+                "csswitch-forge-tests-{}-{nonce}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&base) {
+                Ok(()) => {
+                    std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                    return base;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => panic!("create forge test root: {error}"),
+            }
+        })
+    }
 
     fn tmpdir(tag: &str) -> PathBuf {
         let n = CTR.fetch_add(1, Ordering::SeqCst);
-        let d = std::env::temp_dir().join(format!(
-            "csswitch-forge-{}-{}-{}",
-            std::process::id(),
-            tag,
-            n
-        ));
+        // Keep the test sandbox below a process-owned parent. On Linux the
+        // system temp directory is normally owned by root, while production
+        // sandboxes live below the current user's ~/.csswitch directory.
+        let d = test_base().join(format!("{tag}-{n}"));
         let _ = std::fs::remove_dir_all(&d);
         d
     }
