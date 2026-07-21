@@ -1,8 +1,12 @@
+use std::collections::HashSet;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-const SSH_STUB_MARKER: &str = "# CSSwitch managed system SSH config bridge v1";
+const SSH_STUB_V1_MARKER: &str = "# CSSwitch managed system SSH config bridge v1";
+const SSH_STUB_V2_MARKER: &str = "# CSSwitch managed system SSH config bridge v2";
+const SSH_STUB_MAX_ALIASES: usize = 512;
+const SSH_STUB_MAX_BYTES: u64 = 65_536;
 
 fn system_ssh_config_path_for_home(home: &Path) -> Result<PathBuf, String> {
     if !home.is_absolute() {
@@ -79,7 +83,7 @@ fn remove_managed_sandbox_ssh_stub_for_config(
     let metadata = file
         .metadata()
         .map_err(|error| format!("检查隔离 SSH config 失败：{error}"))?;
-    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > 4096 {
+    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > SSH_STUB_MAX_BYTES {
         return Err("隔离 SSH config 不是 CSSwitch 管理的安全普通文件".into());
     }
     let mut text = String::new();
@@ -89,13 +93,61 @@ fn remove_managed_sandbox_ssh_stub_for_config(
         .to_string_lossy()
         .replace('\\', "\\\\")
         .replace('"', "\\\"");
-    let expected = format!("{SSH_STUB_MARKER}\nInclude \"{escaped}\"\n");
-    if text != expected {
+    if !is_managed_sandbox_ssh_stub_text(&text, &escaped) {
         return Err("隔离 SSH config 不是 CSSwitch 管理的入口，拒绝删除".into());
     }
     std::fs::remove_file(&config).map_err(|error| format!("撤销隔离 SSH config 失败：{error}"))?;
     let _ = std::fs::remove_dir(&ssh_dir);
     Ok(())
+}
+
+fn is_managed_sandbox_ssh_stub_text(text: &str, escaped_system_config: &str) -> bool {
+    let include = format!("Include \"{escaped_system_config}\"");
+    let v1 = format!("{SSH_STUB_V1_MARKER}\n{include}\n");
+    if text == v1 {
+        return true;
+    }
+    if text.len() as u64 > SSH_STUB_MAX_BYTES || !text.ends_with('\n') {
+        return false;
+    }
+
+    let mut lines = text.lines();
+    if lines.next() != Some(SSH_STUB_V2_MARKER) || lines.next() != Some(include.as_str()) {
+        return false;
+    }
+
+    let mut aliases = HashSet::new();
+    for line in lines {
+        let Some(alias) = line.strip_prefix("Host ") else {
+            return false;
+        };
+        if !is_safe_projected_ssh_alias(alias)
+            || !aliases.insert(alias)
+            || aliases.len() > SSH_STUB_MAX_ALIASES
+        {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_safe_projected_ssh_alias(alias: &str) -> bool {
+    !alias.is_empty()
+        && alias.bytes().all(|byte| {
+            matches!(
+                byte,
+                b'A'..=b'Z'
+                    | b'a'..=b'z'
+                    | b'0'..=b'9'
+                    | b'-'
+                    | b'.'
+                    | b'_'
+                    | b':'
+                    | b'@'
+                    | b'%'
+                    | b'+'
+            )
+        })
 }
 
 pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Result<(), String> {
@@ -117,8 +169,9 @@ mod tests {
     use std::os::unix::fs::FileTypeExt;
 
     use super::{
-        remove_managed_sandbox_ssh_stub_for_config, system_ssh_config_path_for_home,
-        validate_runtime_ports, SSH_STUB_MARKER,
+        is_managed_sandbox_ssh_stub_text, remove_managed_sandbox_ssh_stub_for_config,
+        system_ssh_config_path_for_home, validate_runtime_ports, SSH_STUB_V1_MARKER,
+        SSH_STUB_V2_MARKER,
     };
 
     #[test]
@@ -176,7 +229,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "{SSH_STUB_MARKER}\nInclude \"{}\"\n",
+                "{SSH_STUB_V1_MARKER}\nInclude \"{}\"\n",
                 expected_system_config.display()
             ),
         )
@@ -187,7 +240,19 @@ mod tests {
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::write(
             &config,
-            format!("{SSH_STUB_MARKER}\nInclude \"/different/config\"\n\nHost foreign\n"),
+            format!(
+                "{SSH_STUB_V2_MARKER}\nInclude \"{}\"\nHost alpha\nHost beta-2\n",
+                expected_system_config.display()
+            ),
+        )
+        .unwrap();
+        remove_managed_sandbox_ssh_stub_for_config(&home, &expected_system_config).unwrap();
+        assert!(!config.exists());
+
+        std::fs::create_dir_all(home.join(".ssh")).unwrap();
+        std::fs::write(
+            &config,
+            format!("{SSH_STUB_V1_MARKER}\nInclude \"/different/config\"\n\nHost foreign\n"),
         )
         .unwrap();
         assert!(
@@ -222,7 +287,7 @@ mod tests {
         std::fs::create_dir_all(outside.join(".ssh")).unwrap();
         std::fs::write(
             outside.join(".ssh/config"),
-            format!("{SSH_STUB_MARKER}\nInclude \"{}\"\n", expected.display()),
+            format!("{SSH_STUB_V1_MARKER}\nInclude \"{}\"\n", expected.display()),
         )
         .unwrap();
         let linked_home = base.join("linked-home");
@@ -230,5 +295,29 @@ mod tests {
         assert!(remove_managed_sandbox_ssh_stub_for_config(&linked_home, &expected).is_err());
         assert!(outside.join(".ssh/config").is_file());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn managed_v2_stub_accepts_only_canonical_safe_unique_aliases() {
+        let escaped = "/tmp/real-home/.ssh/config";
+        let valid =
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\nHost alpha\nHost beta-2\n");
+        assert!(is_managed_sandbox_ssh_stub_text(&valid, escaped));
+
+        for invalid in [
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\nHost alpha\nHost alpha\n"),
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\nHost *.example\n"),
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\nHost alpha\nUser foreign\n"),
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"/different/config\"\nHost alpha\n"),
+            format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\nHost alpha"),
+        ] {
+            assert!(!is_managed_sandbox_ssh_stub_text(&invalid, escaped));
+        }
+
+        let too_many_aliases = (0..=super::SSH_STUB_MAX_ALIASES)
+            .map(|index| format!("Host alias-{index}\n"))
+            .collect::<String>();
+        let over_limit = format!("{SSH_STUB_V2_MARKER}\nInclude \"{escaped}\"\n{too_many_aliases}");
+        assert!(!is_managed_sandbox_ssh_stub_text(&over_limit, escaped));
     }
 }

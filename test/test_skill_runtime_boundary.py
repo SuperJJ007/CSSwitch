@@ -158,6 +158,32 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("version_cache.version(app_bin)", science)
         self.assertIn('"cached_choice_required"', science)
 
+    def test_official_downloaded_runtime_is_first_choice_without_sharing_data(self):
+        science = (ROOT / "desktop/src-tauri/src/runtime/science.rs").read_text()
+        launch = (ROOT / "scripts/launch-virtual-sandbox.sh").read_text()
+        status_state = (ROOT / "desktop/src/runtime-status-state.js").read_text()
+
+        selection = science.split("fn select_science_runtime_for_paths_cached", 1)[1].split(
+            "pub(crate) fn select_science_runtime_cached", 1
+        )[0]
+        self.assertLess(
+            selection.index("ScienceRuntimeSource::OfficialDownloaded"),
+            selection.index("ScienceRuntimeSource::InstalledApp"),
+        )
+        candidates = science.split("fn runtime_probe_candidates", 1)[1].split(
+            "fn science_status_value", 1
+        )[0]
+        self.assertLess(
+            candidates.index("ScienceRuntimeSource::OfficialDownloaded"),
+            candidates.index("ScienceRuntimeSource::InstalledApp"),
+        )
+        self.assertIn('join(".claude-science")', science)
+        self.assertIn('join("bin")', science)
+        self.assertIn('join("claude-science")', science)
+        self.assertIn('.env("HOME", sandbox_home())', science)
+        self.assertIn("--no-auto-update", launch)
+        self.assertIn("隔离实例不登录或检查更新", status_state)
+
     def test_manual_science_open_refreshes_url_and_has_visible_feedback(self):
         js = (ROOT / "desktop/src/main.js").read_text()
         runtime = (ROOT / "desktop/src-tauri/src/commands/runtime.rs").read_text()

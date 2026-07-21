@@ -6,6 +6,7 @@ import {
   RUNTIME_STATUS_LABELS,
   aggregateRuntimeStatus,
   normalizeRuntimeLight,
+  scienceRuntimeStatusText,
 } from "../desktop/src/runtime-status-state.js";
 
 test("Codex 无独立 upstream 时只聚合适用层", () => {
@@ -22,6 +23,23 @@ test("未知状态保持中性，明确失败才变红", () => {
   assert.equal(aggregateRuntimeStatus({ proxy: "green", sandbox: "green" }), "gray");
   assert.equal(aggregateRuntimeStatus({ proxy: "red", sandbox: "green", upstream: "gray" }), "red");
   assert.equal(RUNTIME_STATUS_LABELS.unknown, "状态未知");
+});
+
+test("隔离 Science 只展示 runtime 来源且不声称自己检查更新", () => {
+  assert.equal(
+    scienceRuntimeStatusText({
+      runtime: { source: "official_downloaded", version: "claude-science 0.1.15" },
+    }),
+    "官方已下载 Runtime · claude-science 0.1.15；隔离实例仅复用程序文件。",
+  );
+  assert.match(
+    scienceRuntimeStatusText({
+      runtime: { source: "installed_app", version: "claude-science 0.1.0" },
+    }),
+    /App 内置备用 Runtime.*官方下载 Runtime 当前不可用/,
+  );
+  assert.match(scienceRuntimeStatusText(null), /隔离实例不登录或检查更新/);
+  assert.doesNotMatch(scienceRuntimeStatusText(null), /已是最新|up to date/i);
 });
 
 test("运行反馈统一显示在右上角且不会触发页面滚动", () => {

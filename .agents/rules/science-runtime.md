@@ -1,9 +1,9 @@
 # Science runtime 规则
 
 - Science executable、持久 data-dir、版本 runtime 资源、组织数据和监听进程是不同事实。
-- 新启动通常使用用户当前安装的官方 Claude Science App executable，并复用 CSSwitch 隔离 data-dir。
+- 新启动优先只读复用官方 updater 已下载的 `~/.claude-science/bin/claude-science`，不存在或未通过安全版本预检时才使用官方 Claude Science App executable；两者都必须复用 CSSwitch 隔离 data-dir。
 - `SCIENCE_BIN` 仅是显式开发 override；无效时 fail closed。历史缓存绝不能隐式回退。
-- 不从真实 `~/.claude-science` 复制 runtime 资产，不下载或升级 Science；保持 `--no-auto-update`，除非产品合同另行批准。
+- 不从真实 `~/.claude-science` 复制 runtime 资产，不读取 executable 之外的真实数据，不下载或升级 Science；隔离模式保持 `--no-auto-update`，更新由官方模式负责。
 - Science 与 CSSwitch Gateway 均绑定 loopback；引入或暗示 `0.0.0.0` 需要单独的安全和产品决策。
 - 端口占用或 `status` 成功不能单独证明 runtime 身份；需结合 executable、data-dir、监听 PID 和受管启动身份。
 - 已健康 daemon 不因版本探测或可选功能漂移而强制重启。

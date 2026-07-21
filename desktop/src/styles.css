@@ -233,6 +233,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .status-page-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .status-detail-card p { min-height: 50px; margin-top: 7px; font-size: 10.5px; }
 .status-detail-card h2 { margin-top: 5px; }
+.science-runtime-meta { margin-top: 8px; color: var(--muted); font-size: 9.5px; line-height: 1.45; }
 .large-state { display: flex; align-items: center; gap: 8px; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); color: var(--ink); font-size: 11px; font-weight: 700; }
 .diagnostics-card { margin-top: 12px; }
 .diagnostic-actions { margin-top: 0; }

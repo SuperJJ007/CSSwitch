@@ -20,6 +20,7 @@ pub(crate) const CACHED_ONCE_CHOICE: &str = "cached_once";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ScienceRuntimeSource {
     Explicit,
+    OfficialDownloaded,
     InstalledApp,
     CachedOnce,
 }
@@ -28,6 +29,7 @@ impl ScienceRuntimeSource {
     pub(crate) fn code(self) -> &'static str {
         match self {
             Self::Explicit => "explicit",
+            Self::OfficialDownloaded => "official_downloaded",
             Self::InstalledApp => "installed_app",
             Self::CachedOnce => "cached_once",
         }
@@ -237,6 +239,28 @@ fn cached_science_bin(data_dir: &Path) -> PathBuf {
     data_dir.join("bin").join("claude-science")
 }
 
+fn official_downloaded_science_bin_for_home(home: &Path) -> Option<PathBuf> {
+    if !home.is_absolute() {
+        return None;
+    }
+    let path = cached_science_bin(&home.join(".claude-science"));
+    is_executable_file(&path).then_some(path)
+}
+
+#[cfg(not(feature = "acceptance-build"))]
+fn official_downloaded_science_bin() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    official_downloaded_science_bin_for_home(&home)
+}
+
+// Acceptance artifacts must never inspect the real user's Science data root.
+// Path-injected unit tests below cover this candidate without weakening that
+// build-time isolation contract.
+#[cfg(feature = "acceptance-build")]
+fn official_downloaded_science_bin() -> Option<PathBuf> {
+    None
+}
+
 fn safe_science_version(path: &Path) -> Option<String> {
     let output = Command::new(path)
         .arg("--version")
@@ -291,6 +315,7 @@ fn science_runtime_preflight_for_paths(
     science_runtime_preflight_for_paths_cached(
         data_dir,
         explicit_bin,
+        None,
         app_bin,
         &ScienceVersionCache::default(),
     )
@@ -299,6 +324,7 @@ fn science_runtime_preflight_for_paths(
 fn science_runtime_preflight_for_paths_cached(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
+    official_downloaded_bin: Option<&Path>,
     app_bin: &Path,
     version_cache: &ScienceVersionCache,
 ) -> Result<Value, String> {
@@ -316,6 +342,17 @@ fn science_runtime_preflight_for_paths_cached(
             "cached_version": Value::Null,
             "download_url": SCIENCE_DOWNLOAD_URL,
         }));
+    }
+    if let Some(bin) = official_downloaded_bin {
+        if let Some(version) = version_cache.version(bin) {
+            return Ok(json!({
+                "status": "installed_ready",
+                "selected_source": ScienceRuntimeSource::OfficialDownloaded.code(),
+                "selected_version": version,
+                "cached_version": Value::Null,
+                "download_url": SCIENCE_DOWNLOAD_URL,
+            }));
+        }
     }
     if let Some(version) = version_cache.version(app_bin) {
         return Ok(json!({
@@ -346,25 +383,35 @@ fn science_runtime_preflight_for_paths_cached(
     }))
 }
 
+fn available_science_runtime_preflight(
+    version_cache: &ScienceVersionCache,
+) -> Result<Value, String> {
+    let data_dir = sandbox_data_dir();
+    let explicit = explicit_science_bin()?;
+    let official_downloaded = if explicit.is_none() {
+        official_downloaded_science_bin()
+    } else {
+        None
+    };
+    science_runtime_preflight_for_paths_cached(
+        &data_dir,
+        explicit.as_deref(),
+        official_downloaded.as_deref(),
+        Path::new(SCIENCE_BIN),
+        version_cache,
+    )
+}
+
 pub(crate) fn science_runtime_preflight(
     version_cache: &ScienceVersionCache,
     confirmed_stopped: Option<&ScienceRuntimeIdentity>,
 ) -> Result<Value, String> {
     if let Ok(cfg) = config::load_from(&config::default_dir()) {
-        if let Some(runtime) = confirmed_stopped {
-            if runtime.source != ScienceRuntimeSource::CachedOnce
-                && !loopback_port_accepts_tcp(cfg.sandbox_port)
-            {
-                if let Some(version) = version_cache.version(&runtime.path) {
-                    return Ok(json!({
-                        "status": "installed_ready",
-                        "selected_source": runtime.source.code(),
-                        "selected_version": version,
-                        "cached_version": Value::Null,
-                        "download_url": SCIENCE_DOWNLOAD_URL,
-                    }));
-                }
-            }
+        if confirmed_stopped.is_some() && !loopback_port_accepts_tcp(cfg.sandbox_port) {
+            // A stopped identity proves ownership, not future selection. Resolve
+            // candidates again so an official update that appeared since the
+            // prior stop wins over a remembered App fallback.
+            return available_science_runtime_preflight(version_cache);
         }
         let (state, runtime) = probe_sandbox_runtime_cached(cfg.sandbox_port, version_cache)?;
         if state == SandboxScienceState::RunningHealthy {
@@ -378,14 +425,7 @@ pub(crate) fn science_runtime_preflight(
             }));
         }
     }
-    let data_dir = sandbox_data_dir();
-    let explicit = explicit_science_bin()?;
-    science_runtime_preflight_for_paths_cached(
-        &data_dir,
-        explicit.as_deref(),
-        Path::new(SCIENCE_BIN),
-        version_cache,
-    )
+    available_science_runtime_preflight(version_cache)
 }
 
 #[cfg(test)]
@@ -398,6 +438,7 @@ fn select_science_runtime_for_paths(
     select_science_runtime_for_paths_cached(
         data_dir,
         explicit_bin,
+        None,
         app_bin,
         choice,
         &ScienceVersionCache::default(),
@@ -407,6 +448,7 @@ fn select_science_runtime_for_paths(
 fn select_science_runtime_for_paths_cached(
     data_dir: &Path,
     explicit_bin: Option<&Path>,
+    official_downloaded_bin: Option<&Path>,
     app_bin: &Path,
     choice: Option<&str>,
     version_cache: &ScienceVersionCache,
@@ -423,6 +465,15 @@ fn select_science_runtime_for_paths_cached(
             source: ScienceRuntimeSource::Explicit,
             version: Some(version),
         });
+    }
+    if let Some(bin) = official_downloaded_bin {
+        if let Some(version) = version_cache.version(bin) {
+            return Ok(ScienceRuntimeIdentity {
+                path: bin.to_path_buf(),
+                source: ScienceRuntimeSource::OfficialDownloaded,
+                version: Some(version),
+            });
+        }
     }
     if let Some(version) = version_cache.version(app_bin) {
         return Ok(ScienceRuntimeIdentity {
@@ -454,9 +505,15 @@ pub(crate) fn select_science_runtime_cached(
 ) -> Result<ScienceRuntimeIdentity, String> {
     let data_dir = sandbox_data_dir();
     let explicit = explicit_science_bin()?;
+    let official_downloaded = if explicit.is_none() {
+        official_downloaded_science_bin()
+    } else {
+        None
+    };
     select_science_runtime_for_paths_cached(
         &data_dir,
         explicit.as_deref(),
+        official_downloaded.as_deref(),
         Path::new(SCIENCE_BIN),
         choice,
         version_cache,
@@ -474,6 +531,15 @@ fn runtime_probe_candidates(
         )]);
     }
     let mut candidates = Vec::new();
+    if let Some(official_downloaded) = official_downloaded_science_bin() {
+        if version_cache.version(&official_downloaded).is_some() {
+            candidates.push(runtime_identity(
+                official_downloaded,
+                ScienceRuntimeSource::OfficialDownloaded,
+                version_cache,
+            ));
+        }
+    }
     let app = PathBuf::from(SCIENCE_BIN);
     if version_cache.version(&app).is_some() {
         candidates.push(runtime_identity(
@@ -834,8 +900,9 @@ mod tests {
     use std::process::{ExitStatus, Output};
 
     use super::{
-        classify_known_runtime_state, classify_sandbox_state, first_http_url, runtime_status_value,
-        sandbox_home, sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
+        classify_known_runtime_state, classify_sandbox_state, first_http_url,
+        official_downloaded_science_bin_for_home, runtime_status_value, sandbox_home,
+        sandbox_running_ours, sandbox_url, science_runtime_preflight_for_paths,
         science_runtime_preflight_for_paths_cached, science_status_running,
         select_science_runtime_for_paths, select_science_runtime_for_paths_cached,
         settings_change_needs_teardown, stop_runtime_from_probe, trusted_science_status,
@@ -901,16 +968,16 @@ mod tests {
         let cache = ScienceVersionCache::default();
 
         let preflight =
-            science_runtime_preflight_for_paths_cached(&data_dir, None, &app_bin, &cache)?;
+            science_runtime_preflight_for_paths_cached(&data_dir, None, None, &app_bin, &cache)?;
         assert_eq!(preflight["selected_version"], "claude-science cache-v1");
         let selected =
-            select_science_runtime_for_paths_cached(&data_dir, None, &app_bin, None, &cache)?;
+            select_science_runtime_for_paths_cached(&data_dir, None, None, &app_bin, None, &cache)?;
         assert_eq!(selected.version.as_deref(), Some("claude-science cache-v1"));
         assert_eq!(fs::read_to_string(&count)?, "1");
 
         write_counted_version_bin(&app_bin, &count, "claude-science cache-version-two")?;
         let selected =
-            select_science_runtime_for_paths_cached(&data_dir, None, &app_bin, None, &cache)?;
+            select_science_runtime_for_paths_cached(&data_dir, None, None, &app_bin, None, &cache)?;
         assert_eq!(
             selected.version.as_deref(),
             Some("claude-science cache-version-two")
@@ -922,6 +989,76 @@ mod tests {
             Some("claude-science cache-version-two")
         );
         assert_eq!(fs::read_to_string(&count)?, "3");
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn official_downloaded_runtime_wins_without_sharing_official_data(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let root = unique_temp_dir("science-official-downloaded-selection")?;
+        let official_home = root.join("official-home");
+        let official_bin = official_home
+            .join(".claude-science")
+            .join("bin")
+            .join("claude-science");
+        let data_dir = root.join("isolated-home").join(".claude-science");
+        let cached_bin = data_dir.join("bin").join("claude-science");
+        let app_bin = root.join("app-claude-science");
+        let isolated_marker = data_dir.join("isolated-state.txt");
+        write_fake_version_bin(&official_bin, 0o755, "fake-official-downloaded-2")?;
+        write_fake_version_bin(&app_bin, 0o755, "fake-app-1")?;
+        write_fake_version_bin(&cached_bin, 0o755, "fake-cache-3")?;
+        fs::write(&isolated_marker, "keep-isolated")?;
+        let cache = ScienceVersionCache::default();
+
+        assert_eq!(
+            official_downloaded_science_bin_for_home(&official_home).as_deref(),
+            Some(official_bin.as_path())
+        );
+        assert!(
+            official_downloaded_science_bin_for_home(std::path::Path::new("relative-home"))
+                .is_none()
+        );
+
+        let preflight = science_runtime_preflight_for_paths_cached(
+            &data_dir,
+            None,
+            Some(&official_bin),
+            &app_bin,
+            &cache,
+        )?;
+        assert_eq!(preflight["selected_source"], "official_downloaded");
+        assert_eq!(preflight["selected_version"], "fake-official-downloaded-2");
+
+        let selected = select_science_runtime_for_paths_cached(
+            &data_dir,
+            None,
+            Some(&official_bin),
+            &app_bin,
+            Some(CACHED_ONCE_CHOICE),
+            &cache,
+        )?;
+        assert_eq!(selected.path, official_bin);
+        assert_eq!(selected.source, ScienceRuntimeSource::OfficialDownloaded);
+        assert_eq!(
+            selected.version.as_deref(),
+            Some("fake-official-downloaded-2")
+        );
+        assert_eq!(fs::read_to_string(&isolated_marker)?, "keep-isolated");
+
+        fs::set_permissions(&selected.path, fs::Permissions::from_mode(0o644))?;
+        let fallback = select_science_runtime_for_paths_cached(
+            &data_dir,
+            None,
+            Some(&selected.path),
+            &app_bin,
+            None,
+            &cache,
+        )?;
+        assert_eq!(fallback.source, ScienceRuntimeSource::InstalledApp);
+        assert_eq!(fallback.version.as_deref(), Some("fake-app-1"));
+
         fs::remove_dir_all(root)?;
         Ok(())
     }

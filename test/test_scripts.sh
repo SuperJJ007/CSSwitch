@@ -84,7 +84,7 @@ FAKE_CAPTURE="$T/fake-capture"
 mkdir -p "$OUTER_HOME/.claude-science/runtime"
 mkdir -p "$OUTER_HOME/.ssh"
 printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
-printf 'Host test-only\n  HostName 127.0.0.1\n' > "$OUTER_HOME/.ssh/config"
+printf 'Host test-only second-alias test-only\n  HostName 127.0.0.1\n  Port 2222\n  User must-not-project\nHost *.wildcard !blocked\nHost=equals-alias\nhOsT lower-alias\nIdentityFile /must/not/project\n' > "$OUTER_HOME/.ssh/config"
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
 chmod +x "$FAKE_CAPTURE"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
@@ -93,13 +93,31 @@ if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CO
 SANDBOX_SSH_CONFIG="$T/vh-capture/.ssh/config"
 SANDBOX_SSH_MODE="$(stat -f '%Lp' "$SANDBOX_SSH_CONFIG" 2>/dev/null || true)"
 if [ -f "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFIG" ] && [ "$SANDBOX_SSH_MODE" = "600" ]; then ok "opt-in creates a narrow regular 0600 sandbox SSH config"; else no "opt-in did not create a safe sandbox SSH config"; fi
+EXPECTED_ALIASES="$T/expected-host-aliases"
+printf 'Host test-only\nHost second-alias\nHost equals-alias\nHost lower-alias\n' > "$EXPECTED_ALIASES"
+ACTUAL_ALIASES="$T/actual-host-aliases"
+grep '^Host ' "$SANDBOX_SSH_CONFIG" > "$ACTUAL_ALIASES" || true
+if grep -Fxq '# CSSwitch managed system SSH config bridge v2' "$SANDBOX_SSH_CONFIG" && cmp -s "$EXPECTED_ALIASES" "$ACTUAL_ALIASES"; then ok "sandbox SSH config projects literal explicit Host aliases for Science"; else no "sandbox SSH config did not project the expected Host aliases"; fi
+if ! grep -Eq 'HostName|Port|User|IdentityFile|must-not-project|must/not/project|wildcard|blocked' "$SANDBOX_SSH_CONFIG"; then ok "sandbox SSH alias projection excludes connection details and patterns"; else no "sandbox SSH alias projection copied non-alias config content"; fi
 out_ssh="$(/usr/bin/ssh -F "$SANDBOX_SSH_CONFIG" -G test-only 2>/dev/null)"; rc_ssh=$?
-if [ $rc_ssh -eq 0 ] && echo "$out_ssh" | grep -qx 'hostname 127.0.0.1'; then ok "sandbox SSH config Include resolves Host with system OpenSSH"; else no "sandbox SSH config did not resolve included Host (rc=$rc_ssh)"; fi
+if [ $rc_ssh -eq 0 ] && echo "$out_ssh" | grep -qx 'hostname 127.0.0.1' && echo "$out_ssh" | grep -qx 'port 2222'; then ok "sandbox SSH config Include resolves Host with system OpenSSH"; else no "sandbox SSH config did not resolve included Host (rc=$rc_ssh)"; fi
 if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi
 if ! echo "$out" | grep -Fq "$T/vh-capture" && ! echo "$out" | grep -Fq "$FAKE_CAPTURE"; then ok "launch log redacts sandbox and binary paths"; else no "launch log exposed sensitive paths: $out"; fi
 
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=0 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && [ ! -e "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFIG" ]; then ok "disabling SSH removes only the managed sandbox config"; else no "disabling SSH left the managed sandbox config or failed (rc=$rc): $out"; fi
+
+V1_SANDBOX="$T/vh-v1-ssh"
+mkdir -p "$V1_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v1\nInclude "%s"\n' "$OUTER_HOME/.ssh/config" > "$V1_SANDBOX/.ssh/config"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$V1_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9945 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && grep -Fxq '# CSSwitch managed system SSH config bridge v2' "$V1_SANDBOX/.ssh/config" && grep -Fxq 'Host test-only' "$V1_SANDBOX/.ssh/config"; then ok "SSH opt-in atomically migrates the managed v1 stub to v2 aliases"; else no "SSH opt-in did not migrate the managed v1 stub (rc=$rc): $out"; fi
+
+V1_REVOKE_SANDBOX="$T/vh-v1-revoke-ssh"
+mkdir -p "$V1_REVOKE_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v1\nInclude "%s"\n' "$OUTER_HOME/.ssh/config" > "$V1_REVOKE_SANDBOX/.ssh/config"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$V1_REVOKE_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=0 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9946 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -e "$V1_REVOKE_SANDBOX/.ssh/config" ]; then ok "disabling SSH still revokes a managed v1 stub"; else no "disabling SSH did not revoke the managed v1 stub (rc=$rc): $out"; fi
 
 FOREIGN_SANDBOX="$T/vh-foreign-ssh"
 mkdir -p "$FOREIGN_SANDBOX/.ssh"
@@ -112,6 +130,25 @@ mkdir -p "$FORGED_SANDBOX/.ssh"
 printf '# CSSwitch managed system SSH config bridge v1\nInclude "/different/config"\n\nHost must-survive\n' > "$FORGED_SANDBOX/.ssh/config"
 out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FORGED_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9943 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && grep -q 'Host must-survive' "$FORGED_SANDBOX/.ssh/config"; then ok "SSH opt-in preserves a forged marker with a different Include"; else no "SSH opt-in trusted or overwrote a forged marker (rc=$rc): $out"; fi
+
+FORGED_V2_SANDBOX="$T/vh-forged-v2-ssh"
+mkdir -p "$FORGED_V2_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v2\nInclude "%s"\nHost plausible\nUser must-survive\n' "$OUTER_HOME/.ssh/config" > "$FORGED_V2_SANDBOX/.ssh/config"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FORGED_V2_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9947 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && grep -q 'User must-survive' "$FORGED_V2_SANDBOX/.ssh/config"; then ok "SSH opt-in preserves a malformed v2 managed-looking config"; else no "SSH opt-in trusted or overwrote malformed v2 content (rc=$rc): $out"; fi
+
+NO_NEWLINE_V2_SANDBOX="$T/vh-no-newline-v2-ssh"
+mkdir -p "$NO_NEWLINE_V2_SANDBOX/.ssh"
+printf '# CSSwitch managed system SSH config bridge v2\nInclude "%s"\nHost must-survive' "$OUTER_HOME/.ssh/config" > "$NO_NEWLINE_V2_SANDBOX/.ssh/config"
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$NO_NEWLINE_V2_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9948 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && grep -q 'Host must-survive' "$NO_NEWLINE_V2_SANDBOX/.ssh/config"; then ok "SSH opt-in preserves a noncanonical v2 config without final newline"; else no "SSH opt-in trusted or overwrote a noncanonical v2 config (rc=$rc): $out"; fi
+
+OVERFLOW_HOME="$T/overflow-home"
+OVERFLOW_SANDBOX="$T/vh-overflow-ssh"
+mkdir -p "$OVERFLOW_HOME/.ssh"
+for index in $(seq 0 512); do printf 'Host overflow-%s\n' "$index"; done > "$OVERFLOW_HOME/.ssh/config"
+out="$(HOME="$OVERFLOW_HOME" SANDBOX_HOME="$OVERFLOW_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9949 --skip-oauth-forge 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q '无法安全提取系统 SSH Host alias' && [ ! -e "$OVERFLOW_SANDBOX/.ssh/config" ]; then ok "SSH alias projection fails closed above the alias limit"; else no "SSH alias projection accepted or hid an oversized alias set (rc=$rc): $out"; fi
 
 LINK_SANDBOX="$T/vh-linked-ssh"
 mkdir -p "$LINK_SANDBOX" "$T/ssh-link-target"

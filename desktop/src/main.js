@@ -1,5 +1,10 @@
 import { CODEX_AUTH_REASONS, formatCodexAuthCommandError, parseCodexAuthCommandError } from "./codex-auth-protocol.js";
-import { RUNTIME_STATUS_LABELS, aggregateRuntimeStatus, normalizeRuntimeLight } from "./runtime-status-state.js";
+import {
+  RUNTIME_STATUS_LABELS,
+  aggregateRuntimeStatus,
+  normalizeRuntimeLight,
+  scienceRuntimeStatusText,
+} from "./runtime-status-state.js";
 import {
   buildSimpleModelSubmission,
   mergeCatalogCandidates,
@@ -338,7 +343,7 @@ function mockInvoke(cmd, args) {
     case "science_runtime_preflight":
       return Promise.resolve(PREVIEW_RUNTIME_CACHE
         ? { status: "cached_choice_required", selected_source: null, selected_version: null, cached_version: "0.0.0-preview-cache", download_url: "https://claude.com/download" }
-        : { status: "installed_ready", selected_source: "installed_app", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
+        : { status: "installed_ready", selected_source: "official_downloaded", selected_version: "0.0.0-preview", cached_version: null, download_url: "https://claude.com/download" });
     case "install_local_skill_package":
       if (!mockImportedSkills.some((item) => item.skill_id === "demo-reader")) {
         mockImportedSkills.push({ skill_id: "demo-reader", display_name: "Demo reader", description: "刚刚从本地包导入的示例 Skill。", source_kind: "csswitch_local", bundle_name: "demo-bundle", attachment_state: "attached" });
@@ -351,9 +356,9 @@ function mockInvoke(cmd, args) {
       return Promise.resolve(null);
     case "status":
       if (QUERY.get("status") === "error") return Promise.reject(new Error("预览注入：运行状态查询失败"));
-      if (QUERY.get("status") === "partial") return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "amber" });
-      if (QUERY.get("status") === "stopped") return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber" });
-      return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "green" });
+      if (QUERY.get("status") === "partial") return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "amber", science: { runtime: { source: "official_downloaded", version: "claude-science preview" } } });
+      if (QUERY.get("status") === "stopped") return Promise.resolve({ proxy: "amber", sandbox: "amber", upstream: "amber", science: {} });
+      return Promise.resolve({ proxy: "green", sandbox: "green", upstream: "green", science: { runtime: { source: "official_downloaded", version: "claude-science preview" } } });
     case "boot_error":
       return Promise.resolve(null);
     case "app_version":
@@ -2353,8 +2358,8 @@ function showRuntimeChoice(preflight) {
   const canUseCache = preflight && preflight.status === "cached_choice_required" && !!cachedVersion;
   els.runtimeUseCacheBtn.hidden = !canUseCache;
   els.runtimeChoiceText.textContent = canUseCache
-    ? "未找到通过安全预检的 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
-    : "未找到通过安全预检的 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
+    ? "未找到通过安全预检的官方 downloaded runtime 或 Claude Science App。发现可确认版本的历史缓存：" + cachedVersion + "。你可以仅本次使用它，或前往官方页面安装 / 更新 Science。此选择不会保存。"
+    : "未找到通过安全预检的官方 downloaded runtime 或 Claude Science App，历史缓存也无法确认版本。请先从官方页面安装 / 更新 Science。";
   els.runtimeChoiceSec.hidden = false;
   runtimeChoiceActiveId = configState.active_id || null;
 }
@@ -2514,8 +2519,8 @@ async function oneClick() {
     }
     showRuntimeChoice(preflight || { status: "missing" });
     setMsg(preflight && preflight.status === "cached_choice_required"
-      ? "Claude Science App 不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
-      : "Claude Science App 不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
+      ? "官方 downloaded runtime 与 Claude Science App 均不可用或未通过预检。请选择是否仅本次使用已确认版本的缓存。"
+      : "官方 downloaded runtime 与 Claude Science App 均不可用或未通过预检，且没有可安全启动的缓存版本。", "err");
   } catch (e) {
     setMsg("Science 运行环境检查失败：" + e, "err");
   } finally {
@@ -2643,11 +2648,13 @@ async function refreshStatus() {
     setStatusText("proxyStateText", s.proxy);
     setStatusText("sandboxStateText", s.sandbox);
     setStatusText("upstreamStateText", s.upstream);
+    els.scienceRuntimeMeta.textContent = scienceRuntimeStatusText(s.science);
     els.brandDot.className = "dot " + aggregateRuntimeStatus(s, { mode, officialState: officialRuntimeState });
     setStatusRecoveryMsg(proxyRecoveryMessage(s));
   } catch (e) {
     [els.ltProxy, els.ltSandbox, els.ltUpstream].forEach((l) => setLight(l, "unknown"));
     ["proxyStateText", "sandboxStateText", "upstreamStateText"].forEach((id) => setStatusText(id, "unknown"));
+    els.scienceRuntimeMeta.textContent = "Runtime 状态读取失败；未改变官方或隔离实例。";
     els.brandDot.className = "dot gray";
   }
 }
@@ -2669,7 +2676,7 @@ function wire() {
     "metaSec", "metaName", "metaNotes", "metaSaveBtn", "metaCancelBtn",
     "themeBtn", "pageEyebrow", "pageTitle", "pageSubtitle",
     "currentProfileIcon", "currentProfileName", "currentProfileState", "currentRouteMode", "currentProfileModel", "currentProfileMeta",
-    "proxyStateText", "sandboxStateText", "upstreamStateText",
+    "proxyStateText", "sandboxStateText", "upstreamStateText", "scienceRuntimeMeta",
   ].forEach((id) => (els[id] = $(id)));
   els.panel = document.querySelector(".panel");
 

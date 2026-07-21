@@ -51,7 +51,7 @@ DMG 必须从一次性创建的空 staging 目录生成，只复制本次 clean 
 使用临时 HOME / data-dir、动态端口、假凭证验证：
 
 - Gateway ownership、启动 / 停止；
-- installed App 优先、无效 `SCIENCE_BIN` fail-closed、cache one-shot；
+- official downloaded runtime 优先、App fallback、无效 `SCIENCE_BIN` fail-closed、cache one-shot；
 - Science start / reopen / recovery / url / stop 的强 runtime identity，并确认高频 UI status 只报告 HTTP health 与已记 metadata；
 - 外部 Skill route、install / attach / load / restart / uninstall / detach；
 - 外部 Skill bridge 失败只 warning；系统 SSH 默认关闭不影响启动，但 opt-in 后缺失 / 不安全 config 或 wrapper 必须 fail closed。
