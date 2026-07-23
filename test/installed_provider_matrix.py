@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 try:
-    from _loopback_ports import FORBIDDEN_PORTS, LoopbackPortReservation
+    from _loopback_ports import FORBIDDEN_PORTS, MAX_BIND_ATTEMPTS, LoopbackPortReservation
     from provider_mock_scenarios import (
         ACTION_TYPES,
         SCHEMA as MOCK_MANIFEST_SCHEMA,
@@ -49,7 +49,7 @@ try:
         start_scenario,
     )
 except ImportError:  # ``python -m unittest test.test_...``
-    from test._loopback_ports import FORBIDDEN_PORTS, LoopbackPortReservation
+    from test._loopback_ports import FORBIDDEN_PORTS, MAX_BIND_ATTEMPTS, LoopbackPortReservation
     from test.provider_mock_scenarios import (
         ACTION_TYPES,
         SCHEMA as MOCK_MANIFEST_SCHEMA,
@@ -965,23 +965,45 @@ class InstalledProviderSession:
         self._scenario = build_case_scenario(self.case)
         self._proxy_reservation = LoopbackPortReservation()
         try:
-            self._sandbox_reservation = LoopbackPortReservation()
+            for _ in range(MAX_BIND_ATTEMPTS):
+                sandbox_reservation = LoopbackPortReservation()
+                if sandbox_reservation.port >= 65535:
+                    sandbox_reservation.release()
+                    continue
+                try:
+                    preview_reservation = LoopbackPortReservation(sandbox_reservation.port + 1)
+                except (OSError, ValueError):
+                    sandbox_reservation.release()
+                    continue
+                self._sandbox_reservation = sandbox_reservation
+                self._preview_reservation = preview_reservation
+                break
+            else:
+                raise ControllerError("could not reserve adjacent sandbox preview port")
         except Exception:
             self._proxy_reservation.release()
             raise
         self.proxy_port = self._proxy_reservation.port
         self.sandbox_port = self._sandbox_reservation.port
-        if len({self.proxy_port, self.sandbox_port}) != 2:
+        self.preview_port = self._preview_reservation.port
+        if self.preview_port != self.sandbox_port + 1 or len(
+            {self.proxy_port, self.sandbox_port, self.preview_port}
+        ) != 3:
             self._proxy_reservation.release()
             self._sandbox_reservation.release()
+            self._preview_reservation.release()
             raise ControllerError("dynamic port collision")
-        if FORBIDDEN_PORTS.intersection({self.proxy_port, self.sandbox_port}):
+        if FORBIDDEN_PORTS.intersection(
+            {self.proxy_port, self.sandbox_port, self.preview_port}
+        ):
             self._proxy_reservation.release()
             self._sandbox_reservation.release()
+            self._preview_reservation.release()
             raise ControllerError("forbidden port selected")
         if isinstance(scenario_control, InProcessScenarioControl) and not allow_test_bundle:
             self._proxy_reservation.release()
             self._sandbox_reservation.release()
+            self._preview_reservation.release()
             raise ControllerError("in-process provider mock is unit-test-only")
         self._mock = scenario_control or SubprocessScenarioControl(self._scenario, self.evidence)
         self._mock_started = False
@@ -1093,6 +1115,10 @@ with Server(("127.0.0.1", port), Handler) as server:
 set -eu
 cmd="${1:-}"
 test "$#" -eq 0 || shift
+if test "$cmd" = "--version"; then
+  printf '%s\n' 'claude-science acceptance-fixture-1'
+  exit 0
+fi
 data_dir=''
 port=''
 while test "$#" -gt 0; do
@@ -1168,11 +1194,30 @@ esac
             (self.bin_dir / "security", security_script),
             (self.bin_dir / "python3", python_tripwire),
             (server_path, server_script),
-            (self.fake_science, science_script),
         ):
             _safe_write(path, body.encode(), 0o700)
             _reject_symlink(path)
             path.chmod(0o700)
+        native_fixture = os.environ.get("CSSWITCH_ACCEPTANCE_FAKE_SCIENCE_BIN", "")
+        if native_fixture:
+            source = Path(native_fixture)
+            _reject_existing_symlink_components(source)
+            source = source.resolve(strict=True)
+            source_info = source.stat()
+            if (
+                not source.is_file()
+                or source_info.st_uid != os.getuid()
+                or stat.S_IMODE(source_info.st_mode) & 0o022
+                or not os.access(source, os.X_OK)
+                or source_info.st_size <= 0
+                or source_info.st_size > 2 * 1024 * 1024
+            ):
+                raise ControllerError("native fake Science fixture is unsafe")
+            _safe_write(self.fake_science, source.read_bytes(), 0o700)
+        else:
+            _safe_write(self.fake_science, science_script.encode(), 0o700)
+        _reject_symlink(self.fake_science)
+        self.fake_science.chmod(0o700)
         self._open_log = open_log
         self._python_tripwire = tripwire
 
@@ -1301,7 +1346,11 @@ esac
         if self._mock_started:
             raise ControllerError("mock already started")
         ready = self._mock.start()
-        if self._mock.port in {self.proxy_port, self.sandbox_port} | set(FORBIDDEN_PORTS):
+        if self._mock.port in {
+            self.proxy_port,
+            self.sandbox_port,
+            self.preview_port,
+        } | set(FORBIDDEN_PORTS):
             self._mock.stop()
             raise ControllerError("mock selected a reserved port")
         mock_pid = ready.get("owned_pid")
@@ -1344,7 +1393,7 @@ esac
     def prepare_dry_run(self) -> Dict[str, Any]:
         reservation = LoopbackPortReservation()
         try:
-            if reservation.port in {self.proxy_port, self.sandbox_port}:
+            if reservation.port in {self.proxy_port, self.sandbox_port, self.preview_port}:
                 raise ControllerError("dry-run mock port collision")
             mock_base = f"http://127.0.0.1:{reservation.port}"
             self._write_config(mock_base)
@@ -1443,6 +1492,7 @@ esac
             "gateway_executable": str(self.gateway_bin),
             "proxy_port": self.proxy_port,
             "sandbox_port": self.sandbox_port,
+            "preview_port": self.preview_port,
             "mock_base_url": mock_base,
             "adapter": self.case.adapter,
             "shim": self.case.shim,
@@ -1462,6 +1512,7 @@ esac
             raise ControllerError("refusing port release while preflight is blocked")
         self._proxy_reservation.release()
         self._sandbox_reservation.release()
+        self._preview_reservation.release()
 
     def mock_phases(self) -> List[Dict[str, Any]]:
         counts: Dict[str, int] = {}
@@ -1943,7 +1994,12 @@ esac
     def verify_cleanup(self) -> Dict[str, Any]:
         self._proxy_reservation.release()
         self._sandbox_reservation.release()
-        ports = {"proxy": self.proxy_port, "sandbox": self.sandbox_port}
+        self._preview_reservation.release()
+        ports = {
+            "proxy": self.proxy_port,
+            "sandbox": self.sandbox_port,
+            "preview": self.preview_port,
+        }
         if self._mock_started:
             ports["mock"] = self._mock.port
         port_results = {name: self._port_closed(port) for name, port in ports.items()}
@@ -2068,6 +2124,7 @@ esac
             self._mock_stopped = True
         self._proxy_reservation.release()
         self._sandbox_reservation.release()
+        self._preview_reservation.release()
 
     def __enter__(self) -> "InstalledProviderSession":
         return self

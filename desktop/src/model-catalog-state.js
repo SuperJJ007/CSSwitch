@@ -316,10 +316,31 @@ export function buildSimpleModelSubmission(fields, options = {}) {
     && previousSonnet;
   const sonnetRef = preserveSonnet ? routeReference(previousSonnet) : defaultRef;
 
-  // 简化 UI 只投影四个 role，但不能因一次编辑静默删除历史额外 route。
+  const routeKey = (route) => route?.selector_id
+    ? `selector:${route.selector_id}`
+    : route?.upstream_model
+      ? `upstream:${route.upstream_model}`
+      : "";
+  const previousBoundKeys = new Set(Object.values(preferred)
+    .map((reference) => routeByReference(existingRoutes, reference))
+    .map(routeKey)
+    .filter(Boolean));
+  const finalCatalog = [...selectedRoutes, ...existingRoutes];
+  const finalBoundKeys = new Set([defaultRef, sonnetRef, qualityRef, fastRef, fableRef]
+    .map((reference) => routeByReference(finalCatalog, reference))
+    .map(routeKey)
+    .filter(Boolean));
+
+  // 简化 UI 只投影四个 role。连接编辑时，用户明确替换掉的旧绑定应从
+  // Science 白名单移除；从未被绑定的历史额外 route 仍原样保留。
   for (const existing of existingRoutes) {
     const route = simplifiedRoute(existing, existing.upstream_model);
-    const key = route.selector_id ? `selector:${route.selector_id}` : `upstream:${route.upstream_model}`;
+    const key = routeKey(route);
+    if (options.prune_replaced_bindings === true
+        && previousBoundKeys.has(key)
+        && !finalBoundKeys.has(key)) {
+      continue;
+    }
     if (!selectedKeys.has(key)) {
       selectedKeys.add(key);
       selectedRoutes.push(route);

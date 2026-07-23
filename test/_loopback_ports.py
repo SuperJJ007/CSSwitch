@@ -42,8 +42,21 @@ def bind_http_server(server_type, handler_type):
 
 
 class LoopbackPortReservation:
-    def __init__(self):
-        self._socket = bind_loopback_listener(backlog=1)
+    def __init__(self, port=None):
+        if port is None:
+            self._socket = bind_loopback_listener(backlog=1)
+        else:
+            if not isinstance(port, int) or not (1 <= port <= 65535) or port in FORBIDDEN_PORTS:
+                raise ValueError("invalid exact loopback reservation port")
+            self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self._socket.bind(("127.0.0.1", port))
+                self._socket.listen(1)
+            except Exception:
+                self._socket.close()
+                self._socket = None
+                raise
         self.port = self._socket.getsockname()[1]
 
     def release(self):

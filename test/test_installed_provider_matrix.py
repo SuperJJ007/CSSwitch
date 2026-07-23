@@ -3,11 +3,13 @@ import os
 import plistlib
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock as mocklib
 
 import test.installed_provider_matrix as controller_module
@@ -30,7 +32,11 @@ from test.installed_provider_matrix import (
     _scrub_error,
     build_case_scenario,
 )
-from test.model_catalog_coverage_acceptance import strict_route_checks
+from test.model_catalog_coverage_acceptance import (
+    require_acceptance_bundle,
+    strict_route_checks,
+    v3_fixture,
+)
 
 
 class FakeInspector:
@@ -60,12 +66,26 @@ class FakeInspector:
 class FakePortReservation:
     next_port = 43100
 
-    def __init__(self):
-        self.port = type(self).next_port
-        type(self).next_port += 1
+    def __init__(self, port=None):
+        if port is None:
+            self.port = type(self).next_port
+            type(self).next_port += 1
+        else:
+            self.port = port
+            type(self).next_port = max(type(self).next_port, port + 1)
 
     def release(self):
         return None
+
+
+class PreviewValueErrorOnceReservation(FakePortReservation):
+    raised = False
+
+    def __init__(self, port=None):
+        if port is not None and not type(self).raised:
+            type(self).raised = True
+            raise ValueError("reserved preview port")
+        super().__init__(port)
 
 
 class InstalledProviderMatrixTests(unittest.TestCase):
@@ -106,6 +126,21 @@ class InstalledProviderMatrixTests(unittest.TestCase):
                 build_case_scenario(CASE_DEFINITIONS[case])
             ),
         )
+
+    def test_coverage_fixture_is_legal_v3_and_bundle_id_is_run_scoped(self):
+        fixture = v3_fixture(SimpleNamespace(proxy_port=43191, sandbox_port=43192))
+        self.assertEqual(fixture["schema_version"], 3)
+        self.assertEqual(fixture["profiles"][0]["model_policy"], "optional_fixed")
+        self.assertEqual(
+            require_acceptance_bundle(self.app_bundle, EXPECTED_BUNDLE_ID)[
+                "CFBundleIdentifier"
+            ],
+            EXPECTED_BUNDLE_ID,
+        )
+        coverage_source = Path(controller_module.__file__).with_name(
+            "model_catalog_coverage_acceptance.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("stopped_science = session.stop_fake_science()", coverage_source)
 
     def test_required_case_catalog_and_composed_phase_contract(self):
         self.assertTrue(
@@ -162,6 +197,18 @@ class InstalledProviderMatrixTests(unittest.TestCase):
         self.addCleanup(session.close)
         self.assertEqual(session.csswitch_dir, session.home / ".csswitch-acceptance")
 
+    def test_preview_value_error_retries_adjacent_port_reservation(self):
+        PreviewValueErrorOnceReservation.raised = False
+        with mocklib.patch.object(
+            controller_module,
+            "LoopbackPortReservation",
+            PreviewValueErrorOnceReservation,
+        ):
+            session = self._session("qwen-chat")
+        self.addCleanup(session.close)
+        self.assertTrue(PreviewValueErrorOnceReservation.raised)
+        self.assertEqual(session.preview_port, session.sandbox_port + 1)
+
     def test_controller_rejects_arbitrary_data_root_names(self):
         with self.assertRaisesRegex(ControllerError, "unsupported config data root"):
             InstalledProviderSession(
@@ -184,6 +231,12 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             self.assertNotEqual(config["proxy_port"], 8765)
             self.assertNotEqual(config["sandbox_port"], 8765)
             self.assertNotEqual(config["proxy_port"], config["sandbox_port"])
+            self.assertEqual(session.preview_port, session.sandbox_port + 1)
+            dry_run_mock_port = int(plan["mock_base_url"].rsplit(":", 1)[1])
+            self.assertNotIn(
+                session.preview_port,
+                {session.proxy_port, dry_run_mock_port},
+            )
             for directory in (
                 session.root,
                 session.home,
@@ -203,6 +256,22 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             ):
                 self.assertFalse(wrapper.is_symlink())
                 self.assertEqual(stat.S_IMODE(wrapper.stat().st_mode), 0o700)
+            version = subprocess.run(
+                [session.fake_science, "--version"],
+                check=False,
+                env={"HOME": str(session.home), "PATH": "/usr/bin:/bin"},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                # A newly materialized executable can spend several seconds in
+                # macOS launch/security checks while the full loopback suite is
+                # under load. Keep a bounded hang detector without making that
+                # cold-start latency a release-gate flake.
+                timeout=10,
+            )
+            self.assertEqual(version.returncode, 0)
+            self.assertEqual(version.stdout.strip(), "claude-science acceptance-fixture-1")
+            self.assertEqual(version.stderr, "")
             encoded = json.dumps(plan, sort_keys=True)
             self.assertNotIn(FIXED_PATH_SECRET, encoded)
             self.assertNotIn(FAKE_API_KEY, encoded)
@@ -395,7 +464,9 @@ class InstalledProviderMatrixTests(unittest.TestCase):
             session.prepare_dry_run()
             result = session.verify_cleanup()
             self.assertTrue(result["ok"])
-            self.assertEqual(set(result["ports_closed"]), {"proxy", "sandbox"})
+            self.assertEqual(
+                set(result["ports_closed"]), {"proxy", "sandbox", "preview"}
+            )
             self.assertNotIn(8765, (session.proxy_port, session.sandbox_port))
 
     def test_cleanup_accepts_stopped_fake_science_empty_state_but_rejects_partial_state(self):

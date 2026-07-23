@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.8.2] — 2026-07-23
+
+### Fixed
+
+- Made the isolated Claude Science SSH preflight consume concrete authorized Host aliases instead of relying on a cross-HOME OpenSSH Include that Science skips.
+- Kept OpenCode Go `kimi-k3` consistent across saved profiles, Science selectors, `/v1/models`, and the final upstream route instead of retaining stale `kimi-k2.6` entries.
+- Repaired the isolated old-to-new coverage-install acceptance so the old Gateway health phase, replacement, migrated catalog, strict routes, and cleanup complete in one run.
+- Prefer a validated, content-addressed snapshot of the official updater executable for new third-party Science launches, keeping Science data isolated while avoiding the stale `/Applications` seed runtime.
+- Added collision-safe, bidirectional compatibility for Claude Science's `python` tool name so Codex no longer rejects full tool-bearing conversations as a generic 502.
+- Let the first Codex model-catalog request use the existing bounded refresh/retry budget instead of failing after 400 ms, so switching from official mode to third-party Codex no longer requires a second click. Static provider catalogs retain the short local timeout, and catalog failures are now reported as `catalog_verify`.
+
+### Known limitation
+
+- Third-party Science still runs with `--no-auto-update`; its Settings update action cannot apply an update. Update through the official Science runtime first, then stop and restart the CSSwitch-managed chain so the validated updater executable can be adopted.
+
 ## [0.8.1] — 2026-07-20
 
 ### Added

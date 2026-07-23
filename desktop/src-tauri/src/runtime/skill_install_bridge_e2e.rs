@@ -8,6 +8,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use super::{merge_registrations, INSTALL_SERVER_NAME, MANAGED_MARKER};
 use crate::runtime::external_skill_route::ensure_route_skill;
@@ -1825,6 +1826,25 @@ fn wait_log_contains(path: &Path, needle: &str) {
     panic!("Science 日志未在有界等待内出现：{needle}");
 }
 
+fn wait_data_logs_contain(data_dir: &Path, needle: &str) {
+    for _ in 0..900 {
+        let found = fs::read_dir(data_dir.join("logs"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+            .any(|entry| {
+                fs::read_to_string(entry.path()).is_ok_and(|content| content.contains(needle))
+            });
+        if found {
+            return;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    panic!("Science 日志未出现预期安全事件：{needle}");
+}
+
 #[test]
 #[ignore = "explicit installed Science local-MCP dialogue E2E; temp HOME/data-dir, public GitHub, local mock/browser only"]
 fn isolated_science_installs_attaches_and_persists_external_skill() {
@@ -1891,6 +1911,10 @@ fn isolated_science_installs_attaches_and_persists_external_skill() {
             modified_seconds: metadata.mtime(),
             modified_nanoseconds: metadata.mtime_nsec(),
             mode: metadata.mode(),
+            sha256: Sha256::digest(fs::read(&science_bin).unwrap())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         },
         home: sandbox_home.clone(),
         data_dir: data_dir.clone(),
@@ -2181,8 +2205,8 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
 
     let provider = ModelAliasProvider::start(vec![
         (
-            "claude-csswitch-codex-stage0-old-a".into(),
-            "Stage0 Codex Old A".into(),
+            "claude-csswitch-opencode-go-kimi-k2-6-old".into(),
+            "Stage0 Kimi K2.6".into(),
         ),
         (
             "claude-csswitch-codex-stage0-old-b".into(),
@@ -2224,28 +2248,34 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
 
     let old_chat = open_chat(&mut guard).unwrap();
     let old_catalog = open_model_catalog(&guard, &old_chat).unwrap();
-    assert!(old_catalog.contains("Stage0 Codex Old A"), "{old_catalog}");
+    assert!(old_catalog.contains("Stage0 Kimi K2.6"), "{old_catalog}");
     assert!(old_catalog.contains("Stage0 Codex Old B"), "{old_catalog}");
 
     let static_models: Vec<(String, String)> = (1..=6)
         .map(|index| {
-            let upstream = format!("stage0-model-{index}");
+            let upstream = if index == 1 {
+                "kimi-k3".to_string()
+            } else {
+                format!("stage0-model-{index}")
+            };
             (
-                crate::model_catalog::selector_id_v1("qwen", &upstream),
-                format!("Stage0 Qwen Model {index}"),
+                crate::model_catalog::selector_id_v1("opencode-go-openai", &upstream),
+                if index == 1 {
+                    "Stage0 Kimi K3".to_string()
+                } else {
+                    format!("Stage0 OpenCode Model {index}")
+                },
             )
         })
         .collect();
+    let k3_alias = static_models[0].0.clone();
     let selected_alias = static_models[4].0.clone();
     let gets_before_hot_replace = provider.snapshot().model_gets;
     provider.replace_models(static_models.clone());
     let hot_chat = open_chat(&mut guard).unwrap();
     let hot_catalog = open_model_catalog(&guard, &hot_chat).unwrap();
-    assert!(hot_catalog.contains("Stage0 Codex Old A"), "{hot_catalog}");
-    assert!(
-        !hot_catalog.contains("Stage0 Qwen Model 1"),
-        "{hot_catalog}"
-    );
+    assert!(hot_catalog.contains("Stage0 Kimi K2.6"), "{hot_catalog}");
+    assert!(!hot_catalog.contains("Stage0 Kimi K3"), "{hot_catalog}");
     assert_eq!(
         provider.snapshot().model_gets,
         gets_before_hot_replace,
@@ -2264,7 +2294,7 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
 
     let new_chat = open_chat(&mut guard).unwrap();
     let new_catalog = open_model_catalog(&guard, &new_chat).unwrap();
-    assert!(!new_catalog.contains("Stage0 Codex Old A"), "{new_catalog}");
+    assert!(!new_catalog.contains("Stage0 Kimi K2.6"), "{new_catalog}");
     assert!(!new_catalog.contains("Stage0 Codex Old B"), "{new_catalog}");
     for (_, display_name) in &static_models {
         assert!(
@@ -2272,10 +2302,38 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
             "{display_name}: {new_catalog}"
         );
     }
-    click(&guard, &new_catalog, "Stage0 Qwen Model 5").unwrap();
+    click(&guard, &new_catalog, "Stage0 Kimi K3").unwrap();
+    let k3_selected = wait_chat_idle(&guard, 40).unwrap();
+    assert!(
+        k3_selected.contains("Model: Stage0 Kimi K3"),
+        "{k3_selected}"
+    );
+    send_prompt(&guard, &k3_selected, "stage0 kimi k3 selected route").unwrap();
+    for _ in 0..300 {
+        if provider
+            .snapshot()
+            .requested_models
+            .iter()
+            .any(|model| model == &k3_alias)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    let k3_chat = wait_chat_idle(&guard, 40).unwrap();
+    assert!(
+        provider
+            .snapshot()
+            .requested_models
+            .iter()
+            .any(|model| model == &k3_alias),
+        "Science did not send its displayed K3 selector"
+    );
+    let new_catalog = open_model_catalog(&guard, &k3_chat).unwrap();
+    click(&guard, &new_catalog, "Stage0 OpenCode Model 5").unwrap();
     let selected = wait_chat_idle(&guard, 40).unwrap();
     assert!(
-        selected.contains("Model: Stage0 Qwen Model 5"),
+        selected.contains("Model: Stage0 OpenCode Model 5"),
         "{selected}"
     );
     send_prompt(&guard, &selected, "stage0 model alias round trip").unwrap();
@@ -2299,12 +2357,146 @@ fn isolated_science_accepts_many_csswitch_aliases_and_refreshes_after_restart() 
             .any(|model| model == &selected_alias),
         "{observation:?}"
     );
+    assert!(
+        observation
+            .requested_models
+            .iter()
+            .any(|model| model == &k3_alias),
+        "{observation:?}"
+    );
 
     guard.stop();
     drop(provider);
     let stderr = fs::read_to_string(science_stderr).unwrap_or_default();
     assert!(!stderr.contains("ANTHROPIC_API_KEY"));
     assert!(!stderr.contains("CLAUDE_CODE_OAUTH_TOKEN"));
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+#[ignore = "explicit installed Science SSH preflight E2E; temp outer HOME/data-dir and fixture aliases only"]
+fn isolated_science_registers_csswitch_managed_ssh_hosts_and_revoke_restores_toml() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert_eq!(
+        std::env::var("CSSWITCH_REAL_SCIENCE_SSH_E2E").as_deref(),
+        Ok("1"),
+        "必须显式设置 CSSWITCH_REAL_SCIENCE_SSH_E2E=1"
+    );
+
+    let root = temp_dir("real-ssh-preflight");
+    let outer_home = root.join("outer-home");
+    let sandbox_home = root.join("sandbox/home");
+    let data_dir = sandbox_home.join(".claude-science");
+    let safe_bin = prepare_safe_bin(&sandbox_home);
+    fs::create_dir_all(outer_home.join(".ssh")).unwrap();
+    fs::create_dir_all(&data_dir).unwrap();
+    fs::write(
+        outer_home.join(".ssh/config"),
+        "Host science-ssh-fixture\n  HostName 127.0.0.1\n  Port 9\n",
+    )
+    .unwrap();
+    fs::write(
+        data_dir.join("config.toml"),
+        "# preserve this setting\ndebug = true\nquiet_logs = false\nssh_hosts = [\"preexisting-host\"]\n\n[conda]\nauto_install = false\n",
+    )
+    .unwrap();
+    fs::set_permissions(
+        data_dir.join("config.toml"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    crate::oauth_forge::ensure_virtual_login(&data_dir, "virtual@localhost.invalid", &sandbox_home)
+        .unwrap();
+
+    let managed =
+        crate::runtime::ssh_bridge::prepare_science_ssh_bridge_for(&sandbox_home, &outer_home)
+            .unwrap();
+    assert_eq!(managed, ["science-ssh-fixture"]);
+    let prepared = fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    assert!(prepared.contains("preexisting-host"));
+    assert!(prepared.contains("science-ssh-fixture"));
+    assert!(prepared.contains("# preserve this setting"));
+
+    let science_bin =
+        PathBuf::from("/Applications/Claude Science.app/Contents/Resources/bin/claude-science")
+            .canonicalize()
+            .unwrap();
+    let playwright =
+        PathBuf::from("/Users/superjj/.codex/skills/playwright/scripts/playwright_cli.sh");
+    let provider = ModelAliasProvider::start(vec![(
+        "claude-csswitch-ssh-fixture-model".into(),
+        "SSH Fixture Model".into(),
+    )]);
+    let launch =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/launch-virtual-sandbox.sh");
+    let (port, preview_port) = loop {
+        let candidate = free_port();
+        let Some(preview) = candidate.checked_add(1) else {
+            continue;
+        };
+        if candidate != 8765 && preview != 8765 && TcpListener::bind(("127.0.0.1", preview)).is_ok()
+        {
+            break (candidate, preview);
+        }
+    };
+    let output = Command::new("zsh")
+        .arg(&launch)
+        .arg("--port")
+        .arg(port.to_string())
+        .arg("--skip-oauth-forge")
+        .env("HOME", &outer_home)
+        .env("SANDBOX_HOME", &sandbox_home)
+        .env("SCIENCE_BIN", &science_bin)
+        .env("CSSWITCH_RUNTIME_VERSION_PRECHECKED", "1")
+        .env("CSSWITCH_PROXY_URL", provider.base_url())
+        .env("CSSWITCH_REUSE_SYSTEM_SSH", "1")
+        .env("CSSWITCH_SYSTEM_SSH_HOSTS", managed.join(" "))
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_port(port);
+    let mut guard = ScienceGuard {
+        science_bin,
+        sandbox_home: sandbox_home.clone(),
+        safe_bin,
+        data_dir: data_dir.clone(),
+        child: None,
+        gateway_child: None,
+        install_bridge: root.join("unused-install-bridge"),
+        playwright,
+        session: format!("csswitch-ssh-preflight-{}", std::process::id()),
+        workdir: root.join("unused-browser-workdir"),
+        browser_open: false,
+        port,
+    };
+    assert_ne!(preview_port, 8765);
+    let stub = fs::read_to_string(sandbox_home.join(".ssh/config")).unwrap();
+    assert!(stub.contains("Host science-ssh-fixture"));
+    assert!(!stub.contains("HostName"));
+    assert!(!stub.contains("IdentityFile"));
+    wait_data_logs_contain(&data_dir, "registered SSH compute provider (env)");
+    wait_data_logs_contain(&data_dir, "science-ssh-fixture");
+    fs::create_dir_all(&guard.workdir).unwrap();
+    let chat = open_chat(&mut guard).unwrap();
+    click(&guard, &chat, "button \"Customize\"").unwrap();
+    let customize = wait_control(&guard, "button \"Compute\"", 40).unwrap();
+    click(&guard, &customize, "button \"Compute\"").unwrap();
+    let compute = wait_control(&guard, "science-ssh-fixture", 40).unwrap();
+    assert!(compute.contains("science-ssh-fixture"), "{compute}");
+
+    guard.stop_science();
+    crate::runtime::ssh_bridge::revoke_science_ssh_bridge(&sandbox_home).unwrap();
+    let revoked = fs::read_to_string(data_dir.join("config.toml")).unwrap();
+    assert!(revoked.contains("# preserve this setting"));
+    assert!(revoked.contains("preexisting-host"));
+    assert!(!revoked.contains("science-ssh-fixture"));
+    guard.stop();
+    drop(provider);
     let _ = fs::remove_dir_all(root);
 }
 

@@ -55,6 +55,7 @@ pub struct ScienceExecutableFingerprint {
     pub modified_seconds: i64,
     pub modified_nanoseconds: i64,
     pub mode: u32,
+    pub sha256: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]

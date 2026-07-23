@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.8.1"
+version = "0.8.2"
 description = "CSSwitch 菜单栏 app（进程管家 + 配置面板）"
 authors = ["CSSwitch"]
 edition = "2021"
@@ -32,6 +32,8 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+glob = "0.3"
+toml_edit = "0.25.12"
 # 虚拟 OAuth 伪造器（Rust 原生，去 node 依赖 —— 见 src/oauth_forge.rs）。
 # 纯 RustCrypto，全部编进二进制，不引外部运行时。与 .mjs 的 v2 GCM 格式字节兼容
 # （由 oauth_forge.rs 内 tests 的 node↔rust 双向对拍单测保证）。

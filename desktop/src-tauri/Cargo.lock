@@ -818,12 +818,13 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
  "csswitch-codex-network",
  "csswitch-skill-install-core",
+ "glob",
  "hkdf",
  "libc",
  "serde",
@@ -834,6 +835,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "toml_edit 0.25.12+spec-1.1.0",
 ]
 
 [[package]]
@@ -4281,6 +4283,7 @@ dependencies = [
  "indexmap 2.14.0",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.3",
 ]
 

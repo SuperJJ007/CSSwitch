@@ -13,6 +13,7 @@ use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::{active_org, ScienceExecutableFingerprint, ScienceHostContext, AGENT_NAME};
 
@@ -348,17 +349,50 @@ fn executable_fingerprint(path: &Path) -> Option<ScienceExecutableFingerprint> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let metadata = fs::metadata(path).ok()?;
-        if !metadata.is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .ok()?;
+        let before = file.metadata().ok()?;
+        if !before.is_file() || before.permissions().mode() & 0o111 == 0 {
+            return None;
+        }
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer).ok()?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let after = file.metadata().ok()?;
+        let current = path.symlink_metadata().ok()?;
+        if current.file_type().is_symlink()
+            || before.dev() != after.dev()
+            || before.ino() != after.ino()
+            || before.size() != after.size()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.mode() != after.mode()
+            || after.dev() != current.dev()
+            || after.ino() != current.ino()
+        {
             return None;
         }
         Some(ScienceExecutableFingerprint {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            size: metadata.size(),
-            modified_seconds: metadata.mtime(),
-            modified_nanoseconds: metadata.mtime_nsec(),
-            mode: metadata.mode(),
+            device: after.dev(),
+            inode: after.ino(),
+            size: after.size(),
+            modified_seconds: after.mtime(),
+            modified_nanoseconds: after.mtime_nsec(),
+            mode: after.mode(),
+            sha256: digest
+                .finalize()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect(),
         })
     }
     #[cfg(not(unix))]

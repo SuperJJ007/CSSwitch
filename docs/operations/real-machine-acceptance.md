@@ -125,9 +125,9 @@ RM-01～RM-34 保留历史编号；Codex 场景从 RM-35 继续，0.8.1 新增 p
 | RM-16 | 重启恢复 | 同一隔离 HOME 重开 | profiles / active / notes / ports 持久；不自动启动；恢复不能仅凭端口冒认 runtime |
 | RM-17 | 包资源 | 从 `.app` 与挂载 DMG 启动 | `Contents/MacOS/{desktop,csswitch-gateway}` 与 `Contents/Resources/scripts` 齐全；无旧 `Resources/proxy`；正式包无需 `CSSWITCH_REPO` |
 | RM-18 | 发布安全 | hash、codesign、spctl、stapler | 签名完整性、身份、公证、ticket、Gatekeeper 分栏；不把 ad-hoc 写成已公证 |
-| RM-19 | installed App 优先 | App 与 stale cache 同时存在 | 选择 App executable，复用原 data-dir，cache 不被改写 |
-| RM-20 | explicit / cache preflight | 合法 / 非法 `SCIENCE_BIN`，App 缺失与 cache 组合 | override 无效 fail closed；cache 仅版本可读时提供 one-shot；选择不持久化 |
-| RM-21 | Science 升级与强身份 | 替换测试 App 后 stopped-to-started；再恢复 / stop | 新 executable + 原 data-dir；启动 / 恢复 / stop 核对 PID、binary、data-dir、port；UI status 仍只代表 HTTP health |
+| RM-19 | updater runtime 优先 | 固定真实 HOME updater、App 与 stale 隔离 cache 同时存在 | 通过路径、属主、权限、Mach-O、embedded identity 校验后生成 CSSwitch 私有 SHA-256 snapshot，选择来源 `official_updated` 并复用 CSSwitch data-dir；只读取固定 executable，不读取或改写真实 HOME 的其他 Science 数据；不得把 embedded metadata 写成官方来源密码学证明 |
+| RM-20 | explicit / updater / cache preflight | 合法 / 非法 `SCIENCE_BIN`，身份/权限/路径合法与非法的 updater，App 缺失与 cache 组合 | override 无效 fail closed；检测到非法 updater 时显式报错，不静默回退旧 App；cache 仅版本可读时提供 one-shot；选择不持久化 |
+| RM-21 | Science 升级与强身份 | stopped-to-started 前加入新 updater runtime；再恢复 / stop；运行中替换 source candidate；模拟 stop CLI 返回 0 但 listener 未退出 | 新 snapshot + 原隔离 data-dir；启动 / 恢复 / stop 核对 PID、含 SHA-256 的 binary fingerprint、data-dir、port；运行中替换 source 不影响当前 snapshot，停止后下次启动选择新 snapshot；CLI 假成功时只终止前后均精确匹配的 PID并确认端口关闭；UI status 仍只代表 HTTP health |
 | RM-22 | Skill Agent 控制面 | 首次配置、重复启动、注入中途失败 | 管理固定 route / connector / `customize` / prompt；成功 marker 后跳过重复；失败 warning 且如实报告可能的部分配置 |
 | RM-23 | 外部 Skill 安装 | 精确公开 GitHub URL | connector -> host approval -> commit -> native attach -> `skill()` load，各阶段分开记录 |
 | RM-24 | Skill 重启 / 卸载 | 同 data-dir 重启，再卸载 | 重启仍 load；只 quarantine 有 marker 的导入；native detach；不走 catalog / shell |

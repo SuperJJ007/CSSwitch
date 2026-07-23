@@ -1,3 +1,4 @@
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -13,9 +14,10 @@ use crate::runtime::proxy_lifecycle::{
     current_skill_install_bridge_key, ensure_proxy, skill_install_bridge_dir,
 };
 use crate::runtime::science::{
-    probe_known_runtime, probe_sandbox_runtime_cached, sandbox_data_dir, sandbox_home,
-    sandbox_listener_matches_runtime, sandbox_url, select_science_runtime_cached, stop_sandbox,
-    SandboxScienceState, ScienceRuntimeIdentity, ScienceRuntimeSource,
+    probe_known_runtime, probe_sandbox_runtime_cached, runtime_identity_is_current,
+    sandbox_data_dir, sandbox_home, sandbox_listener_matches_runtime, sandbox_url,
+    select_science_runtime_cached, stop_sandbox, SandboxScienceState, ScienceRuntimeIdentity,
+    ScienceRuntimeSource,
 };
 use crate::runtime::skill_install_bridge::{
     configure_third_party_after_science_start, inspect_while_science_running,
@@ -90,19 +92,42 @@ fn append_installer_note(mut message: String, status: &RegistrationStatus) -> St
     message
 }
 
+fn validate_running_system_ssh_bridge<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    sandbox_home: &Path,
+) -> Result<(), String> {
+    let expected_hosts = crate::runtime::ssh_bridge::validate_science_ssh_bridge(sandbox_home)?;
+    crate::runtime::settings::validate_managed_sandbox_ssh_stub(sandbox_home, &expected_hosts)?;
+    let root = asset_root(app).ok_or("找不到打包的 CSSwitch SSH bridge")?;
+    let wrapper_dir = root.join("scripts/ssh-bridge");
+    let wrapper = wrapper_dir.join("ssh");
+    for path in [&root, &root.join("scripts"), &wrapper_dir, &wrapper] {
+        let metadata = std::fs::symlink_metadata(path)
+            .map_err(|_| "打包的 CSSwitch SSH bridge 缺失或无法检查")?;
+        if metadata.file_type().is_symlink() {
+            return Err("打包的 CSSwitch SSH bridge 路径包含符号链接".into());
+        }
+    }
+    let metadata =
+        std::fs::symlink_metadata(&wrapper).map_err(|_| "打包的 CSSwitch SSH bridge 缺失")?;
+    if !metadata.file_type().is_file()
+        || metadata.len() > 128 * 1024
+        || metadata.permissions().mode() & 0o111 == 0
+    {
+        return Err("打包的 CSSwitch SSH bridge 不是安全的可执行文件".into());
+    }
+    Ok(())
+}
+
 fn verify_gateway_model_catalog(
     port: u16,
     secret: &str,
     profile: &config::Profile,
 ) -> Result<(), String> {
-    let (status, body) = proc::http_get_body_cancellable(
-        port,
-        Some(secret),
-        "/v1/models",
-        operation::LOCAL_HEALTH_TIMEOUT_MS,
-        None,
-    )
-    .ok_or("gateway 模型目录探活无响应")?;
+    let timeout_ms = gateway_model_catalog_timeout_ms(profile);
+    let (status, body) =
+        proc::http_get_body_cancellable(port, Some(secret), "/v1/models", timeout_ms, None)
+            .ok_or("gateway 模型目录探活无响应")?;
     if status != 200 {
         return Err(format!("gateway 模型目录探活返回 {status}"));
     }
@@ -134,6 +159,41 @@ fn verify_gateway_model_catalog(
         return Err("gateway 模型目录与已提交白名单/default selector 不一致".into());
     }
     Ok(())
+}
+
+fn gateway_model_catalog_timeout_ms(profile: &config::Profile) -> u64 {
+    if profile.model_policy == crate::provider_contracts::ModelPolicy::DynamicCatalog {
+        operation::CODEX_MODELS_PROBE_TIMEOUT_MS
+    } else {
+        operation::LOCAL_HEALTH_TIMEOUT_MS
+    }
+}
+
+fn verify_gateway_model_catalog_traced(
+    trace: &OperationTrace,
+    port: u16,
+    secret: &str,
+    profile: &config::Profile,
+) -> Result<(), String> {
+    trace.stage(
+        OperationStage::CatalogVerify,
+        format!(
+            "start policy={:?} timeout_ms={}",
+            profile.model_policy,
+            gateway_model_catalog_timeout_ms(profile)
+        ),
+    );
+    match verify_gateway_model_catalog(port, secret, profile) {
+        Ok(()) => {
+            trace.stage(OperationStage::CatalogVerify, "outcome=ok");
+            Ok(())
+        }
+        Err(error) => {
+            trace.stage(OperationStage::CatalogVerify, "outcome=error");
+            trace.finish("error=catalog_verify");
+            Err(error)
+        }
+    }
 }
 
 fn configure_third_party_best_effort<R: Runtime>(
@@ -194,6 +254,12 @@ pub(crate) fn force_third_party_reconcile<R: Runtime>(
 
     let (science_state, running_runtime) = match remembered_runtime {
         Some(mut runtime) => {
+            if !runtime_identity_is_current(&runtime) {
+                invalidate_route_configuration(&data_dir)?;
+                return Ok(
+                    "Science 二进制文件已变化；已安排下次停止并启动后重新选择 runtime。".into(),
+                );
+            }
             let previous_version = runtime.version.clone();
             let refreshed = version_cache
                 .force_refresh(&runtime.path)
@@ -433,6 +499,9 @@ fn one_click_login_with_options<R: Runtime>(
             let login_intact =
                 oauth_forge::login_intact(&auth_dir, "virtual@localhost.invalid", &sbx_home);
             if login_intact && science_binding_matches {
+                if cfg.reuse_system_ssh {
+                    validate_running_system_ssh_bridge(&app, &sbx_home)?;
+                }
                 oauth_forge::bootstrap_marker_for_intact_login(
                     &auth_dir,
                     "virtual@localhost.invalid",
@@ -447,7 +516,12 @@ fn one_click_login_with_options<R: Runtime>(
                     Some(&trace),
                     auth_proof,
                 )?;
-                verify_gateway_model_catalog(cfg.proxy_port, &secret, active_profile)?;
+                verify_gateway_model_catalog_traced(
+                    &trace,
+                    cfg.proxy_port,
+                    &secret,
+                    active_profile,
+                )?;
                 let installer_bridge = skill_install_bridge_dir(&secret)?;
                 // Science 已在运行时只读检查，不并发改写它的 MCP 配置。
                 let installer = match current_skill_install_bridge_key() {
@@ -653,6 +727,13 @@ fn one_click_login_with_options<R: Runtime>(
         return Err("找不到 scripts/launch-virtual-sandbox.sh。".into());
     }
 
+    let ssh_hosts = if cfg.reuse_system_ssh {
+        crate::runtime::ssh_bridge::prepare_science_ssh_bridge(&sbx_home)?
+    } else {
+        crate::runtime::ssh_bridge::revoke_science_ssh_bridge(&sbx_home)?;
+        Vec::new()
+    };
+
     let (pport, secret, proxy_action) = ensure_proxy(
         &app,
         &state,
@@ -661,7 +742,7 @@ fn one_click_login_with_options<R: Runtime>(
         Some(&trace),
         auth_proof,
     )?;
-    verify_gateway_model_catalog(pport, &secret, active_profile)?;
+    verify_gateway_model_catalog_traced(&trace, pport, &secret, active_profile)?;
     advance_runtime_transaction(
         &dir,
         &active_profile.id,
@@ -690,6 +771,10 @@ fn one_click_login_with_options<R: Runtime>(
     }
     let logf2 = logf.try_clone().map_err(|e| e.to_string())?;
     trace.stage(OperationStage::SandboxLaunch, format!("port={sport}"));
+    if !runtime_identity_is_current(&launch_runtime) {
+        trace.finish("error=science_runtime_changed_before_launch");
+        return Err("Science runtime 在预检后发生变化；已拒绝启动，请重试".into());
+    }
     let status = Command::new("zsh")
         .arg(&launch)
         .arg("--port")
@@ -703,6 +788,7 @@ fn one_click_login_with_options<R: Runtime>(
             "CSSWITCH_REUSE_SYSTEM_SSH",
             if cfg.reuse_system_ssh { "1" } else { "0" },
         )
+        .env("CSSWITCH_SYSTEM_SSH_HOSTS", ssh_hosts.join(" "))
         .stdout(Stdio::from(logf))
         .stderr(Stdio::from(logf2))
         .status()
@@ -838,8 +924,86 @@ fn one_click_login_with_options<R: Runtime>(
 
 #[cfg(test)]
 mod transaction_tests {
-    use super::advance_runtime_transaction;
+    use super::{
+        advance_runtime_transaction, gateway_model_catalog_timeout_ms, verify_gateway_model_catalog,
+    };
     use crate::config::{self, Config, RuntimeBindingCommit};
+    use crate::provider_contracts::ModelPolicy;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    fn profile_with_policy(policy: ModelPolicy) -> config::Profile {
+        config::Profile {
+            model_policy: policy,
+            ..Default::default()
+        }
+    }
+
+    fn serve_models_after(
+        delay: Duration,
+        body: &'static str,
+    ) -> (u16, Arc<AtomicUsize>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert_ne!(port, 8765);
+        let requests = Arc::new(AtomicUsize::new(0));
+        let server_requests = requests.clone();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0_u8; 1024];
+            let read = stream.read(&mut request).unwrap();
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.starts_with("GET /test-secret/v1/models HTTP/1.0\r\n"));
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            thread::sleep(delay);
+            write!(
+                stream,
+                "HTTP/1.0 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .unwrap();
+        });
+        (port, requests, server)
+    }
+
+    #[test]
+    fn gateway_catalog_timeout_matches_model_policy_contract() {
+        assert_eq!(
+            gateway_model_catalog_timeout_ms(&profile_with_policy(ModelPolicy::DynamicCatalog)),
+            crate::runtime::operation::CODEX_MODELS_PROBE_TIMEOUT_MS
+        );
+        assert_eq!(
+            gateway_model_catalog_timeout_ms(&profile_with_policy(ModelPolicy::SavedCatalog)),
+            crate::runtime::operation::LOCAL_HEALTH_TIMEOUT_MS
+        );
+    }
+
+    #[test]
+    fn dynamic_catalog_cold_response_uses_one_long_local_request() {
+        let body = r#"{"data":[{"id":"claude-csswitch-codex-gpt-5"}]}"#;
+        let (port, requests, server) = serve_models_after(Duration::from_millis(600), body);
+        let profile = profile_with_policy(ModelPolicy::DynamicCatalog);
+
+        verify_gateway_model_catalog(port, "test-secret", &profile).unwrap();
+        server.join().unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn dynamic_catalog_still_rejects_empty_or_non_codex_aliases() {
+        for body in [r#"{"data":[]}"#, r#"{"data":[{"id":"gpt-5"}]}"#] {
+            let (port, _requests, server) = serve_models_after(Duration::ZERO, body);
+            let profile = profile_with_policy(ModelPolicy::DynamicCatalog);
+            let error = verify_gateway_model_catalog(port, "test-secret", &profile).unwrap_err();
+            assert!(error.contains("Codex published model snapshot"));
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn runtime_journal_advances_in_place_and_retargets_without_secrets() {

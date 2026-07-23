@@ -2,8 +2,7 @@
 """Isolated v3 -> v4 coverage-install Acceptance for provider model catalogs.
 
 The caller supplies an old schema-v3 Acceptance bundle and the current
-Acceptance bundle. Both use the dedicated
-``com.csswitch.acceptance.modelcatalog`` identity. The test installs
+Acceptance bundle. Both use the same run-unique Acceptance identity. The test installs
 the old bundle under a private temporary root, launches only that owned binary
 against a fake v3 Qwen profile, replaces the same installation path with the
 new bundle, and reuses the same temporary HOME.
@@ -22,6 +21,8 @@ import json
 import os
 import plistlib
 import signal
+import socket
+import stat
 import subprocess
 import sys
 import time
@@ -74,12 +75,14 @@ def require_isolated_root(path: Path) -> Path:
     return resolved
 
 
-def require_acceptance_bundle(path: Path) -> Dict[str, Any]:
+def require_acceptance_bundle(
+    path: Path, expected_bundle_id: str = ACCEPTANCE_BUNDLE_ID
+) -> Dict[str, Any]:
     resolved = path.resolve(strict=True)
     if Path("/Applications") in resolved.parents:
         raise AcceptanceFailure("refusing an /Applications bundle")
     info = _read_bundle_info(resolved)
-    if info.get("CFBundleIdentifier") != ACCEPTANCE_BUNDLE_ID:
+    if info.get("CFBundleIdentifier") != expected_bundle_id:
         raise AcceptanceFailure("bundle identifier is not the isolated model-catalog Acceptance ID")
     if info.get("CFBundleExecutable") != "desktop":
         raise AcceptanceFailure("unexpected Acceptance executable")
@@ -244,6 +247,26 @@ def cleanup_owned_runtime(session: InstalledProviderSession) -> None:
         pass
 
 
+def cleanup_run_scoped_single_instance_socket(expected_bundle_id: str) -> bool:
+    """Remove only this run-unique Tauri socket after its exact app is stopped."""
+    socket_path = Path("/tmp") / f"{expected_bundle_id.replace('.', '_')}_si.sock"
+    try:
+        metadata = socket_path.lstat()
+    except FileNotFoundError:
+        return True
+    if metadata.st_uid != os.getuid() or not stat.S_ISSOCK(metadata.st_mode):
+        raise AcceptanceFailure("refusing to remove a foreign single-instance socket")
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        probe.settimeout(0.2)
+        if probe.connect_ex(str(socket_path)) == 0:
+            raise AcceptanceFailure("single-instance socket still has a live listener")
+    finally:
+        probe.close()
+    socket_path.unlink()
+    return not socket_path.exists()
+
+
 def stop_exact_owned_gateway(session: InstalledProviderSession) -> None:
     """Stop only the old test Gateway so the replacement can reuse its port."""
     health = session.inspect_health()
@@ -283,7 +306,7 @@ def v3_fixture(session: InstalledProviderSession) -> Dict[str, Any]:
                 "model": "qwen-plus-latest",
                 "credential_source": "api_key",
                 "credential_ref": None,
-                "model_policy": "saved_catalog",
+                "model_policy": "optional_fixed",
                 "website_url": None,
                 "icon": "qwen",
                 "icon_color": "#615CED",
@@ -477,19 +500,25 @@ def strict_route_checks(
     }
 
 
-def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
+def run(
+    old_bundle: Path,
+    new_bundle: Path,
+    root: Path,
+    expected_bundle_id: str = ACCEPTANCE_BUNDLE_ID,
+    v3_commit: Optional[str] = None,
+) -> Dict[str, Any]:
     root = require_isolated_root(root)
     control_socket = root / "session/evidence/provider-mock/control.sock"
     if len(os.fsencode(control_socket)) >= 100:
         raise AcceptanceFailure(
             "acceptance root is too long for the macOS Unix control socket; use a shorter /private/tmp path"
         )
-    old_info = require_acceptance_bundle(old_bundle)
-    new_info = require_acceptance_bundle(new_bundle)
+    old_info = require_acceptance_bundle(old_bundle, expected_bundle_id)
+    new_info = require_acceptance_bundle(new_bundle, expected_bundle_id)
     installed = root / "installed" / APP_NAME
     previous = root / "previous-install" / APP_NAME
     ditto_bundle(old_bundle, installed)
-    require_acceptance_bundle(installed)
+    require_acceptance_bundle(installed, expected_bundle_id)
 
     session_root = root / "session"
     old_process: Optional[int] = None
@@ -499,7 +528,7 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
         root=session_root,
         app_bundle=installed,
         allow_test_bundle=True,
-        expected_bundle_id=ACCEPTANCE_BUNDLE_ID,
+        expected_bundle_id=expected_bundle_id,
         config_dir_name=".csswitch-acceptance",
     ) as session:
         try:
@@ -511,8 +540,7 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
 
             # Start the old runtime in the same temporary HOME so replacement
             # proves a Science refresh, not merely a first post-migration boot.
-            session._proxy_reservation.release()
-            session._sandbox_reservation.release()
+            session.release_app_ports()
             old_env = session._launch_environment(session._mock.base_url, auto_boot=True)
             old_process = launch_owned(
                 installed,
@@ -557,7 +585,7 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
                 if not installed.exists() and previous.exists():
                     os.replace(previous, installed)
                 raise
-            require_acceptance_bundle(installed)
+            require_acceptance_bundle(installed, expected_bundle_id)
             new_binary_sha = sha256(installed / "Contents/MacOS/desktop")
             if old_binary_sha == new_binary_sha:
                 raise AcceptanceFailure("coverage replacement did not change the desktop binary")
@@ -622,6 +650,10 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
                 new_process, installed / "Contents/MacOS/desktop", "new Acceptance"
             )
             new_process = None
+            stop_exact_owned_gateway(session)
+            stopped_science = session.stop_fake_science()
+            if not stopped_science.get("ok"):
+                raise AcceptanceFailure("exact fake Science stop command failed")
             wait_until(
                 lambda: not session.inspector.listener_owned(fake_science["pid"], session.sandbox_port),
                 timeout=8,
@@ -634,12 +666,21 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
                 and mock_result.get("ok")
             ):
                 raise AcceptanceFailure("provider mock phases were incomplete or failed")
-            cleanup = session.verify_cleanup()
-            if not cleanup.get("ok"):
-                raise AcceptanceFailure("owned Acceptance processes or ports were not cleaned up")
+            cleanup = wait_until(
+                lambda: (
+                    lambda value: value if value.get("ok") else None
+                )(session.verify_cleanup()),
+                timeout=12,
+                description="owned Acceptance process and port cleanup",
+            )
+            cleanup["single_instance_socket_closed"] = (
+                cleanup_run_scoped_single_instance_socket(expected_bundle_id)
+            )
 
             summary = {
                 "schema": "csswitch.model-catalog-coverage-acceptance.v1",
+                "status": "passed",
+                "v3_commit": v3_commit,
                 "old_bundle_id": old_info["CFBundleIdentifier"],
                 "new_bundle_id": new_info["CFBundleIdentifier"],
                 "installation_path_reused": True,
@@ -685,6 +726,7 @@ def run(old_bundle: Path, new_bundle: Path, root: Path) -> Dict[str, Any]:
             )
             terminate_owned(old_process, installed / "Contents/MacOS/desktop", "old Acceptance")
             cleanup_owned_runtime(session)
+            cleanup_run_scoped_single_instance_socket(expected_bundle_id)
             if session._mock_started and not session._mock_stopped:
                 session.stop_mock()
 
@@ -693,10 +735,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--old-bundle", type=Path, required=True)
     parser.add_argument("--new-bundle", type=Path, required=True)
+    parser.add_argument("--expected-bundle-id", default=ACCEPTANCE_BUNDLE_ID)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument("--v3-commit")
     args = parser.parse_args()
     try:
-        summary = run(args.old_bundle, args.new_bundle, args.root)
+        summary = run(
+            args.old_bundle,
+            args.new_bundle,
+            args.root,
+            args.expected_bundle_id,
+            args.v3_commit,
+        )
     except Exception as error:
         failure = {
             "schema": "csswitch.model-catalog-coverage-acceptance.v1",

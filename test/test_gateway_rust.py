@@ -1408,6 +1408,83 @@ class RustGatewayLoopback(unittest.TestCase):
             upstream.shutdown()
             upstream.server_close()
 
+    def test_v081_opencode_k3_replacement_catalog_routes_k3_and_rejects_removed_k26(self):
+        upstream = MockUpstream(json.dumps({
+            "id": "chatcmpl_k3_replacement",
+            "choices": [{
+                "message": {"role": "assistant", "content": "k3 ok"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+        }).encode())
+        thread = threading.Thread(target=upstream.serve_forever, daemon=True)
+        thread.start()
+        k3_selector = "claude-csswitch-opencode-go-kimi-k3-a1b2c3d4e5f6"
+        removed_k26_selector = "claude-csswitch-opencode-go-kimi-k2-6-0a1b2c3d4e5f"
+        catalog = {
+            "schema_version": 1,
+            "adapter": "openai-custom",
+            "default_selector_id": k3_selector,
+            "routes": [{
+                "selector_id": k3_selector,
+                "display_name": "Kimi K3",
+                "upstream_model": "kimi-k3",
+                "supports_tools": True,
+            }],
+            "role_bindings": {
+                role: k3_selector for role in ("sonnet", "opus", "haiku", "fable")
+            },
+            "legacy_aliases": [],
+        }
+        proc, port = self.start_current_gateway(
+            provider="openai-custom",
+            contract_id="opencode-go-openai-chat",
+            openai_base_url=f"http://127.0.0.1:{upstream.server_port}/zen/go/v1",
+            static_catalog=catalog,
+        )
+
+        def post(model):
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn.request(
+                "POST",
+                "/secret/v1/messages",
+                body=json.dumps({
+                    "model": model,
+                    "max_tokens": 16,
+                    "messages": [{"role": "user", "content": "which model"}],
+                }).encode(),
+                headers={"content-type": "application/json"},
+            )
+            response = conn.getresponse()
+            raw = response.read()
+            conn.close()
+            return response.status, json.loads(raw)
+
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            conn.request("GET", "/secret/v1/models")
+            response = conn.getresponse()
+            models = json.loads(response.read())
+            conn.close()
+            self.assertEqual(response.status, 200)
+            self.assertEqual([item["id"] for item in models["data"]], [k3_selector])
+            self.assertEqual([item["display_name"] for item in models["data"]], ["Kimi K3"])
+
+            status, body = post(k3_selector)
+            self.assertEqual(status, 200, body)
+            self.assertEqual(len(upstream.requests), 1)
+            self.assertEqual(upstream.requests[0]["path"], "/zen/go/v1/chat/completions")
+            self.assertEqual(json.loads(upstream.requests[0]["body"])["model"], "kimi-k3")
+
+            status, body = post(removed_k26_selector)
+            self.assertEqual(status, 400, body)
+            self.assertEqual(body["error"]["type"], "route_unknown")
+            self.assertEqual(len(upstream.requests), 1, "removed K2.6 must fail before upstream")
+        finally:
+            self.stop_gateway(proc)
+            upstream.shutdown()
+            upstream.server_close()
+
     def test_v081_k3_reasoning_tool_round_trip_and_malformed_response_fail_closed(self):
         upstream = MockUpstream(b"{}")
         thread = threading.Thread(target=upstream.serve_forever, daemon=True)

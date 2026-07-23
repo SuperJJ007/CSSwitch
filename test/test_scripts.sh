@@ -85,14 +85,15 @@ mkdir -p "$OUTER_HOME/.claude-science/runtime"
 mkdir -p "$OUTER_HOME/.ssh"
 printf 'must-not-copy\n' > "$OUTER_HOME/.claude-science/runtime/real-user-sentinel"
 printf 'Host test-only\n  HostName 127.0.0.1\n' > "$OUTER_HOME/.ssh/config"
-printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
+printf '#!/bin/sh\nprintf "%%s\\n" "$@" > "$CAPTURE_FILE"\nif [ -n "${CAPTURE_ENV:-}" ]; then printf "PATH=%%s\\nSSH_CONFIG=%%s\\nSSH_HOSTS=%%s\\nHOME=%%s\\n" "$PATH" "${CSSWITCH_SYSTEM_SSH_CONFIG:-}" "${CSSWITCH_SYSTEM_SSH_HOSTS:-}" "$HOME" > "$CAPTURE_ENV"; fi\nexit 0\n' > "$FAKE_CAPTURE"
 chmod +x "$FAKE_CAPTURE"
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$T/vh-capture" SCIENCE_BIN="$FAKE_CAPTURE" CAPTURE_FILE="$CAPTURE_FILE" CAPTURE_ENV="$CAPTURE_ENV" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only second-alias" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9940 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -eq 0 ] && grep -qx -- '--host' "$CAPTURE_FILE" && grep -qx -- '127.0.0.1' "$CAPTURE_FILE" && grep -qx -- '--sandbox-port' "$CAPTURE_FILE" && grep -qx -- '9941' "$CAPTURE_FILE"; then ok "launch pins loopback host and explicit Science preview port"; else no "launch omitted explicit loopback/preview port (rc=$rc): $out"; fi
-if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CONFIG=$OUTER_HOME/.ssh/config" "$CAPTURE_ENV" && grep -Fxq "HOME=$T/vh-capture" "$CAPTURE_ENV"; then ok "launch scopes SSH bridge to the isolated Science environment"; else no "launch omitted isolated SSH bridge environment"; fi
+if grep -Fq "PATH=$ROOT/scripts/ssh-bridge:" "$CAPTURE_ENV" && grep -Fxq "SSH_CONFIG=$OUTER_HOME/.ssh/config" "$CAPTURE_ENV" && grep -Fxq "SSH_HOSTS=test-only second-alias" "$CAPTURE_ENV" && grep -Fxq "HOME=$T/vh-capture" "$CAPTURE_ENV"; then ok "launch scopes SSH bridge to the isolated Science environment"; else no "launch omitted isolated SSH bridge environment"; fi
 SANDBOX_SSH_CONFIG="$T/vh-capture/.ssh/config"
 SANDBOX_SSH_MODE="$(stat -f '%Lp' "$SANDBOX_SSH_CONFIG" 2>/dev/null || true)"
 if [ -f "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFIG" ] && [ "$SANDBOX_SSH_MODE" = "600" ]; then ok "opt-in creates a narrow regular 0600 sandbox SSH config"; else no "opt-in did not create a safe sandbox SSH config"; fi
+if grep -Fxq 'Host test-only second-alias' "$SANDBOX_SSH_CONFIG" && grep -Fxq "Include \"$OUTER_HOME/.ssh/config\"" "$SANDBOX_SSH_CONFIG" && ! grep -q 'HostName\|IdentityFile\|ProxyCommand' "$SANDBOX_SSH_CONFIG"; then ok "sandbox SSH config materializes only concrete Host aliases before Include"; else no "sandbox SSH config did not materialize the Science preflight alias boundary"; fi
 out_ssh="$(/usr/bin/ssh -F "$SANDBOX_SSH_CONFIG" -G test-only 2>/dev/null)"; rc_ssh=$?
 if [ $rc_ssh -eq 0 ] && echo "$out_ssh" | grep -qx 'hostname 127.0.0.1'; then ok "sandbox SSH config Include resolves Host with system OpenSSH"; else no "sandbox SSH config did not resolve included Host (rc=$rc_ssh)"; fi
 if [ ! -e "$T/vh-capture/.claude-science/runtime/real-user-sentinel" ]; then ok "launch never copies real Science runtime data"; else no "launch copied real Science data into sandbox"; fi
@@ -104,19 +105,19 @@ if [ $rc -eq 0 ] && [ ! -e "$SANDBOX_SSH_CONFIG" ] && [ ! -L "$SANDBOX_SSH_CONFI
 FOREIGN_SANDBOX="$T/vh-foreign-ssh"
 mkdir -p "$FOREIGN_SANDBOX/.ssh"
 printf 'Host foreign\n' > "$FOREIGN_SANDBOX/.ssh/config"
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FOREIGN_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9942 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FOREIGN_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9942 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "不是 CSSwitch 管理" && grep -qx 'Host foreign' "$FOREIGN_SANDBOX/.ssh/config"; then ok "SSH opt-in refuses and preserves a foreign sandbox config"; else no "SSH opt-in overwrote or accepted a foreign sandbox config (rc=$rc): $out"; fi
 
 FORGED_SANDBOX="$T/vh-forged-ssh"
 mkdir -p "$FORGED_SANDBOX/.ssh"
 printf '# CSSwitch managed system SSH config bridge v1\nInclude "/different/config"\n\nHost must-survive\n' > "$FORGED_SANDBOX/.ssh/config"
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FORGED_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9943 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$FORGED_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9943 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && grep -q 'Host must-survive' "$FORGED_SANDBOX/.ssh/config"; then ok "SSH opt-in preserves a forged marker with a different Include"; else no "SSH opt-in trusted or overwrote a forged marker (rc=$rc): $out"; fi
 
 LINK_SANDBOX="$T/vh-linked-ssh"
 mkdir -p "$LINK_SANDBOX" "$T/ssh-link-target"
 ln -s "$T/ssh-link-target" "$LINK_SANDBOX/.ssh"
-out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$LINK_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9944 --skip-oauth-forge 2>&1)"; rc=$?
+out="$(HOME="$OUTER_HOME" SANDBOX_HOME="$LINK_SANDBOX" SCIENCE_BIN="$FAKE_CAPTURE" CSSWITCH_REUSE_SYSTEM_SSH=1 CSSWITCH_SYSTEM_SSH_HOSTS="test-only" "$ROOT/scripts/launch-virtual-sandbox.sh" --port 9944 --skip-oauth-forge 2>&1)"; rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -q "符号链接" && [ ! -e "$T/ssh-link-target/config" ]; then ok "SSH opt-in rejects a symlinked sandbox .ssh directory"; else no "SSH opt-in followed a symlinked sandbox .ssh directory (rc=$rc): $out"; fi
 
 python3 -c 'import socket,time; s=socket.socket(); s.bind(("127.0.0.1",29992)); s.listen(); time.sleep(10)' &

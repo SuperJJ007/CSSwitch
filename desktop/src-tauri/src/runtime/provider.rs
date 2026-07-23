@@ -472,11 +472,14 @@ pub(crate) fn binding_fingerprint(
     runtime: &crate::runtime::science::ScienceRuntimeIdentity,
 ) -> Result<String, String> {
     let host = runtime.skill_install_host_context(cfg.sandbox_port)?;
+    let ssh_bridge_fp =
+        crate::runtime::ssh_bridge::system_ssh_bridge_fingerprint(cfg.reuse_system_ssh)?;
     let value = serde_json::json!({
         "proxy_port": cfg.proxy_port,
         "path_secret_fp": sha256_fingerprint(b"csswitch-path-secret-v1\0", cfg.secret.as_bytes()),
         "sandbox_port": cfg.sandbox_port,
         "runtime": host,
+        "ssh_bridge_fp": ssh_bridge_fp,
     });
     let encoded = serde_json::to_vec(&value).map_err(|error| error.to_string())?;
     Ok(sha256_fingerprint(b"csswitch-binding-fp-v1\0", &encoded))

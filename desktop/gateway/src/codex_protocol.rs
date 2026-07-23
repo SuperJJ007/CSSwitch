@@ -22,6 +22,7 @@ pub const MAX_OUTPUT_ITEMS: usize = 1024;
 
 const SIGNATURE_PREFIX: &str = "csswitch.codex-thinking.v1";
 const SIGNATURE_PURPOSE: &str = "codex-reasoning";
+const CODEX_PYTHON_TOOL_ALIAS: &str = "csswitch_compat_python";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProtocolErrorKind {
@@ -318,11 +319,87 @@ struct ToolHistory {
     results: HashSet<String>,
 }
 
+struct MessageToolState<'a> {
+    history: ToolHistory,
+    names: &'a ToolNameMap,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ToolNameMap {
+    to_codex: HashMap<String, String>,
+    to_anthropic: HashMap<String, String>,
+}
+
+impl ToolNameMap {
+    fn from_request(object: &Map<String, Value>) -> Self {
+        let mut source_names = HashSet::new();
+        if let Some(tools) = object.get("tools").and_then(Value::as_array) {
+            for tool in tools {
+                if let Some(name) = tool.get("name").and_then(Value::as_str) {
+                    source_names.insert(name.to_string());
+                }
+            }
+        }
+        if let Some(messages) = object.get("messages").and_then(Value::as_array) {
+            for message in messages {
+                let Some(blocks) = message.get("content").and_then(Value::as_array) else {
+                    continue;
+                };
+                for block in blocks {
+                    if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                        continue;
+                    }
+                    if let Some(name) = block.get("name").and_then(Value::as_str) {
+                        source_names.insert(name.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut names = Self::default();
+        if source_names.contains("python") {
+            let mut alias = CODEX_PYTHON_TOOL_ALIAS.to_string();
+            let mut suffix = 1_u32;
+            while source_names.contains(&alias) {
+                alias = format!("{CODEX_PYTHON_TOOL_ALIAS}_{suffix}");
+                suffix += 1;
+            }
+            names.to_codex.insert("python".into(), alias.clone());
+            names.to_anthropic.insert(alias, "python".into());
+        }
+        names
+    }
+
+    fn codex_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.to_codex.get(name).map(String::as_str).unwrap_or(name)
+    }
+
+    fn anthropic_name<'a>(&'a self, name: &'a str) -> &'a str {
+        self.to_anthropic
+            .get(name)
+            .map(String::as_str)
+            .unwrap_or(name)
+    }
+}
+
+pub(crate) struct TranslatedAnthropicRequest {
+    pub(crate) body: Value,
+    pub(crate) tool_names: ToolNameMap,
+}
+
 pub fn translate_anthropic_request(
     request: &Value,
     context: &RequestContext<'_>,
     signer: &ThinkingSigner,
 ) -> Result<Value, ProtocolError> {
+    translate_anthropic_exchange(request, context, signer).map(|translated| translated.body)
+}
+
+pub(crate) fn translate_anthropic_exchange(
+    request: &Value,
+    context: &RequestContext<'_>,
+    signer: &ThinkingSigner,
+) -> Result<TranslatedAnthropicRequest, ProtocolError> {
     if context.target_model.trim().is_empty() || context.target_model.len() > 256 {
         return Err(ProtocolError::invalid("model is invalid"));
     }
@@ -334,10 +411,14 @@ pub fn translate_anthropic_request(
         .get("messages")
         .and_then(Value::as_array)
         .ok_or_else(|| ProtocolError::invalid("messages must be an array"))?;
+    let tool_names = ToolNameMap::from_request(object);
     let mut input = Vec::new();
     let mut text_bytes = 0_usize;
     let mut reasoning_bytes = 0_usize;
-    let mut tool_history = ToolHistory::default();
+    let mut message_tools = MessageToolState {
+        history: ToolHistory::default(),
+        names: &tool_names,
+    };
     for message in messages {
         translate_message(
             message,
@@ -346,10 +427,10 @@ pub fn translate_anthropic_request(
             &mut input,
             &mut text_bytes,
             &mut reasoning_bytes,
-            &mut tool_history,
+            &mut message_tools,
         )?;
     }
-    let tools = translate_tools(object.get("tools"), &mut text_bytes)?;
+    let tools = translate_tools(object.get("tools"), &mut text_bytes, &tool_names)?;
     let has_tools = !tools.is_empty();
     if context.use_responses_lite {
         if let Some(choice) = object.get("tool_choice") {
@@ -364,7 +445,7 @@ pub fn translate_anthropic_request(
             }
         }
     }
-    let tool_choice = translate_tool_choice(object.get("tool_choice"), &tools)?;
+    let tool_choice = translate_tool_choice(object.get("tool_choice"), &tools, &tool_names)?;
     let output_format = translate_output_format(object)?;
     if context.use_responses_lite && output_format.is_some() {
         return Err(ProtocolError::invalid(
@@ -475,7 +556,10 @@ pub fn translate_anthropic_request(
     if encoded_len > MAX_REQUEST_BYTES {
         return Err(ProtocolError::bounds("request is too large"));
     }
-    Ok(translated)
+    Ok(TranslatedAnthropicRequest {
+        body: translated,
+        tool_names,
+    })
 }
 
 fn translate_message(
@@ -485,7 +569,7 @@ fn translate_message(
     input: &mut Vec<Value>,
     text_bytes: &mut usize,
     reasoning_bytes: &mut usize,
-    tool_history: &mut ToolHistory,
+    message_tools: &mut MessageToolState<'_>,
 ) -> Result<(), ProtocolError> {
     let role = message
         .get("role")
@@ -553,7 +637,7 @@ fn translate_message(
                 flush_message(role, &mut ordinary, input);
                 let id = required_short_string(block, "id", "tool id is invalid")?;
                 let name = required_short_string(block, "name", "tool name is invalid")?;
-                if !tool_history.calls.insert(id.to_string()) {
+                if !message_tools.history.calls.insert(id.to_string()) {
                     return Err(ProtocolError::invalid("tool id is duplicated"));
                 }
                 let empty_input = Value::Object(Map::new());
@@ -569,17 +653,17 @@ fn translate_message(
                 input.push(json!({
                     "type": "function_call",
                     "call_id": id,
-                    "name": name,
+                    "name": message_tools.names.codex_name(name),
                     "arguments": arguments,
                 }));
             }
             "tool_result" if role == "user" => {
                 flush_message(role, &mut ordinary, input);
                 let id = required_short_string(block, "tool_use_id", "tool result id is invalid")?;
-                if !tool_history.calls.contains(id) {
+                if !message_tools.history.calls.contains(id) {
                     return Err(ProtocolError::invalid("tool result has no matching call"));
                 }
-                if !tool_history.results.insert(id.to_string()) {
+                if !message_tools.history.results.insert(id.to_string()) {
                     return Err(ProtocolError::invalid("tool result is duplicated"));
                 }
                 let output = tool_result_output(block.get("content"), text_bytes)?;
@@ -732,6 +816,7 @@ fn tool_result_output(
 fn translate_tools(
     tools: Option<&Value>,
     text_bytes: &mut usize,
+    tool_names: &ToolNameMap,
 ) -> Result<Vec<Value>, ProtocolError> {
     let Some(tools) = tools else {
         return Ok(Vec::new());
@@ -770,7 +855,7 @@ fn translate_tools(
             }
             Ok(json!({
                 "type": "function",
-                "name": name,
+                "name": tool_names.codex_name(name),
                 "description": description,
                 "parameters": parameters,
                 "strict": strict,
@@ -1139,6 +1224,7 @@ struct ToolChoiceTranslation {
 fn translate_tool_choice(
     choice: Option<&Value>,
     tools: &[Value],
+    tool_names: &ToolNameMap,
 ) -> Result<ToolChoiceTranslation, ProtocolError> {
     let has_tools = !tools.is_empty();
     let kind = choice
@@ -1171,6 +1257,7 @@ fn translate_tool_choice(
                 .and_then(Value::as_str)
                 .filter(|name| !name.is_empty() && name.len() <= 512)
                 .ok_or_else(|| ProtocolError::invalid("forced tool name is invalid"))?;
+            let name = tool_names.codex_name(name);
             if !tools
                 .iter()
                 .any(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
@@ -1423,6 +1510,7 @@ pub struct ResponsesReducer<'a> {
     total_reasoning_bytes: usize,
     stored_bytes: usize,
     estimated_nonstream_bytes: usize,
+    tool_names: ToolNameMap,
 }
 
 impl<'a> ResponsesReducer<'a> {
@@ -1431,6 +1519,22 @@ impl<'a> ResponsesReducer<'a> {
         auth_epoch: &'a str,
         account_hash: &'a str,
         signer: &'a ThinkingSigner,
+    ) -> Self {
+        Self::new_with_tool_names(
+            model,
+            auth_epoch,
+            account_hash,
+            signer,
+            ToolNameMap::default(),
+        )
+    }
+
+    pub(crate) fn new_with_tool_names(
+        model: impl Into<String>,
+        auth_epoch: &'a str,
+        account_hash: &'a str,
+        signer: &'a ThinkingSigner,
+        tool_names: ToolNameMap,
     ) -> Self {
         Self {
             model: model.into(),
@@ -1458,6 +1562,7 @@ impl<'a> ResponsesReducer<'a> {
             total_reasoning_bytes: 0,
             stored_bytes: 0,
             estimated_nonstream_bytes: 512,
+            tool_names,
         }
     }
 
@@ -1822,7 +1927,8 @@ impl<'a> ResponsesReducer<'a> {
             .get("call_id")
             .and_then(Value::as_str)
             .unwrap_or(item_id);
-        let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        let upstream_name = item.get("name").and_then(Value::as_str).unwrap_or("");
+        let name = self.tool_names.anthropic_name(upstream_name).to_string();
         if call_id.is_empty() || name.is_empty() || call_id.len() > 512 || name.len() > 512 {
             return Err(ProtocolError::upstream("tool identity is invalid"));
         }
@@ -1845,7 +1951,7 @@ impl<'a> ResponsesReducer<'a> {
         self.close_pending_reasoning(Some(call_id), out)?;
         self.reserve_identity(item_id, 192)?;
         self.reserve_identity(call_id, 0)?;
-        self.reserve_identity(name, 0)?;
+        self.reserve_identity(&name, 0)?;
         self.call_ids
             .insert(call_id.to_string(), item_id.to_string());
         self.tools.insert(
@@ -1853,7 +1959,7 @@ impl<'a> ResponsesReducer<'a> {
             ToolState {
                 index: None,
                 call_id: call_id.to_string(),
-                name: name.to_string(),
+                name,
                 arguments: String::new(),
                 closed: false,
             },
@@ -2876,6 +2982,101 @@ mod tests {
                 detail: "forced tool is not declared"
             })
         ));
+    }
+
+    #[test]
+    fn python_tool_name_uses_one_collision_safe_bidirectional_mapping() {
+        let request = json!({
+            "messages": [
+                {"role": "assistant", "content": [{
+                    "type": "tool_use",
+                    "id": "call_previous",
+                    "name": "python",
+                    "input": {"code": "print(1)"}
+                }]},
+                {"role": "user", "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": "call_previous",
+                    "content": "1"
+                }]}
+            ],
+            "tools": [
+                {"name": "python", "input_schema": {"type": "object"}},
+                {"name": CODEX_PYTHON_TOOL_ALIAS, "input_schema": {"type": "object"}}
+            ],
+            "tool_choice": {"type": "tool", "name": "python"}
+        });
+        let translated = translate_anthropic_exchange(&request, &context(), &signer()).unwrap();
+        let alias = format!("{CODEX_PYTHON_TOOL_ALIAS}_1");
+        assert_eq!(translated.body["tools"][0]["name"], alias);
+        assert_eq!(translated.body["tools"][1]["name"], CODEX_PYTHON_TOOL_ALIAS);
+        assert_eq!(translated.body["tool_choice"]["name"], alias);
+        assert_eq!(translated.body["input"][0]["type"], "function_call");
+        assert_eq!(translated.body["input"][0]["name"], alias);
+
+        let mut lite_request = request.clone();
+        lite_request["tool_choice"] = json!({"type": "auto"});
+        let lite = RequestContext {
+            use_responses_lite: true,
+            ..context()
+        };
+        let lite_translated =
+            translate_anthropic_exchange(&lite_request, &lite, &signer()).unwrap();
+        assert_eq!(lite_translated.body["input"][0]["tools"][0]["name"], alias);
+        assert_eq!(
+            lite_translated.body["input"][0]["tools"][1]["name"],
+            CODEX_PYTHON_TOOL_ALIAS
+        );
+
+        let signer = signer();
+        let mut reducer = ResponsesReducer::new_with_tool_names(
+            "gpt-5.6-codex",
+            EPOCH,
+            ACCOUNT,
+            &signer,
+            translated.tool_names,
+        );
+        let fixtures = [
+            json!({"type": "response.created", "response": {"id": "resp_python"}}),
+            json!({"type": "response.output_item.added", "item": {
+                "type": "function_call",
+                "id": "fc_python",
+                "call_id": "call_python",
+                "name": alias,
+                "arguments": ""
+            }}),
+            json!({"type": "response.function_call_arguments.delta",
+                "item_id": "fc_python",
+                "call_id": "call_python",
+                "delta": "{}"
+            }),
+            json!({"type": "response.output_item.done", "item": {
+                "type": "function_call",
+                "id": "fc_python",
+                "call_id": "call_python",
+                "name": alias,
+                "arguments": "{}"
+            }}),
+            json!({"type": "response.completed", "response": {
+                "id": "resp_python",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            }}),
+        ];
+        let mut streamed_name = None;
+        for fixture in fixtures {
+            for event in reducer.apply(fixture).unwrap() {
+                if event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "tool_use"
+                {
+                    streamed_name = event.data["content_block"]["name"]
+                        .as_str()
+                        .map(ToString::to_string);
+                }
+            }
+        }
+        assert_eq!(streamed_name.as_deref(), Some("python"));
+        let response = reducer.nonstream_response().unwrap();
+        assert_eq!(response["content"][0]["name"], "python");
     }
 
     #[test]

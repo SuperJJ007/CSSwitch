@@ -24,6 +24,7 @@ use crate::runtime::science::{
 use crate::runtime::settings::{
     remove_managed_sandbox_ssh_stub, system_ssh_config_path, validate_runtime_ports,
 };
+use crate::runtime::ssh_bridge::{revoke_science_ssh_bridge, system_ssh_hosts};
 use crate::runtime::system::open_in_browser;
 use crate::{
     config, lock, proc, run_blocking, run_blocking_typed, AppState, SharedAppState, SharedLifecycle,
@@ -199,6 +200,7 @@ fn set_settings_inner(
     validate_runtime_ports(cfg.proxy_port, cfg.sandbox_port)?;
     if cfg.reuse_system_ssh {
         system_ssh_config_path()?;
+        system_ssh_hosts()?;
     }
     lifecycle.with_serialized(|| {
         let dir = config::default_dir();
@@ -223,6 +225,7 @@ fn set_settings_inner(
             st.stop_proxy();
         }
         if !cfg.reuse_system_ssh {
+            revoke_science_ssh_bridge(&crate::runtime::science::sandbox_home())?;
             remove_managed_sandbox_ssh_stub(&crate::runtime::science::sandbox_home())?;
         }
         // 拆链路成功（或无需拆）→ 才落盘新端口，保证 config 与运行态一致。
@@ -569,10 +572,13 @@ fn one_click_failure_value(message: String) -> serde_json::Value {
 fn science_failure_stage(message: &str) -> &'static str {
     if message.contains("停止旧进程") || message.contains("停止沙箱") {
         "science_stop"
+    } else if message.contains("模型目录")
+        || message.contains("selector")
+        || message.contains("Codex published model snapshot")
+    {
+        "catalog_verify"
     } else if message.contains("代理") || message.contains("gateway") {
         "gateway_start"
-    } else if message.contains("模型目录") || message.contains("selector") {
-        "catalog_verify"
     } else if message.contains("沙箱") || message.contains("Science") {
         "science_start"
     } else {
@@ -915,6 +921,14 @@ mod tests {
         assert_eq!(science_failure_stage("停止旧进程失败"), "science_stop");
         assert_eq!(science_failure_stage("代理探活失败"), "gateway_start");
         assert_eq!(science_failure_stage("模型目录不一致"), "catalog_verify");
+        assert_eq!(
+            science_failure_stage("gateway 模型目录探活无响应"),
+            "catalog_verify"
+        );
+        assert_eq!(
+            science_failure_stage("Codex published model snapshot 为空或包含非法 alias"),
+            "catalog_verify"
+        );
         assert_eq!(science_failure_stage("沙箱起后超时"), "science_start");
         assert_eq!(science_failure_stage("配置不可用"), "prepare");
     }

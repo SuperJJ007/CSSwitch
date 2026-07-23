@@ -1107,7 +1107,7 @@ fn handle_codex_messages_with_policy(
         supports_parallel_tool_calls: policy.supports_parallel_tool_calls,
         use_responses_lite: policy.use_responses_lite,
     };
-    let translated = match codex_protocol::translate_anthropic_request(raw, &context, &signer) {
+    let translated = match codex_protocol::translate_anthropic_exchange(raw, &context, &signer) {
         Ok(translated) => translated,
         Err(error) => {
             if error.kind == codex_protocol::ProtocolErrorKind::Bounds {
@@ -1118,7 +1118,7 @@ fn handle_codex_messages_with_policy(
             return;
         }
     };
-    let body = match serde_json::to_vec(&translated) {
+    let body = match serde_json::to_vec(&translated.body) {
         Ok(body) => body,
         Err(_) => {
             invalid_request_json(stream, "Codex request encoding failed");
@@ -1149,11 +1149,12 @@ fn handle_codex_messages_with_policy(
                 return;
             }
         };
-    let mut reducer = codex_protocol::ResponsesReducer::new(
+    let mut reducer = codex_protocol::ResponsesReducer::new_with_tool_names(
         target_model,
         secrets.auth_epoch(),
         secrets.account_hash(),
         &signer,
+        translated.tool_names,
     );
     if is_stream {
         forward_codex_stream(stream, upstream, &mut reducer);

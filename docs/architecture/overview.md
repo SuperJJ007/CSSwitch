@@ -34,7 +34,8 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 |---|---|---|
 | provider profiles 与 CSSwitch settings | `~/.csswitch/` 配置 | CSSwitch |
 | Gateway 生命周期与本地路由 | CSSwitch runtime state | CSSwitch |
-| 已安装 Science executable | `/Applications/Claude Science.app/.../claude-science` | 用户 / Science installer |
+| Science executable 候选 | 通过 CSSwitch 固定路径、文件安全与 embedded metadata 本地校验的 `~/.claude-science/bin/claude-science`，或 `/Applications/Claude Science.app/.../claude-science` | 用户 / Science updater / installer |
+| updater runtime snapshot | `<CSSwitch data root>/runtime-snapshots/science/claude-science-<sha256>` | CSSwitch |
 | 持久 Science 状态 | `~/.csswitch/sandbox/home/.claude-science` | Science |
 | 版本 runtime 资源 | `<data-dir>/runtime/<version>/` | Science |
 | 组织与 Skills | `<data-dir>/orgs/<active-org>/...` | Science 组织 |
@@ -44,7 +45,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 | Codex OAuth / thinking / generation records | CSSwitch data root 下的私有 `codex-*.v1.json` | CSSwitch Gateway |
 | v0.4.2 / v0.4.3 legacy Skill store / inventory | 原样保留但不参与当前 runtime | 非当前运行路径 |
 
-持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先用户当前安装的 App；历史缓存只有在 App 不可用、版本可读且用户仅本次授权时才可使用。详见 [Science runtime 合同](science-runtime.md)。
+持久 data-dir 提供状态连续性，不固定 executable 版本。正常新启动优先把通过本地路径、文件安全与 embedded metadata 校验的 updater executable 固化为 CSSwitch 私有内容寻址 snapshot，再使用当前安装的 App；CSSwitch 隔离 data-dir 内的历史缓存只有在前两者不可用、版本可读且用户仅本次授权时才可使用。embedded metadata 不是官方来源的密码学认证。详见 [Science runtime 合同](science-runtime.md)。
 
 ## 组件边界
 
@@ -58,7 +59,7 @@ CSSwitch profile（API key 或 CSSwitch OAuth）
 
 ### Science runtime
 
-新启动显式传入 data-dir、`--host 127.0.0.1`、独立 `--sandbox-port` 和 `--no-auto-update`。CSSwitch 记录实际 binary path、来源和版本；启动、复用、恢复与停止边界另结合监听 PID、canonical executable 和 data-dir CLI 结果做强身份判断。高频 UI `status` 只做 HTTP health，并返回内存中的 runtime metadata，不能凭它证明端口属于本沙箱。
+新启动显式传入 data-dir、`--host 127.0.0.1`、独立 `--sandbox-port` 和 `--no-auto-update`。updater 来源实际执行 CSSwitch 私有、只读、内容寻址的 snapshot，避免 source 在运行中更新后破坏 stop/recovery 身份。CSSwitch 记录实际 binary path、来源、版本和含 SHA-256 的文件指纹；启动、复用、恢复与停止边界另结合监听 PID、canonical executable 和 data-dir CLI 结果做强身份判断。高频 UI `status` 只做 HTTP health，并返回内存中的 runtime metadata，不能凭它证明端口属于本沙箱。
 
 ### 外部 Skill bridge
 

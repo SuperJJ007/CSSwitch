@@ -13,5 +13,6 @@ pub(crate) mod sandbox_session;
 pub(crate) mod science;
 pub(crate) mod settings;
 pub(crate) mod skill_install_bridge;
+pub(crate) mod ssh_bridge;
 pub(crate) mod system;
 pub(crate) mod transaction;

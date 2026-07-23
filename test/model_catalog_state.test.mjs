@@ -233,6 +233,56 @@ test("editing preserves a legacy sonnet selector until the default model actuall
   assert.equal(newProfile.role_bindings.sonnet, newProfile.default_model_route_id);
 });
 
+test("connection edit prunes replaced bound routes without deleting unbound legacy extras", () => {
+  const existing = [
+    { selector_id: "sel-k26", upstream_model: "kimi-k2.6", display_name: "Kimi K2.6", supports_tools: true },
+    { selector_id: "sel-extra", upstream_model: "legacy-extra", display_name: "Legacy extra", supports_tools: null },
+  ];
+  const payload = buildSimpleModelSubmission({ default_model: "kimi-k3" }, {
+    existing_routes: existing,
+    existing_references: {
+      default: "sel-k26", balanced: "sel-k26", quality: "sel-k26", fast: "sel-k26", fable: "sel-k26",
+    },
+    preserve_existing_sonnet: true,
+    prune_replaced_bindings: true,
+  });
+  assert.deepEqual(payload.model_catalog.map((route) => route.upstream_model), ["kimi-k3", "legacy-extra"]);
+  assert.ok(!payload.model_catalog.some((route) => route.upstream_model === "kimi-k2.6"));
+  assert.deepEqual(new Set(Object.values(payload.role_bindings)), new Set([payload.default_model_route_id]));
+});
+
+test("connection pruning retains every route that remains finally bound", () => {
+  const existing = [
+    { selector_id: "sel-default", upstream_model: "old-default", display_name: "Old default", supports_tools: true },
+    { selector_id: "sel-quality", upstream_model: "quality", display_name: "Quality", supports_tools: true },
+    { selector_id: "sel-sonnet", upstream_model: "balanced", display_name: "Balanced", supports_tools: true },
+  ];
+  const refs = {
+    default: "sel-default", balanced: "sel-sonnet", quality: "sel-quality", fast: "sel-default", fable: "sel-quality",
+  };
+  const unchanged = buildSimpleModelSubmission({ default_model: "old-default", quality_model: "quality" }, {
+    existing_routes: existing,
+    existing_references: refs,
+    preserve_existing_sonnet: true,
+    prune_replaced_bindings: true,
+  });
+  assert.ok(unchanged.model_catalog.some((route) => route.selector_id === "sel-sonnet"));
+  assert.ok(unchanged.model_catalog.some((route) => route.selector_id === "sel-quality"));
+  for (const reference of [unchanged.default_model_route_id, ...Object.values(unchanged.role_bindings)]) {
+    assert.ok(unchanged.model_catalog.some((route) => route.selector_id === reference || route.upstream_model === reference));
+  }
+
+  const changed = buildSimpleModelSubmission({ default_model: "new-default", quality_model: "quality" }, {
+    existing_routes: existing,
+    existing_references: refs,
+    preserve_existing_sonnet: true,
+    prune_replaced_bindings: true,
+  });
+  assert.deepEqual(changed.model_catalog.map((route) => route.upstream_model), ["new-default", "quality"]);
+  assert.ok(!changed.model_catalog.some((route) => route.selector_id === "sel-default"));
+  assert.ok(!changed.model_catalog.some((route) => route.selector_id === "sel-sonnet"));
+});
+
 test("role summary exposes every bound DeepSeek model without including extra routes", () => {
   const profile = {
     model_catalog: [

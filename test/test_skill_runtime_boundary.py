@@ -155,7 +155,12 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("runtime_choice: Option<String>", runtime)
         self.assertIn("choice == Some(CACHED_ONCE_CHOICE)", science)
         self.assertIn("fn safe_science_version(path: &Path)", science)
-        self.assertIn("version_cache.version(app_bin)", science)
+        self.assertIn("official_updated_science_bin()", science)
+        self.assertIn("ScienceRuntimeSource::OfficialUpdated", science)
+        self.assertIn("OFFICIAL_SCIENCE_IDENTIFIER", science)
+        self.assertIn("OFFICIAL_SCIENCE_TEAM_ID", science)
+        self.assertIn("sha256: [u8; 32]", science)
+        self.assertIn("runtime_identity_is_current", science)
         self.assertIn('"cached_choice_required"', science)
 
     def test_manual_science_open_refreshes_url_and_has_visible_feedback(self):
@@ -259,6 +264,7 @@ class SkillRuntimeBoundary(unittest.TestCase):
         self.assertIn("probe_known_runtime(sport, &runtime)", session)
         self.assertIn("sandbox_listener_matches_runtime(sport, &launch_runtime)", session)
         self.assertIn("sandbox_url(sport, &launch_runtime)", session)
+        self.assertIn("runtime_identity_is_current(&launch_runtime)", session)
         self.assertIn('.env("SCIENCE_BIN", &runtime.path)', science)
         self.assertIn('"source": runtime.source.code()', runtime)
 

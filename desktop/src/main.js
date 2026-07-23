@@ -1824,6 +1824,7 @@ function catalogSubmission(kind) {
     candidate_routes: editor.discovered,
     existing_references: editor.refs,
     preserve_existing_sonnet: kind === "connection",
+    prune_replaced_bindings: kind === "connection",
   });
 }
 

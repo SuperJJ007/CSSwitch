@@ -3,6 +3,28 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 const SSH_STUB_MARKER: &str = "# CSSwitch managed system SSH config bridge v1";
+const SSH_STUB_MARKER_V2: &str = "# CSSwitch managed system SSH config bridge v2";
+
+fn managed_ssh_stub_text(text: &str, expected_system_config: &Path) -> bool {
+    let escaped = expected_system_config
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"");
+    if text == format!("{SSH_STUB_MARKER}\nInclude \"{escaped}\"\n") {
+        return true;
+    }
+    let lines = text.lines().collect::<Vec<_>>();
+    lines.len() == 3
+        && lines[0] == SSH_STUB_MARKER_V2
+        && lines[1].strip_prefix("Host ").is_some_and(|hosts| {
+            let aliases = hosts.split_ascii_whitespace().collect::<Vec<_>>();
+            !aliases.is_empty()
+                && aliases
+                    .iter()
+                    .all(|alias| crate::runtime::ssh_bridge::is_concrete_alias(alias))
+        })
+        && lines[2] == format!("Include \"{escaped}\"")
+}
 
 fn system_ssh_config_path_for_home(home: &Path) -> Result<PathBuf, String> {
     if !home.is_absolute() {
@@ -33,6 +55,70 @@ pub(crate) fn remove_managed_sandbox_ssh_stub(sandbox_home: &Path) -> Result<(),
         return Err("无法确认系统 HOME，不能撤销系统 SSH 配置。".into());
     }
     remove_managed_sandbox_ssh_stub_for_config(sandbox_home, &home.join(".ssh/config"))
+}
+
+pub(crate) fn validate_managed_sandbox_ssh_stub(
+    sandbox_home: &Path,
+    expected_hosts: &[String],
+) -> Result<(), String> {
+    let expected_system_config = system_ssh_config_path()?;
+    validate_managed_sandbox_ssh_stub_for_config(
+        sandbox_home,
+        &expected_system_config,
+        expected_hosts,
+    )
+}
+
+fn validate_managed_sandbox_ssh_stub_for_config(
+    sandbox_home: &Path,
+    expected_system_config: &Path,
+    expected_hosts: &[String],
+) -> Result<(), String> {
+    if expected_hosts.is_empty()
+        || !expected_hosts
+            .iter()
+            .all(|host| crate::runtime::ssh_bridge::is_concrete_alias(host))
+    {
+        return Err("没有可供 Science 校验的安全 SSH Host alias".into());
+    }
+    let ssh_dir = sandbox_home.join(".ssh");
+    let dir_metadata = std::fs::symlink_metadata(&ssh_dir)
+        .map_err(|_| "隔离 SSH 配置目录缺失，拒绝复用运行中的 Science")?;
+    // SAFETY: geteuid has no preconditions and does not dereference pointers.
+    let uid = unsafe { libc::geteuid() };
+    if !dir_metadata.file_type().is_dir()
+        || dir_metadata.file_type().is_symlink()
+        || dir_metadata.uid() != uid
+        || dir_metadata.mode() & 0o022 != 0
+    {
+        return Err("隔离 SSH 配置目录不安全，拒绝复用运行中的 Science".into());
+    }
+    let config = ssh_dir.join("config");
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(&config)
+        .map_err(|_| "隔离 SSH config 缺失或不安全，拒绝复用运行中的 Science")?;
+    let metadata = file.metadata().map_err(|_| "无法检查隔离 SSH config")?;
+    if !metadata.is_file()
+        || metadata.uid() != uid
+        || metadata.mode() & 0o077 != 0
+        || metadata.len() > 128 * 1024
+    {
+        return Err("隔离 SSH config 不是安全的 CSSwitch 管理文件".into());
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)
+        .map_err(|_| "无法读取隔离 SSH config")?;
+    let expected_host_line = format!("Host {}", expected_hosts.join(" "));
+    let lines = text.lines().collect::<Vec<_>>();
+    if !managed_ssh_stub_text(&text, expected_system_config)
+        || lines.first().copied() != Some(SSH_STUB_MARKER_V2)
+        || lines.get(1).copied() != Some(expected_host_line.as_str())
+    {
+        return Err("隔离 SSH config 与当前 CSSwitch SSH bridge 不一致".into());
+    }
+    Ok(())
 }
 
 fn remove_managed_sandbox_ssh_stub_for_config(
@@ -79,18 +165,13 @@ fn remove_managed_sandbox_ssh_stub_for_config(
     let metadata = file
         .metadata()
         .map_err(|error| format!("检查隔离 SSH config 失败：{error}"))?;
-    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > 4096 {
+    if !metadata.is_file() || metadata.uid() != uid || metadata.len() > 128 * 1024 {
         return Err("隔离 SSH config 不是 CSSwitch 管理的安全普通文件".into());
     }
     let mut text = String::new();
     file.read_to_string(&mut text)
         .map_err(|error| format!("读取隔离 SSH config 失败：{error}"))?;
-    let escaped = expected_system_config
-        .to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"");
-    let expected = format!("{SSH_STUB_MARKER}\nInclude \"{escaped}\"\n");
-    if text != expected {
+    if !managed_ssh_stub_text(&text, expected_system_config) {
         return Err("隔离 SSH config 不是 CSSwitch 管理的入口，拒绝删除".into());
     }
     std::fs::remove_file(&config).map_err(|error| format!("撤销隔离 SSH config 失败：{error}"))?;
@@ -114,11 +195,12 @@ pub(crate) fn validate_runtime_ports(proxy_port: u16, sandbox_port: u16) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::FileTypeExt;
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 
     use super::{
         remove_managed_sandbox_ssh_stub_for_config, system_ssh_config_path_for_home,
-        validate_runtime_ports, SSH_STUB_MARKER,
+        validate_managed_sandbox_ssh_stub_for_config, validate_runtime_ports, SSH_STUB_MARKER,
+        SSH_STUB_MARKER_V2,
     };
 
     #[test]
@@ -196,6 +278,48 @@ mod tests {
         assert!(std::fs::read_to_string(&config)
             .unwrap()
             .contains("Host foreign"));
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn running_stub_validation_requires_exact_v2_aliases_and_private_file() {
+        let home = std::env::temp_dir().join(format!(
+            "csswitch-system-ssh-running-stub-test-{}",
+            crate::config::new_id()
+        ));
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        let expected_system_config = home.join("real-home/.ssh/config");
+        let config = ssh_dir.join("config");
+        std::fs::write(
+            &config,
+            format!(
+                "{SSH_STUB_MARKER_V2}\nHost alpha beta\nInclude \"{}\"\n",
+                expected_system_config.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let expected = vec!["alpha".to_string(), "beta".to_string()];
+        assert!(validate_managed_sandbox_ssh_stub_for_config(
+            &home,
+            &expected_system_config,
+            &expected
+        )
+        .is_ok());
+        assert!(validate_managed_sandbox_ssh_stub_for_config(
+            &home,
+            &expected_system_config,
+            &["alpha".to_string()]
+        )
+        .is_err());
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_managed_sandbox_ssh_stub_for_config(
+            &home,
+            &expected_system_config,
+            &expected
+        )
+        .is_err());
         let _ = std::fs::remove_dir_all(home);
     }
 
