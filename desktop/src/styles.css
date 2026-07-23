@@ -412,7 +412,10 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .catalog-field{grid-column:1 / -1}
 .simple-model-editor{margin-top:8px;padding:10px;border:1px solid var(--line);border-radius:10px;background:var(--field)}
 .simple-model-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+.simple-model-route{min-width:0;margin:0;padding:9px;border:1px solid var(--line);border-radius:8px}
+.simple-model-route legend{padding:0 4px;color:var(--ink);font-size:10px;font-weight:700}
 .simple-model-grid label{margin:0;color:var(--sub);font-size:10px}
+.simple-model-route label+label{display:block;margin-top:7px}
 .simple-model-grid input{margin-top:4px;font:11px/1.3 ui-monospace,SFMono-Regular,Menlo,monospace}
 .simple-model-editor>.hint{margin-top:8px}
 .static-catalog{margin-top:9px;padding:9px;border:1px solid var(--line);border-radius:10px;background:var(--field)}

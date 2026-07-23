@@ -69,13 +69,13 @@
                   <div class="connection-actions">
                     <button class="hero" id="oneClickBtn">一键开始</button>
                     <button class="btn" id="openBrowserBtn">浏览器打开</button>
-                    <button class="btn" id="stopBtn">全部停止</button>
+                    <button class="btn" id="stopBtn">停止第三方实例</button>
                   </div>
                 </section>
 
                 <aside class="connection-controls">
                   <section class="surface mode-surface modeseg">
-                    <h2>连接方式</h2>
+                    <h2>操作对象</h2>
                     <div class="seg" id="modeSeg">
                       <button type="button" class="seg-btn active" data-mode="proxy">第三方模型</button>
                       <button type="button" class="seg-btn" data-mode="official">官方 Claude</button>
@@ -83,7 +83,7 @@
                   </section>
                   <section class="surface status-overview">
                     <h2>运行状态</h2>
-                    <div class="status-list tp-only">
+                    <div class="status-list">
                       <div class="status-row"><span><i id="ltProxy" class="lt a"></i>代理</span><strong id="proxyStateText">检查中</strong></div>
                       <div class="status-row"><span><i id="ltSandbox" class="lt a"></i>Science</span><strong id="sandboxStateText">检查中</strong></div>
                       <div class="status-row"><span><i id="ltUpstream" class="lt a"></i>上游</span><strong id="upstreamStateText">检查中</strong></div>
@@ -131,7 +131,17 @@
               <div class="form-grid">
                 <div class="field"><label for="wizName">名称</label><input id="wizName" type="text" placeholder="给这套配置起个名字" autocomplete="off" spellcheck="false" /></div>
                 <div class="field" id="wizBaseGroup"><label for="wizBase">地址 base_url</label><input id="wizBase" type="text" placeholder="https://your-relay/claude" autocomplete="off" spellcheck="false" /><div class="hint" id="wizBaseHint"></div></div>
-                <div class="field catalog-field" id="wizModelGroup"><label id="wizModelLabel">模型配置</label><div id="wizModelInfo" class="modelinfo" hidden></div><div class="codex-catalog-heading"><div class="codex-catalog-meta" id="wizCodexCatalogMeta">尚未探测模型。</div><button class="btn" id="wizFetchBtn" type="button">获取可用模型</button></div><div id="wizStaticCatalog" class="simple-model-editor"><div class="simple-model-grid"><label>默认模型（均衡）<input id="wizModel" list="wizModelList" autocomplete="off" spellcheck="false" /></label><label>高质量模型（可选）<input id="wizRoleQuality" list="wizModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>快速模型（可选）<input id="wizRoleFast" list="wizModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>Fable 模型（可选）<input id="wizRoleFable" list="wizModelList" placeholder="留空则使用高质量模型" autocomplete="off" spellcheck="false" /></label></div><datalist id="wizModelList"></datalist><div class="hint" id="wizCatalogWarning">可以选择推荐模型，也可以直接填写供应商或中转站提供的精确模型 ID。</div></div><div id="wizCodexCatalog" class="codex-catalog" hidden><div class="codex-catalog-list" id="wizCodexCatalogList"></div></div><div class="hint" id="wizModelHint"></div></div>
+                <div class="field catalog-field" id="wizModelGroup">
+                  <label id="wizModelLabel">模型配置</label><div id="wizModelInfo" class="modelinfo" hidden></div>
+                  <div class="codex-catalog-heading"><div class="codex-catalog-meta" id="wizCodexCatalogMeta">尚未探测模型。</div><button class="btn" id="wizFetchBtn" type="button">获取可用模型</button></div>
+                  <div id="wizStaticCatalog" class="simple-model-editor"><div class="simple-model-grid">
+                    <fieldset class="simple-model-route"><legend>默认模型（均衡）</legend><label>模型 ID<input id="wizModel" list="wizModelList" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="wizModelDisplayName" placeholder="如 DeepSeek V4 Pro" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>高质量模型（可选）</legend><label>模型 ID<input id="wizRoleQuality" list="wizModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="wizRoleQualityDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>快速模型（可选）</legend><label>模型 ID<input id="wizRoleFast" list="wizModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="wizRoleFastDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>Fable 模型（可选）</legend><label>模型 ID<input id="wizRoleFable" list="wizModelList" placeholder="留空则使用高质量模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="wizRoleFableDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                  </div><datalist id="wizModelList"></datalist><div class="hint" id="wizCatalogWarning">模型 ID 用于上游请求；显示名称用于 Science 模型菜单（对应 display_name），留空则使用模型 ID。</div></div>
+                  <div id="wizCodexCatalog" class="codex-catalog" hidden><div class="codex-catalog-list" id="wizCodexCatalogList"></div></div><div class="hint" id="wizModelHint"></div>
+                </div>
                 <div class="field" id="wizKeyGroup"><label for="wizKey">API Key / Token</label><input id="wizKey" type="password" placeholder="粘贴 key（只存本地）" autocomplete="off" spellcheck="false" /><div class="hint">只存本地；面板仅回显末 4 位。</div></div>
               </div>
               <div class="form-actions"><button class="btn primary" id="wizSaveBtn">创建</button><button class="btn" id="wizCancelBtn">取消</button></div>
@@ -141,7 +151,17 @@
               <div class="section-heading compact"><h2 id="connTitle">编辑连接</h2></div>
               <div class="form-grid">
                 <div class="field" id="connBaseGroup"><label for="connBase">地址 base_url</label><input id="connBase" type="text" autocomplete="off" spellcheck="false" /><div class="hint" id="connBaseHint"></div></div>
-                <div class="field catalog-field" id="connModelGroup"><label id="connModelLabel">模型配置</label><div id="connModelInfo" class="modelinfo" hidden></div><div class="codex-catalog-heading"><div class="codex-catalog-meta" id="connCodexCatalogMeta">尚未探测模型。</div><button class="btn" id="connFetchBtn" type="button">获取可用模型</button></div><div id="connStaticCatalog" class="simple-model-editor"><div class="simple-model-grid"><label>默认模型（均衡）<input id="connModel" list="connModelList" autocomplete="off" spellcheck="false" /></label><label>高质量模型（可选）<input id="connRoleQuality" list="connModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>快速模型（可选）<input id="connRoleFast" list="connModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>Fable 模型（可选）<input id="connRoleFable" list="connModelList" placeholder="留空则使用高质量模型" autocomplete="off" spellcheck="false" /></label></div><datalist id="connModelList"></datalist><div class="hint" id="connCatalogWarning">可以选择推荐模型，也可以直接填写供应商或中转站提供的精确模型 ID。</div></div><div id="connCodexCatalog" class="codex-catalog" hidden><div class="codex-catalog-list" id="connCodexCatalogList"></div></div><div class="hint" id="connModelHint"></div></div>
+                <div class="field catalog-field" id="connModelGroup">
+                  <label id="connModelLabel">模型配置</label><div id="connModelInfo" class="modelinfo" hidden></div>
+                  <div class="codex-catalog-heading"><div class="codex-catalog-meta" id="connCodexCatalogMeta">尚未探测模型。</div><button class="btn" id="connFetchBtn" type="button">获取可用模型</button></div>
+                  <div id="connStaticCatalog" class="simple-model-editor"><div class="simple-model-grid">
+                    <fieldset class="simple-model-route"><legend>默认模型（均衡）</legend><label>模型 ID<input id="connModel" list="connModelList" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="connModelDisplayName" placeholder="如 DeepSeek V4 Pro" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>高质量模型（可选）</legend><label>模型 ID<input id="connRoleQuality" list="connModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="connRoleQualityDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>快速模型（可选）</legend><label>模型 ID<input id="connRoleFast" list="connModelList" placeholder="留空则使用默认模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="connRoleFastDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                    <fieldset class="simple-model-route"><legend>Fable 模型（可选）</legend><label>模型 ID<input id="connRoleFable" list="connModelList" placeholder="留空则使用高质量模型" autocomplete="off" spellcheck="false" /></label><label>显示名称（可选）<input id="connRoleFableDisplayName" autocomplete="off" spellcheck="false" /></label></fieldset>
+                  </div><datalist id="connModelList"></datalist><div class="hint" id="connCatalogWarning">模型 ID 用于上游请求；显示名称用于 Science 模型菜单（对应 display_name），留空则使用模型 ID。</div></div>
+                  <div id="connCodexCatalog" class="codex-catalog" hidden><div class="codex-catalog-list" id="connCodexCatalogList"></div></div><div class="hint" id="connModelHint"></div>
+                </div>
                 <div class="field" id="connKeyGroup"><label for="connKey">API Key / Token</label><input id="connKey" type="password" autocomplete="off" spellcheck="false" /><div class="hint">留空＝不改；要移除请使用“清除 key”。</div></div>
               </div>
               <div class="form-actions"><button class="btn primary" id="connSaveBtn">保存连接</button><button class="btn danger" id="connClearBtn">清除 key</button><button class="btn" id="connCancelBtn">取消</button></div>
@@ -174,9 +194,9 @@
 
           <section class="app-page" data-page="status" aria-label="状态">
             <div class="status-page-grid">
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">PROXY</div><h2>本地代理</h2><p>负责把 Claude Science 请求路由到当前第三方模型。</p><div class="large-state"><i class="lt a" data-mirror-light="ltProxy"></i><span data-mirror-text="proxyStateText">检查中</span></div></section>
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">SANDBOX</div><h2>隔离 Science</h2><p>运行在 CSSwitch 管理的独立 HOME 与数据目录中。</p><div class="large-state"><i class="lt a" data-mirror-light="ltSandbox"></i><span data-mirror-text="sandboxStateText">检查中</span></div></section>
-              <section class="surface status-detail-card tp-only"><div class="section-kicker">UPSTREAM</div><h2>模型上游</h2><p>仅代表当前代理探测到的连接健康状态。</p><div class="large-state"><i class="lt a" data-mirror-light="ltUpstream"></i><span data-mirror-text="upstreamStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">PROXY</div><h2>本地代理</h2><p>负责把 Claude Science 请求路由到当前第三方模型。</p><div class="large-state"><i class="lt a" data-mirror-light="ltProxy"></i><span data-mirror-text="proxyStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">SANDBOX</div><h2>隔离 Science</h2><p>运行在 CSSwitch 管理的独立 HOME 与数据目录中。</p><div class="large-state"><i class="lt a" data-mirror-light="ltSandbox"></i><span data-mirror-text="sandboxStateText">检查中</span></div></section>
+              <section class="surface status-detail-card"><div class="section-kicker">UPSTREAM</div><h2>模型上游</h2><p>仅代表当前代理探测到的连接健康状态。</p><div class="large-state"><i class="lt a" data-mirror-light="ltUpstream"></i><span data-mirror-text="upstreamStateText">检查中</span></div></section>
             </div>
             <section class="surface diagnostics-card">
               <div class="section-heading"><div><div class="section-kicker">DIAGNOSTICS</div><h2>诊断与支持</h2><p>这些动作沿用现有后端能力，不会改变 Skill 或 MCP 配置。</p></div></div>
@@ -240,7 +260,7 @@
               </section>
             </section>
 
-            <section class="surface official-only"><div class="empty-state"><h2>官方模式沿用 Claude Science 设置</h2><p>切换回第三方模式可调整 CSSwitch 代理与沙箱端口。</p></div></section>
+            <section class="surface official-only"><div class="empty-state"><h2>官方实例由 Claude Science 管理</h2><p>官方实例可与第三方隔离实例同时运行；切换操作对象不会停止任何实例。</p></div></section>
           </section>
         </div>
 

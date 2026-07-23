@@ -174,7 +174,10 @@ test("simple model projection preserves selectors and unbound legacy routes", ()
     sonnet: "sel-default", opus: "sel-quality", haiku: "sel-default", fable: "sel-quality",
   });
   assert.deepEqual(fields, {
-    default_model: "balanced", quality_model: "quality", fast_model: "", fable_model: "",
+    default_model: "balanced", default_display_name: "default",
+    quality_model: "quality", quality_display_name: "Quality",
+    fast_model: "", fast_display_name: "",
+    fable_model: "", fable_display_name: "",
   });
   const payload = buildSimpleModelSubmission(fields, {
     existing_routes: existing,
@@ -183,6 +186,54 @@ test("simple model projection preserves selectors and unbound legacy routes", ()
   assert.equal(payload.default_model_route_id, "sel-default");
   assert.equal(payload.model_catalog[0].display_name, "balanced");
   assert.ok(payload.model_catalog.some((route) => route.selector_id === "sel-extra"));
+});
+
+test("editable display names stay separate from exact upstream model IDs", () => {
+  const existing = [
+    {
+      selector_id: "claude-csswitch-custom-openai-responses-deepseek-v4-pro-111111111111",
+      upstream_model: "deepseek-v4-pro",
+      display_name: "deepseek-v4-pro",
+      supports_tools: null,
+    },
+    {
+      selector_id: "claude-csswitch-custom-openai-responses-deepseek-v4-flash-222222222222",
+      upstream_model: "deepseek-v4-flash",
+      display_name: "deepseek-v4-flash",
+      supports_tools: null,
+    },
+  ];
+  const refs = {
+    default: existing[0].selector_id,
+    balanced: existing[0].selector_id,
+    quality: existing[0].selector_id,
+    fast: existing[1].selector_id,
+    fable: existing[0].selector_id,
+  };
+  const fields = projectSimpleModelFields(existing, refs.default, {
+    sonnet: refs.balanced, opus: refs.quality, haiku: refs.fast, fable: refs.fable,
+  });
+  assert.equal(fields.default_display_name, "deepseek-v4-pro");
+  assert.equal(fields.fast_display_name, "deepseek-v4-flash");
+
+  const payload = buildSimpleModelSubmission({
+    ...fields,
+    default_display_name: "DeepSeek V4 Pro",
+    fast_display_name: "DeepSeek V4 Flash",
+  }, {
+    existing_routes: existing,
+    existing_references: refs,
+    preserve_existing_sonnet: true,
+  });
+  assert.deepEqual(payload.model_catalog.map((route) => ({
+    display_name: route.display_name,
+    upstream_model: route.upstream_model,
+  })), [
+    { display_name: "DeepSeek V4 Pro", upstream_model: "deepseek-v4-pro" },
+    { display_name: "DeepSeek V4 Flash", upstream_model: "deepseek-v4-flash" },
+  ]);
+  assert.equal(payload.default_model_route_id, existing[0].selector_id);
+  assert.equal(payload.role_bindings.haiku, existing[1].selector_id);
 });
 
 test("blank optional fields inherit the exact selector selected by their parent role", () => {
@@ -284,11 +335,18 @@ test("role summary groups SiliconFlow roles and stays quiet for one model or dyn
 
 test("provider forms expose four free model inputs plus read-only scratch discovery", () => {
   const html = readFileSync(new URL("../desktop/src/index.html", import.meta.url), "utf8");
+  const js = readFileSync(new URL("../desktop/src/main.js", import.meta.url), "utf8");
+  const busyControls = js.slice(js.indexOf("function setBusy("), js.indexOf("function syncOpenBrowserControl("));
   for (const prefix of ["wiz", "conn"]) {
     for (const id of [`${prefix}Model`, `${prefix}RoleQuality`, `${prefix}RoleFast`, `${prefix}RoleFable`]) {
       assert.match(html, new RegExp(`<input id="${id}"`));
     }
+    for (const id of [`${prefix}ModelDisplayName`, `${prefix}RoleQualityDisplayName`, `${prefix}RoleFastDisplayName`, `${prefix}RoleFableDisplayName`]) {
+      assert.match(html, new RegExp(`<input id="${id}"`));
+      assert.match(busyControls, new RegExp(`els\\.${id}\\b`));
+    }
   }
+  assert.match(html, /显示名称用于 Science 模型菜单/);
   assert.doesNotMatch(html, /搜索已发现模型|添加精确 ID|勾选白名单|同步最新推荐/);
   assert.match(html, /id="wizFetchBtn"[^>]*>获取可用模型</);
   assert.match(html, /id="connFetchBtn"[^>]*>获取可用模型</);

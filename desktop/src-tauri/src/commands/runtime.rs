@@ -97,21 +97,23 @@ pub(crate) fn stop_sandbox_state<R: tauri::Runtime>(
     result
 }
 
-/// 切换运行模式（"proxy" 第三方 / "official" 官方）。切官方要先拆第三方链路成功再落盘。
+/// 切换当前操作视图（"proxy" 第三方 / "official" 官方）。
+///
+/// 官方 Science 是不受 CSSwitch 管理的独立实例；切换视图不得拆掉已经运行的
+/// 第三方 Gateway/隔离 Science。串行锁只用于等待在途 start/stop 完成后再保存视图，
+/// 防止配置更新与运行事务交错。
 #[tauri::command]
 pub(crate) async fn set_mode(
-    app: tauri::AppHandle,
     state: State<'_, SharedAppState>,
     lifecycle: State<'_, SharedLifecycle>,
     mode: String,
 ) -> Result<(), String> {
     let state = state.inner().clone();
     let lifecycle = lifecycle.inner().clone();
-    run_blocking(move || set_mode_inner(app, state, lifecycle, mode)).await
+    run_blocking(move || set_mode_inner(state, lifecycle, mode)).await
 }
 
 fn set_mode_inner(
-    app: tauri::AppHandle,
     state: SharedAppState,
     lifecycle: SharedLifecycle,
     mode: String,
@@ -119,19 +121,10 @@ fn set_mode_inner(
     if mode != "proxy" && mode != "official" {
         return Err(format!("未知模式：{mode}（只支持 proxy / official）。"));
     }
-    // 经串行器（修 P1-b）：切官方的「拆链路 + 落盘」必须与「一键开始」等互斥，否则一键起到一半时
-    // 切官方会先停链路、一键随后又把沙箱/OAuth 起起来 → 显示官方却有第三方沙箱在跑。bump_generation
-    // 作废任何在途启动，防被停后又拿旧配置写回运行态。
+    // 模式现在只表示 UI 操作视图。仍经串行器与「一键开始」等互斥：在途启动先完整
+    // 成功或失败，随后才保存新视图；不停止、不重启，也不作废已完成的第三方链路。
     lifecycle.with_serialized(|| {
         let dir = config::default_dir();
-        if mode == "official" {
-            lifecycle.bump_generation();
-            let mut st = lock(&state);
-            stop_sandbox_state(&app, &mut st).map_err(|e| {
-                format!("停止沙箱失败，未切换到官方模式：{e}（真实实例 8765 未受影响）")
-            })?;
-            st.stop_proxy();
-        }
         config::update(&dir, {
             let mode = mode.clone();
             move |c| c.mode = mode
@@ -1432,6 +1425,43 @@ esac
         assert_eq!(
             fs::read_to_string(fake_state_dir.join("serve-count")).unwrap(),
             "7"
+        );
+
+        let running_pid = fs::read_to_string(fake_state_dir.join("pid")).unwrap();
+        super::set_mode_inner(state.clone(), lifecycle.clone(), "official".into())
+            .expect("switching to the official view must preserve the managed runtime");
+        assert_eq!(config::load_from(&config_dir).unwrap().mode, "official");
+        wait_http_health(proxy_port);
+        wait_http_health(sandbox_port);
+        {
+            let st = lock(&state);
+            assert!(st.proxy.is_some(), "Gateway child must remain tracked");
+            assert!(
+                st.science_runtime.is_some(),
+                "isolated Science identity must remain tracked"
+            );
+        }
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
+            running_pid,
+            "switching views must not restart isolated Science"
+        );
+
+        super::set_mode_inner(state.clone(), lifecycle.clone(), "proxy".into())
+            .expect("switching back to the third-party view should only persist the view");
+        let reopened = sandbox_session::one_click_login(
+            handle.clone(),
+            state.clone(),
+            lifecycle.as_ref(),
+            None,
+            None,
+        )
+        .expect("one-click after a view round-trip should reuse isolated Science");
+        assert_eq!(reopened["action"], "reopened");
+        assert_eq!(
+            fs::read_to_string(fake_state_dir.join("pid")).unwrap(),
+            running_pid,
+            "view round-trip must preserve the third-party session"
         );
 
         let status = super::status(app.state::<SharedAppState>());

@@ -239,8 +239,18 @@ export function summarizeProfileRoleModels(profile) {
   };
 }
 
-function simplifiedRoute(route, upstreamModel) {
-  const display = boundedText(route?.display_name);
+function optionalDisplayName(value, label) {
+  const raw = String(value ?? "");
+  if (!raw.trim()) return "";
+  const display = boundedText(raw, 256);
+  if (!display) throw new Error(`${label}不能含控制字符，且最长 256 字节。`);
+  return display;
+}
+
+function simplifiedRoute(route, upstreamModel, submittedDisplayName) {
+  const submitted = optionalDisplayName(submittedDisplayName, "显示名称");
+  const saved = boundedText(route?.display_name, 256);
+  const display = submitted || (submittedDisplayName === undefined ? saved : "");
   return {
     selector_id: boundedText(route?.selector_id, 160),
     display_name: !display || display.toLowerCase() === "default" ? upstreamModel : display,
@@ -254,14 +264,21 @@ export function projectSimpleModelFields(routes, defaultReference, bindings = {}
   const catalog = (routes || []).map((route) => normalizeCatalogCandidate(route, true)).filter(Boolean);
   const fallback = routeByReference(catalog, defaultReference) || catalog[0] || null;
   const defaultModel = fallback?.upstream_model || "";
-  const qualityModel = (routeByReference(catalog, bindings.opus) || fallback)?.upstream_model || defaultModel;
-  const fastModel = (routeByReference(catalog, bindings.haiku) || fallback)?.upstream_model || defaultModel;
-  const fableModel = (routeByReference(catalog, bindings.fable) || routeByReference(catalog, bindings.opus) || fallback)?.upstream_model || qualityModel || defaultModel;
+  const qualityRoute = routeByReference(catalog, bindings.opus) || fallback;
+  const fastRoute = routeByReference(catalog, bindings.haiku) || fallback;
+  const fableRoute = routeByReference(catalog, bindings.fable) || qualityRoute || fallback;
+  const qualityModel = qualityRoute?.upstream_model || defaultModel;
+  const fastModel = fastRoute?.upstream_model || defaultModel;
+  const fableModel = fableRoute?.upstream_model || qualityModel || defaultModel;
   return {
     default_model: defaultModel,
+    default_display_name: fallback?.display_name || defaultModel,
     quality_model: qualityModel && qualityModel !== defaultModel ? qualityModel : "",
+    quality_display_name: qualityModel && qualityModel !== defaultModel ? (qualityRoute?.display_name || qualityModel) : "",
     fast_model: fastModel && fastModel !== defaultModel ? fastModel : "",
+    fast_display_name: fastModel && fastModel !== defaultModel ? (fastRoute?.display_name || fastModel) : "",
     fable_model: fableModel && fableModel !== qualityModel ? fableModel : "",
+    fable_display_name: fableModel && fableModel !== qualityModel ? (fableRoute?.display_name || fableModel) : "",
   };
 }
 
@@ -270,6 +287,10 @@ export function buildSimpleModelSubmission(fields, options = {}) {
   const qualityInput = exactModelId(fields?.quality_model, "高质量模型");
   const fastInput = exactModelId(fields?.fast_model, "快速模型");
   const fableInput = exactModelId(fields?.fable_model, "Fable 模型");
+  const defaultDisplayName = optionalDisplayName(fields?.default_display_name, "默认模型显示名称");
+  const qualityDisplayName = optionalDisplayName(fields?.quality_display_name, "高质量模型显示名称");
+  const fastDisplayName = optionalDisplayName(fields?.fast_display_name, "快速模型显示名称");
+  const fableDisplayName = optionalDisplayName(fields?.fable_display_name, "Fable 模型显示名称");
   const qualityModel = qualityInput || defaultModel;
   const fastModel = fastInput || defaultModel;
   const fableModel = fableInput || qualityModel;
@@ -286,16 +307,20 @@ export function buildSimpleModelSubmission(fields, options = {}) {
   const selectedRoutes = [];
   const selectedKeys = new Set();
 
-  const choose = (model, preferredReference) => {
+  const choose = (model, displayName, preferredReference) => {
     const preferredRoute = routeByReference(existingRoutes, preferredReference);
-    const existing = preferredRoute?.upstream_model === model
+    const savedRoute = preferredRoute?.upstream_model === model
       ? preferredRoute
-      : existingRoutes.find((route) => route.upstream_model === model)
-        || candidateRoutes.find((route) => route.upstream_model === model);
+      : existingRoutes.find((route) => route.upstream_model === model);
+    const candidateRoute = savedRoute
+      ? null
+      : candidateRoutes.find((route) => route.upstream_model === model);
+    const existing = savedRoute || candidateRoute;
     if (existing?.supports_tools === false) {
       throw new Error(`模型 ${model} 已明确不支持 tools，不能用于 Science。`);
     }
-    const route = simplifiedRoute(existing, model);
+    const resolvedDisplayName = displayName || candidateRoute?.display_name || "";
+    const route = simplifiedRoute(existing, model, resolvedDisplayName);
     const key = route.selector_id ? `selector:${route.selector_id}` : `upstream:${route.upstream_model}`;
     if (!selectedKeys.has(key)) {
       selectedKeys.add(key);
@@ -304,11 +329,11 @@ export function buildSimpleModelSubmission(fields, options = {}) {
     return routeReference(route);
   };
 
-  const defaultRef = choose(defaultModel, preferred.default);
+  const defaultRef = choose(defaultModel, defaultDisplayName, preferred.default);
   // 留空的含义是继承同一条 selector，而不只是碰巧指向同名 upstream。
-  const qualityRef = qualityInput ? choose(qualityModel, preferred.quality) : defaultRef;
-  const fastRef = fastInput ? choose(fastModel, preferred.fast) : defaultRef;
-  const fableRef = fableInput ? choose(fableModel, preferred.fable) : qualityRef;
+  const qualityRef = qualityInput ? choose(qualityModel, qualityDisplayName, preferred.quality) : defaultRef;
+  const fastRef = fastInput ? choose(fastModel, fastDisplayName, preferred.fast) : defaultRef;
+  const fableRef = fableInput ? choose(fableModel, fableDisplayName, preferred.fable) : qualityRef;
   const previousDefault = routeByReference(existingRoutes, preferred.default);
   const previousSonnet = routeByReference(existingRoutes, preferred.balanced);
   const preserveSonnet = options.preserve_existing_sonnet === true

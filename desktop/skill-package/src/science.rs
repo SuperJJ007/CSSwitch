@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, SET_COOKIE};
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -650,18 +650,42 @@ struct ControlSession {
 }
 
 fn authenticate(client: &Client, origin: &str, nonce: &str) -> Result<ControlSession, AttachError> {
-    let auth = client
-        .post(format!("{origin}/api/auth/nonce"))
+    // Current Science consumes the nonce from the browser URL itself. Older
+    // releases exposed POST /api/auth/nonce instead, so retain that endpoint
+    // as an explicit compatibility path only when the browser exchange does
+    // not yield an authenticated session.
+    let browser_auth = client
+        .get(format!("{origin}/?nonce={nonce}"))
         .header(ORIGIN, origin)
-        .form(&[("nonce", nonce), ("dest", "/")])
-        .send()
-        .map_err(|_| {
-            AttachError::new("SCIENCE_CONTROL_FAILED", "Science nonce 认证失败").retryable(true)
-        })?;
-    ensure_success(&auth, "nonce 认证")?;
-    let auth_cookie = response_cookie(&auth, "operon_auth").ok_or_else(|| {
-        AttachError::new("SCIENCE_CONTROL_FAILED", "Science nonce 未返回会话 cookie")
-    })?;
+        .header(ACCEPT, "text/html")
+        .send();
+    let browser_cookies = browser_auth.as_ref().ok().and_then(|response| {
+        (response.status().is_success() || response.status().is_redirection()).then(|| {
+            (
+                response_cookie(response, "operon_auth"),
+                response_cookie(response, "operon_csrf"),
+            )
+        })
+    });
+    let (auth_cookie, mut csrf_cookie) = match browser_cookies {
+        Some((Some(auth_cookie), csrf_cookie)) => (auth_cookie, csrf_cookie),
+        _ => {
+            let auth = client
+                .post(format!("{origin}/api/auth/nonce"))
+                .header(ORIGIN, origin)
+                .form(&[("nonce", nonce), ("dest", "/")])
+                .send()
+                .map_err(|_| {
+                    AttachError::new("SCIENCE_CONTROL_FAILED", "Science nonce 认证失败")
+                        .retryable(true)
+                })?;
+            ensure_success(&auth, "legacy nonce 认证")?;
+            let auth_cookie = response_cookie(&auth, "operon_auth").ok_or_else(|| {
+                AttachError::new("SCIENCE_CONTROL_FAILED", "Science nonce 未返回会话 cookie")
+            })?;
+            (auth_cookie, response_cookie(&auth, "operon_csrf"))
+        }
+    };
     let csrf = client
         .get(format!("{origin}/api/csrf"))
         .header(ORIGIN, origin)
@@ -669,7 +693,8 @@ fn authenticate(client: &Client, origin: &str, nonce: &str) -> Result<ControlSes
         .send()
         .map_err(|_| AttachError::new("SCIENCE_CONTROL_FAILED", "Science CSRF 初始化失败"))?;
     ensure_success(&csrf, "CSRF 初始化")?;
-    let csrf_cookie = response_cookie(&csrf, "operon_csrf")
+    csrf_cookie = response_cookie(&csrf, "operon_csrf").or(csrf_cookie);
+    let csrf_cookie = csrf_cookie
         .ok_or_else(|| AttachError::new("SCIENCE_CONTROL_FAILED", "Science CSRF 未返回 cookie"))?;
     Ok(ControlSession {
         auth_cookie,
@@ -868,11 +893,17 @@ mod tests {
     }
 
     fn reply(stream: &mut TcpStream, cookie: Option<&str>, body: &str) {
-        let cookie = cookie
+        let cookies = cookie.into_iter().collect::<Vec<_>>();
+        reply_with_cookies(stream, &cookies, body);
+    }
+
+    fn reply_with_cookies(stream: &mut TcpStream, cookies: &[&str], body: &str) {
+        let cookies = cookies
+            .iter()
             .map(|value| format!("Set-Cookie: {value}; Path=/; SameSite=Strict\r\n"))
-            .unwrap_or_default();
+            .collect::<String>();
         let response = format!(
-            "HTTP/1.1 200 OK\r\n{cookie}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 200 OK\r\n{cookies}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         stream.write_all(response.as_bytes()).unwrap();
@@ -1061,8 +1092,7 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
         );
         worker.join().unwrap();
         let requests = requests.lock().unwrap();
-        assert!(requests[0].starts_with("POST /api/auth/nonce "));
-        assert!(requests[0].contains("nonce=fresh-nonce"));
+        assert!(requests[0].starts_with("GET /?nonce=fresh-nonce "));
         assert!(requests[1].starts_with("GET /api/csrf "));
         assert!(requests[2].starts_with("GET /api/agents?names=OPERON&include_metadata=true "));
         assert!(requests[3].starts_with("POST /api/agents/OPERON/skills "));
@@ -1072,6 +1102,77 @@ printf '%s\n' 'http://127.0.0.1:18990/?nonce=fresh-one'"#,
         assert!(requests[3].contains(r#"{"skill_name":"demo"}"#));
         assert!(requests[4].starts_with("GET /api/agents?names=OPERON&include_metadata=true "));
         fs::remove_dir_all(context.home.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn browser_nonce_may_supply_auth_and_csrf_cookies_together() {
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let worker = thread::spawn(move || {
+            let (mut auth, _) = listener.accept().unwrap();
+            assert!(read_request(&mut auth).starts_with("GET /?nonce=fresh-nonce "));
+            reply_with_cookies(
+                &mut auth,
+                &["operon_auth=auth-token", "operon_csrf=csrf-token"],
+                "{}",
+            );
+            let (mut csrf, _) = listener.accept().unwrap();
+            assert!(read_request(&mut csrf).starts_with("GET /api/csrf "));
+            reply(&mut csrf, None, "{}");
+        });
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let session =
+            authenticate(&client, &format!("http://127.0.0.1:{port}"), "fresh-nonce").unwrap();
+        assert_eq!(session.auth_cookie, "auth-token");
+        assert_eq!(session.csrf_cookie, "csrf-token");
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn legacy_nonce_endpoint_remains_an_explicit_compatibility_path() {
+        let Some(listener) = bind_loopback() else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
+        let worker = thread::spawn(move || {
+            let replies = [
+                (None, "{}"),
+                (Some("operon_auth=auth-token"), "{}"),
+                (Some("operon_csrf=csrf-token"), "{}"),
+            ];
+            for (cookie, body) in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                captured.lock().unwrap().push(read_request(&mut stream));
+                reply(&mut stream, cookie, body);
+            }
+        });
+        let client = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .redirect(Policy::none())
+            .no_proxy()
+            .build()
+            .unwrap();
+        let session =
+            authenticate(&client, &format!("http://127.0.0.1:{port}"), "fresh-nonce").unwrap();
+        assert_eq!(session.auth_cookie, "auth-token");
+        assert_eq!(session.csrf_cookie, "csrf-token");
+        worker.join().unwrap();
+        let requests = requests.lock().unwrap();
+        assert!(requests[0].starts_with("GET /?nonce=fresh-nonce "));
+        assert!(requests[1].starts_with("POST /api/auth/nonce "));
+        assert!(requests[1].contains("nonce=fresh-nonce"));
+        assert!(requests[2].starts_with("GET /api/csrf "));
     }
 
     #[test]

@@ -180,7 +180,8 @@ class SkillRuntimeBoundary(unittest.TestCase):
             "function syncActivationControls", 1
         )[0]
         self.assertIn("busy || browserOpenInFlight", control)
-        self.assertIn('browserOpenInFlight ? "打开中…" : "浏览器打开"', control)
+        self.assertIn('mode === "official" ? "打开第三方 Science" : "浏览器打开"', control)
+        self.assertIn('browserOpenInFlight ? "打开中…" : idleLabel', control)
 
         command = runtime.split("fn open_url_inner", 1)[1].split(
             "pub(crate) async fn quit_app", 1
