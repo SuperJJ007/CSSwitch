@@ -1,11 +1,15 @@
 # CSSwitch 文档总入口
 
-当前维护基线为 v0.8.0。公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入；本目录按内容寿命和证据类型分类。
+公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入。本目录的公开文档只描述 CSSwitch 自己的产品合同、运维方法和可复核证据；外部 runtime 的私有调查材料不属于公开文档。
 
 ## 架构
 
-- [架构总览](architecture/overview.md)：边界、所有权、数据流和失败边界。
-- [Science runtime](architecture/science-runtime.md)：稳定的 binary、data-dir、身份和网络合同。
+- [架构索引](architecture/README.md)：按稳定问题选择当前架构正文。
+- [架构总览](architecture/overview.md)：产品边界、所有权、依赖方向和高层故障定位。
+- [Desktop 控制面](architecture/desktop-control-plane.md)：Tauri command/event/DTO 与 frontend caller。
+- [运行时状态与事务](architecture/runtime-state-transactions.md)：CSSwitch 状态 ownership、锁序、journal、recovery 与补偿。
+- [Gateway 与 provider 路由](architecture/gateway-provider-routing.md)：正式/scratch Gateway、Codex、Skill stdio 与 runtime adapter 边界。
+- [Science runtime 适配合同](architecture/science-runtime.md)：只描述 CSSwitch-owned executable、隔离、identity 与 recovery contract。
 
 ## 运维
 
@@ -14,26 +18,33 @@
 - [真机验收](operations/real-machine-acceptance.md)
 - [发布](operations/release.md)
 - [升级与回滚](operations/upgrade-and-rollback.md)
-- [Quality kernel](operations/quality-kernel.md)：机器事实源、变化登记、source-green 与证据层边界。
+- [Quality kernel](operations/quality-kernel.md)：机器事实源、source-green 与证据层边界。
 
 ## 功能合同
 
+- [功能合同索引](features/README.md)
 - [外部 Skill bridge](features/external-skill-bridge.md)
 - [系统 SSH 配置复用](features/system-ssh.md)
-- [v0.7 UI 信息架构](features/ui-information-architecture.md)：模型连接、Codex 设置和扩展能力的页面职责。
+- [UI 信息架构](features/ui-information-architecture.md)
 
 ## 证据
 
-- [发布证据](evidence/releases/README.md)：按版本记录最终 artifact 与分发结果。
-- [日期化调查](evidence/investigations/README.md)：只证明特定日期、runtime 和环境。
+- [证据索引](evidence/README.md)
+- [发布证据](evidence/releases/README.md)
+- [日期化调查](evidence/investigations/README.md)
+
+日期化证据只证明所绑定的源码、artifact、runtime 和环境；不能覆盖当前架构合同。
 
 ## 外部参考
 
-- [外部项目参考](references/external/README.md)：记录 reviewed commit 与可借鉴边界，不作为代码来源。
+- [外部参考索引](references/README.md)
+- [外部项目参考](references/external/README.md)
+
+外部参考记录 reviewed source 和可借鉴边界，不作为 CSSwitch 代码或外部 runtime 内部实现的权威来源。
 
 ## 维护约定
 
-- 当前合同写在 architecture / operations / features；日期化结果不能覆盖稳定合同。
-- 当前版本、worktree 与已知问题放在 [`.agents/context/`](../.agents/context/)，不复制到每份文档。
-- Agent 行为规则放在 [`.agents/rules/`](../.agents/rules/)，文档只链接，不重复禁止项。
-- 旧公开路径在一次发布周期内保留兼容指针；指针不是第二份正文。
+- 当前合同写在 architecture、operations 与 features；索引只负责路由。
+- 当前版本、worktree 与已知问题放在 [`.agents/context/`](../.agents/context/)，不复制进架构正文。
+- Agent 强制行为放在 [`.agents/rules/`](../.agents/rules/)，文档只链接。
+- 外部 runtime 始终作为 adapter target；私有接口、内部数据库、package-static 观察、精确路径/hash/版本调查不得进入公开架构正文。
