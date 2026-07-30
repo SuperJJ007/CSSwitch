@@ -19,5 +19,6 @@
   - [真实 Science alias Stage 0](2026-07-18-v070-model-catalog-stage0.md)
 - [2026-07-28 v0.8.3 SSH 晚失败源码修复](2026-07-28-v083-ssh-late-source-repair.md)
 - [2026-07-28 Claude Science 0.1.20 → 0.1.25 兼容与 updater 修复](2026-07-28-claude-science-0.1.25-compatibility.md)
+- [2026-07-30 CSSwitch 代码重构优先级](2026-07-30-csswitch-refactor-priorities.md)
 
 调查结论绑定日期、上游版本和环境。需要稳定合同请回到[架构](../../architecture/README.md)或[功能文档](../../features/README.md)。
