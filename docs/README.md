@@ -1,6 +1,6 @@
 # CSSwitch 文档总入口
 
-公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入。本目录的公开文档只描述 CSSwitch 自己的产品合同、运维方法和可复核证据；外部 runtime 的私有调查材料不属于公开文档。
+公开产品概览从根目录 [README 中文版](../README.md) / [English](../README.en.md) 进入。本轮维护的 architecture、features 与 operations 当前合同只描述 CSSwitch 自己的产品边界和运维方法；`docs/evidence/` 继续保留仓库历史上已经公开的日期化证据。本轮新增的外部 runtime 私有调查材料不因主题或后继关系自动进入公开文档。
 
 ## 架构
 

@@ -21,4 +21,4 @@
 - [2026-07-28 Claude Science 0.1.20 → 0.1.25 兼容与 updater 修复](2026-07-28-claude-science-0.1.25-compatibility.md)
 - [2026-07-30 CSSwitch 代码重构优先级](2026-07-30-csswitch-refactor-priorities.md)
 
-调查结论绑定日期、上游版本和环境。需要稳定合同请回到[架构](../../architecture/README.md)或[功能文档](../../features/README.md)。
+本索引保留仓库历史上已经公开的日期化调查；新增的本地私有调查不因主题相近或存在后继关系自动进入本索引。调查结论绑定日期、上游版本和环境；需要稳定合同请回到[架构](../../architecture/README.md)或[功能文档](../../features/README.md)。
