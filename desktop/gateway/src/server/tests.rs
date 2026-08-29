@@ -329,9 +329,10 @@ fn codex_catalog_capabilities_drive_each_selected_model_request() {
     let (catalog, models_server, root) = mock_codex_model_catalog_with_models(models);
     let mut models_server = Some(models_server);
 
-    for (index, (alias, effort, summary, parallel, lite)) in [
+    for (index, (alias, requested_effort, effort, summary, parallel, lite)) in [
         (
             "claude-csswitch-codex-gpt-sequential",
+            None,
             "low",
             false,
             false,
@@ -339,12 +340,20 @@ fn codex_catalog_capabilities_drive_each_selected_model_request() {
         ),
         (
             "claude-csswitch-codex-gpt-parallel",
-            "high",
+            Some("medium"),
+            "medium",
             true,
             true,
             false,
         ),
-        ("claude-csswitch-codex-gpt-lite", "high", true, false, true),
+        (
+            "claude-csswitch-codex-gpt-lite",
+            Some("high"),
+            "high",
+            true,
+            false,
+            true,
+        ),
     ]
     .into_iter()
     .enumerate()
@@ -359,6 +368,9 @@ fn codex_catalog_capabilities_drive_each_selected_model_request() {
             "input_schema": {"type": "object"}
         }]);
         request["tool_choice"] = json!({"type": "auto"});
+        if let Some(requested_effort) = requested_effort {
+            request["output_config"] = json!({"effort": requested_effort});
+        }
         let response = capture_tcp_response(|stream| {
             handle_codex_messages_with_catalog(
                 stream,
@@ -753,7 +765,7 @@ fn codex_role_without_standard_model_and_lite_forced_tool_fail_before_post() {
     });
     assert!(response.starts_with(b"HTTP/1.1 400 Bad Request"));
     assert!(String::from_utf8_lossy(&response)
-        .contains("output_config.effort is unsupported for Codex"));
+        .contains("output_config.effort is unsupported by the selected Codex model"));
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -800,6 +812,10 @@ fn codex_models_response_exposes_science_aliases_and_cache_diagnostics() {
     assert_eq!(body["data"].as_array().unwrap().len(), 8);
     assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-5.6-sol");
     assert_eq!(body["data"][0]["display_name"], "Codex / GPT-5.6-Sol");
+    assert_eq!(body["data"][0]["reasoning_efforts"], json!(["medium"]));
+    assert_eq!(body["data"][0]["default_reasoning_effort"], "medium");
+    assert_eq!(body["data"][0]["reviewer_compatible"], true);
+    assert_eq!(body["data"][0]["transport"], "responses");
     assert_eq!(body["data"][1]["id"], "claude-csswitch-codex-gpt-5.6-terra");
     assert_eq!(body["data"][1]["display_name"], "Codex / GPT-5.6-Terra");
     assert_eq!(body["data"][2]["id"], "claude-csswitch-codex-gpt-5.6-luna");

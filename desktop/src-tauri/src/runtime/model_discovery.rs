@@ -69,6 +69,7 @@ fn build_fetch_models_contract_response(
 ) -> Result<Value, String> {
     let decorate = |live: Vec<(String, Option<bool>)>,
                     display_names: &BTreeMap<String, String>,
+                    model_metadata: &BTreeMap<String, Value>,
                     authoritative: bool,
                     healthy: bool| {
         let live_ids: BTreeSet<String> = live.iter().map(|(id, _)| id.clone()).collect();
@@ -109,6 +110,11 @@ fn build_fetch_models_contract_response(
                     model["supports_tools"] = json!(value);
                 }
             }
+            if let Some(metadata) = model_metadata.get(&id).and_then(Value::as_object) {
+                for (key, value) in metadata {
+                    model[key] = value.clone();
+                }
+            }
         }
         models
     };
@@ -136,6 +142,7 @@ fn build_fetch_models_contract_response(
                 .and_then(Value::as_u64)
                 .unwrap_or(0);
             let mut display_names = BTreeMap::new();
+            let mut model_metadata = BTreeMap::new();
             let live: Vec<(String, Option<bool>)> = v
                 .get("data")
                 .and_then(|d| d.as_array())
@@ -154,6 +161,58 @@ fn build_fetch_models_contract_response(
                             {
                                 display_names.insert(id.clone(), display_name.to_string());
                             }
+                            let reasoning_efforts = m
+                                .get("reasoning_efforts")
+                                .and_then(Value::as_array)
+                                .filter(|efforts| {
+                                    efforts.len() <= 32
+                                        && efforts.iter().all(|effort| {
+                                            effort.as_str().is_some_and(|effort| {
+                                                !effort.is_empty()
+                                                    && effort.len() <= 32
+                                                    && !effort.chars().any(char::is_control)
+                                            })
+                                        })
+                                })
+                                .cloned();
+                            let default_reasoning_effort = m
+                                .get("default_reasoning_effort")
+                                .and_then(Value::as_str)
+                                .filter(|effort| {
+                                    !effort.is_empty()
+                                        && effort.len() <= 32
+                                        && !effort.chars().any(char::is_control)
+                                });
+                            let reviewer_compatible =
+                                m.get("reviewer_compatible").and_then(Value::as_bool);
+                            let transport =
+                                m.get("transport")
+                                    .and_then(Value::as_str)
+                                    .filter(|transport| {
+                                        matches!(*transport, "responses" | "responses_lite")
+                                    });
+                            let mut metadata = serde_json::Map::new();
+                            if let Some(efforts) = reasoning_efforts {
+                                metadata.insert("reasoning_efforts".into(), Value::Array(efforts));
+                            }
+                            if let Some(effort) = default_reasoning_effort {
+                                metadata.insert(
+                                    "default_reasoning_effort".into(),
+                                    Value::String(effort.to_string()),
+                                );
+                            }
+                            if let Some(compatible) = reviewer_compatible {
+                                metadata.insert("reviewer_compatible".into(), json!(compatible));
+                            }
+                            if let Some(transport) = transport {
+                                metadata.insert(
+                                    "transport".into(),
+                                    Value::String(transport.to_string()),
+                                );
+                            }
+                            if !metadata.is_empty() {
+                                model_metadata.insert(id.clone(), Value::Object(metadata));
+                            }
                             let st = m.get("supports_tools").and_then(|b| b.as_bool());
                             Some((id, st))
                         })
@@ -162,13 +221,13 @@ fn build_fetch_models_contract_response(
                 .unwrap_or_default();
             if live.is_empty() && (!builtin.is_empty() || !saved.is_empty()) {
                 return Ok(json!({
-                    "models": decorate(vec![], &display_names, false, false),
+                    "models": decorate(vec![], &display_names, &model_metadata, false, false),
                     "source": "builtin", "error_kind": null, "upstream_status": 200,
                     "stale": false, "age_seconds": 0
                 }));
             }
             let authoritative = !live.is_empty() && !stale;
-            let models = decorate(live, &display_names, authoritative, !stale);
+            let models = decorate(live, &display_names, &model_metadata, authoritative, !stale);
             Ok(json!({
                 "models": models,
                 "source": reported_source,
@@ -196,7 +255,13 @@ fn build_fetch_models_contract_response(
                 json!(null)
             };
             Ok(json!({
-                "models": decorate(vec![], &BTreeMap::new(), false, false),
+                "models": decorate(
+                    vec![],
+                    &BTreeMap::new(),
+                    &BTreeMap::new(),
+                    false,
+                    false,
+                ),
                 "source": source,
                 "error_kind": error_kind,
                 "upstream_status": status,
@@ -530,7 +595,7 @@ mod tests {
         let live = build_fetch_models_contract_response(
             &ProbeOutcome::Ok,
             Some(200),
-            r#"{"data":[{"id":"m-live","display_name":"Codex / GPT-5.6-Sol","supports_tools":true}]}"#,
+            r#"{"data":[{"id":"m-live","display_name":"Codex / GPT-5.6-Sol","supports_tools":true,"reasoning_efforts":["low","medium","high"],"default_reasoning_effort":"medium","reviewer_compatible":false,"transport":"responses_lite"}]}"#,
             &["m-builtin"],
             &[],
         )
@@ -541,6 +606,13 @@ mod tests {
         assert_eq!(live["models"][0]["id"], "m-live");
         assert_eq!(live["models"][0]["display_name"], "Codex / GPT-5.6-Sol");
         assert_eq!(live["models"][0]["supports_tools"], true);
+        assert_eq!(
+            live["models"][0]["reasoning_efforts"],
+            serde_json::json!(["low", "medium", "high"])
+        );
+        assert_eq!(live["models"][0]["default_reasoning_effort"], "medium");
+        assert_eq!(live["models"][0]["reviewer_compatible"], false);
+        assert_eq!(live["models"][0]["transport"], "responses_lite");
 
         let unsafe_display = build_fetch_models_contract_response(
             &ProbeOutcome::Ok,

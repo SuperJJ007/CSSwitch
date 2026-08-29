@@ -45,6 +45,8 @@ You need an Apple Silicon Mac, [Claude Science](https://claude.com/download), an
 - **Model selection:** A regular profile can use one model for every role, or separate Quality, Balanced, Fast, and Fable models. Science shows the real model name instead of a `default` placeholder.
 - **Codex:** Uses a separate CSSwitch browser login and dynamic account catalog. Native `~/.codex` login is never read or modified.
 
+For Codex profiles, Science's per-request effort is mapped to `reasoning.effort` only when the selected model advertises that value. The Reviewer model remains user-selectable in `Customize → General → Reviewer model`; the Codex catalog marks Reviewer compatibility, and Responses Lite GPT-5.6 entries are not advertised as compatible with Reviewer's forced `verdict` tool contract.
+
 Provider support for tools, thinking, images, long context, and streaming varies. CSSwitch resolves the active catalog strictly; an unknown model is never silently replaced by another model.
 
 ## Skills and MCP

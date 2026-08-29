@@ -278,6 +278,10 @@ impl ResolvedCodexModel<'_> {
         self.model.default_reasoning_effort.as_deref()
     }
 
+    pub(crate) fn supported_reasoning_efforts(&self) -> &[String] {
+        &self.model.supported_reasoning_efforts
+    }
+
     pub(crate) fn supports_reasoning_summary(&self) -> bool {
         self.model.supports_reasoning_summary
     }
@@ -351,6 +355,10 @@ impl CodexModelsSnapshot {
                     "id": science_id,
                     "display_name": format!("{SCIENCE_DISPLAY_PREFIX}{}", model.display_name),
                     "supports_tools": true,
+                    "reasoning_efforts": model.supported_reasoning_efforts,
+                    "default_reasoning_effort": model.default_reasoning_effort,
+                    "reviewer_compatible": !model.use_responses_lite,
+                    "transport": if model.use_responses_lite { "responses_lite" } else { "responses" },
                     "created_at": CREATED_AT,
                 })
             })
@@ -367,6 +375,10 @@ impl CodexModelsSnapshot {
                     model.model.display_name
                 ),
                 "supports_tools": true,
+                "reasoning_efforts": model.model.supported_reasoning_efforts,
+                "default_reasoning_effort": model.model.default_reasoning_effort,
+                "reviewer_compatible": true,
+                "transport": "responses",
                 "created_at": CREATED_AT,
             }));
         }
@@ -1816,6 +1828,7 @@ mod tests {
             .unwrap();
         assert_eq!(gpt_a.raw_id(), "gpt-a");
         assert_eq!(gpt_a.default_reasoning_effort(), Some("medium"));
+        assert_eq!(gpt_a.supported_reasoning_efforts(), ["medium"]);
         assert!(gpt_a.supports_reasoning_summary());
         assert!(!gpt_a.supports_parallel_tool_calls());
         assert!(snapshot.resolve_science_model("gpt-a").is_none());
@@ -1979,6 +1992,8 @@ mod tests {
         assert_eq!(data[0]["display_name"], "Codex / GPT-5.6-Sol");
         assert_eq!(data[1]["display_name"], "Codex / GPT-5.6-Terra");
         assert_eq!(data[2]["display_name"], "Codex / GPT-5.6-Luna");
+        assert_eq!(data[0]["reviewer_compatible"], false);
+        assert_eq!(data[0]["transport"], "responses_lite");
         for raw_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let alias = science_model_alias(raw_id);
             assert_eq!(

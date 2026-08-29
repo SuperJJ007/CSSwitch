@@ -211,6 +211,8 @@ Science 每次发送的完整消息历史是唯一请求上下文。Gateway 每�
 - usage 与 stop reason；
 - 多个并行工具调用和严格 tool id 关联。
 
+Science 的 `output_config.effort` 是逐请求选择，不写入 CSSwitch profile。Gateway 只接受当前账号模型目录 `supported_reasoning_levels` 明确列出的非空取值，并把它覆盖到本次 Responses 请求的 `reasoning.effort`；未指定时继续使用目录默认值。类型错误、目录未声明、所选模型不支持或与 `thinking.type=disabled` 冲突时都在推理 POST 前返回确定性 400，不猜测、截断或回退到另一档 effort。
+
 需要跨轮传递的 Responses encrypted reasoning content 封装进 version 1 Anthropic signature。HMAC-SHA256 key 是独立 256-bit 随机值，只存于 CSSwitch 私有 `codex-thinking.v1.json` record，不能复用 path secret 或 OAuth token；成功 login 生成 / 轮换，logout 删除，relogin 产生新 key。payload 绑定 `version=1`、`purpose=codex-reasoning`、auth epoch、account hash、response item id、可选 tool call id 和 encrypted content 摘要；篡改、版本未知、账号 / epoch 不同或错误 tool 关联均 fail closed，不把不可信内容送给上游。重启保留当前 key；logout 后的旧对话必须新开会话，不接受旧 signature。
 
 推理 POST 一旦发送，CSSwitch 不做自动重发：401、尚无首字节、空 200、SSE 中断、下游断开都不重发当前请求。401 可以刷新凭据，但只供下一次用户请求使用。只有幂等模型目录 GET 可以使用有界网络重试。
@@ -237,7 +239,9 @@ reducer 必须处理文本 delta、reasoning delta、function call arguments、o
 
 2026-07-16 对本机 installed Science `0.1.18-dev.20260709.t211149.shab3f5130` 的隔离实验已验证：Science 会请求 `/v1/models?limit=1000`，但会过滤所有不以 `claude-` 开头的模型 id；同一响应中的 raw `gpt-5.3-codex` 不显示，而确定性的 `claude-csswitch-codex-gpt-5.3-codex` 会显示且可选。详细证据见 [Science 模型 ID 兼容实验](../evidence/investigations/2026-07-16-codex-science-model-compat.md)。
 
-因此模型目录内部与磁盘缓存只保存官方 raw id；Science-facing `/v1/models` 暴露 `claude-csswitch-codex-<raw-id>`，显示名显式加 `Codex / ` 前缀，不冒充 Anthropic 内置型号。Desktop 的“查看模型”按与 Gateway 相同的合同保留非空、至多 512 UTF-8 bytes 且无 Unicode 控制字符的完整 display name，不 trim，也不从 alias 猜展示名；非法或缺失时只显示明确的“显示名不可用”fallback，HTML 输出必须转义。当前账号目录 fixture 覆盖 `Codex / GPT-5.6-Sol`、`Codex / GPT-5.6-Terra`、`Codex / GPT-5.6-Luna`，但 live 目录缺少任一项时不得补造。`/v1/messages` 只接受当前账号目录中可反解的该类 alias，校验后在发送上游前恢复 raw id；直接 raw id、未知 alias 和已失效目录项都返回确定性 400，不能发出推理 POST。自动 Gate 不足以证明真实账号模型的 live 选择与上游一致性；只有绑定用户 OAuth 与 exact candidate 的 dated evidence 才能支持该结论。
+因此模型目录内部与磁盘缓存只保存官方 raw id；Science-facing `/v1/models` 暴露 `claude-csswitch-codex-<raw-id>`，显示名显式加 `Codex / ` 前缀，不冒充 Anthropic 内置型号。每个 model data 还公开目录原样校验后的 `reasoning_efforts`、`default_reasoning_effort`，以及 CSSwitch 根据 transport 得出的 `reviewer_compatible` 和 `transport`。Desktop 的“查看模型”显示精确 alias、可选 effort 与 Reviewer 兼容性；display name 按与 Gateway 相同的合同保留非空、至多 512 UTF-8 bytes 且无 Unicode 控制字符的完整值，不 trim，也不从 alias 猜展示名；非法或缺失时只显示明确的“显示名不可用”fallback，HTML 输出必须转义。当前账号目录 fixture 覆盖 `Codex / GPT-5.6-Sol`、`Codex / GPT-5.6-Terra`、`Codex / GPT-5.6-Luna`，但 live 目录缺少任一项时不得补造。`/v1/messages` 只接受当前账号目录中可反解的该类 alias，校验后在发送上游前恢复 raw id；直接 raw id、未知 alias 和已失效目录项都返回确定性 400，不能发出推理 POST。
+
+Reviewer 模型选择仍由 Science 原生 `Customize → General → Reviewer model` 管理，CSSwitch 不新增第二份持久设置；用户可填写 `/v1/models` 中的精确 Codex alias。Reviewer 请求使用 forced `tool_choice={type:tool,name:verdict}`，因此只有标准 Responses 模型标记 `reviewer_compatible=true`。`use_responses_lite=true` 的 GPT-5.6 项虽然可作为普通会话模型并支持目录声明的 effort，但 Lite 请求必须使用自动 tool choice，不能忠实承载 Reviewer 的强制 verdict 合同；它们明确标记为不兼容并在发送上游前拒绝 forced tool choice，不静默改成 auto。自动 Gate 不足以证明真实账号模型的 live 选择与上游一致性；只有绑定用户 OAuth 与 exact candidate 的 dated evidence 才能支持该结论。
 
 ## 生命周期与 UI
 

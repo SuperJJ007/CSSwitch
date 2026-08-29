@@ -776,6 +776,25 @@ function codexModelLabel(model) {
   return "显示名不可用 · " + String((model && model.id) || "");
 }
 
+function codexModelDetails(model) {
+  const id = typeof model?.id === "string" ? model.id : "";
+  const efforts = Array.isArray(model?.reasoning_efforts)
+    ? model.reasoning_efforts.filter((effort) => typeof effort === "string" && effort.length > 0)
+    : [];
+  const defaultEffort = typeof model?.default_reasoning_effort === "string"
+    ? model.default_reasoning_effort
+    : "";
+  const effortText = efforts.length
+    ? "effort: " + efforts.join(" / ") + (defaultEffort ? "（默认 " + defaultEffort + "）" : "")
+    : "effort: 目录未声明";
+  const reviewerText = model?.reviewer_compatible === true
+    ? "Reviewer 可选"
+    : model?.reviewer_compatible === false
+      ? "Reviewer 不兼容（Responses Lite 不支持强制 verdict 工具）"
+      : "Reviewer 兼容性未知";
+  return { id, effortText, reviewerText };
+}
+
 function renderCodexCatalog(meta, list, r) {
   const models = (r && r.models) || [];
   const source = (r && r.source) || "unknown";
@@ -783,7 +802,14 @@ function renderCodexCatalog(meta, list, r) {
   const age = Number(r && r.age_seconds) || 0;
   meta.textContent = sourceText + " · " + models.length + " 个账号模型" + (age ? " · 缓存年龄 " + compactAge(age) : "");
   list.innerHTML = models.length
-    ? models.map((m) => '<div class="codex-model-item">' + escapeHtml(codexModelLabel(m)) + "</div>").join("")
+    ? models.map((m) => {
+        const details = codexModelDetails(m);
+        return '<div class="codex-model-item"><div class="codex-model-name">'
+          + escapeHtml(codexModelLabel(m))
+          + '</div><code class="codex-model-id">' + escapeHtml(details.id)
+          + '</code><div class="codex-model-capabilities">' + escapeHtml(details.effortText)
+          + " · " + escapeHtml(details.reviewerText) + "</div></div>";
+      }).join("")
     : '<div class="codex-model-empty">账号目录当前没有可展示模型。</div>';
   if (source === "stale-cache" || (r && r.stale)) {
     setMsg("官方目录暂时不可达，当前展示过期缓存（年龄 " + compactAge(age) + "）。可用于识别已有模型，但请稍后刷新确认。", "err");
@@ -792,7 +818,7 @@ function renderCodexCatalog(meta, list, r) {
   } else if (r && r.error_kind === "network") {
     setMsg("官方 Codex 模型目录当前不可达，且没有可用缓存。没有模型被伪造或写入配置，请稍后重试。", "err");
   } else {
-    setMsg("已读取 " + models.length + " 个 Codex 账号模型（" + sourceText + "）。模型不会写入配置，请在 Science 的 More models 中选择。", "ok");
+    setMsg("已读取 " + models.length + " 个 Codex 账号模型（" + sourceText + "）。普通模型与 Reviewer 模型均由你在 Science 中选择；Responses Lite 项不能用于 Reviewer。", "ok");
   }
 }
 
