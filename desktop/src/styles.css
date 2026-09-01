@@ -407,6 +407,9 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); backgro
 .codex-catalog-list{max-height:132px;overflow:auto;padding:5px 9px}
 .codex-model-item{padding:4px 0;font:10.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;
   color:var(--ink);word-break:break-all}
+.codex-model-name{font-weight:600}
+.codex-model-id,.codex-model-capabilities{display:block;margin-top:2px;color:var(--sub);font:9.5px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace}
+.codex-model-id{user-select:all}
 .codex-model-item+.codex-model-item{border-top:1px solid var(--line)}
 .codex-model-empty{padding:5px 0;font-size:10.5px;color:var(--sub)}
 .catalog-field{grid-column:1 / -1}

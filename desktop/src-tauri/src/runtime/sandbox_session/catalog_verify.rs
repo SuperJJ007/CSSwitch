@@ -15,8 +15,32 @@ pub(super) const SCIENCE_CANONICAL_ROLE_MODEL_IDS: [&str; 5] = [
     "claude-haiku-4-5-20251001",
 ];
 
-pub(super) fn is_science_canonical_role_model(id: &str) -> bool {
-    SCIENCE_CANONICAL_ROLE_MODEL_IDS.contains(&id)
+const SCIENCE_CODEX_MODEL_PREFIX: &str = "claude-csswitch-codex-";
+const SCIENCE_CODEX_REVIEWER_MODEL_IDS: [&str; 3] = [
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001",
+];
+
+fn is_science_codex_model_alias(id: &str) -> bool {
+    let Some(raw_id) = id.strip_prefix(SCIENCE_CODEX_MODEL_PREFIX) else {
+        return false;
+    };
+    !raw_id.is_empty()
+        && id.len() <= 256
+        && raw_id.is_ascii()
+        && raw_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+}
+
+fn has_valid_codex_reviewer_slots(ids: &[&str]) -> bool {
+    let published: Vec<&str> = ids
+        .iter()
+        .copied()
+        .filter(|id| SCIENCE_CODEX_REVIEWER_MODEL_IDS.contains(id))
+        .collect();
+    SCIENCE_CODEX_REVIEWER_MODEL_IDS.starts_with(&published)
 }
 
 pub(super) fn verify_gateway_model_catalog(
@@ -51,15 +75,17 @@ pub(super) fn verify_gateway_model_catalog(
         ids.push(id);
     }
     if profile.model_policy == crate::provider_contracts::ModelPolicy::DynamicCatalog {
-        if !ids
-            .iter()
-            .any(|id| id.starts_with("claude-csswitch-codex-"))
+        // Codex assigns its first three standard Responses models to the three
+        // Reviewer selector ids understood by Science 0.1.41. An account with
+        // one to three visible standard models can therefore publish no
+        // `claude-csswitch-codex-*` row at all. The old verifier required both
+        // a dynamic alias and all five historical Claude roles, so it rejected
+        // every such valid snapshot after Reviewer model selection was added.
+        if ids.is_empty()
             || ids.iter().any(|id| {
-                !id.starts_with("claude-csswitch-codex-") && !is_science_canonical_role_model(id)
+                !is_science_codex_model_alias(id) && !SCIENCE_CODEX_REVIEWER_MODEL_IDS.contains(id)
             })
-            || SCIENCE_CANONICAL_ROLE_MODEL_IDS
-                .iter()
-                .any(|canonical| !unique.contains(canonical))
+            || !has_valid_codex_reviewer_slots(&ids)
         {
             return Err("Codex published model snapshot 为空或包含非法 alias".into());
         }

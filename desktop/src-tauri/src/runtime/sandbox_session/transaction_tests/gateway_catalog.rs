@@ -54,8 +54,6 @@ fn dynamic_catalog_cold_response_uses_one_long_local_request() {
             {"id":"claude-csswitch-codex-gpt-5"},
             {"id":"claude-opus-5"},
             {"id":"claude-sonnet-5"},
-            {"id":"claude-opus-4-8"},
-            {"id":"claude-sonnet-4-6"},
             {"id":"claude-haiku-4-5-20251001"}
         ]}"#;
     let (port, requests, server) = serve_models_after(Duration::from_millis(600), body);
@@ -67,18 +65,31 @@ fn dynamic_catalog_cold_response_uses_one_long_local_request() {
 }
 
 #[test]
+fn dynamic_catalog_accepts_reviewer_only_snapshot_for_three_standard_models() {
+    let body = r#"{"data":[
+            {"id":"claude-opus-5"},
+            {"id":"claude-sonnet-5"},
+            {"id":"claude-haiku-4-5-20251001"}
+        ]}"#;
+    let (port, _requests, server) = serve_models_after(Duration::ZERO, body);
+    let profile = profile_with_policy(ModelPolicy::DynamicCatalog);
+
+    verify_gateway_model_catalog(port, "test-secret", &profile).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn dynamic_catalog_still_rejects_empty_or_non_codex_aliases() {
     for body in [
         r#"{"data":[]}"#,
         r#"{"data":[{"id":"gpt-5"}]}"#,
         r#"{"data":[{"id":"claude-sonnet-5"}]}"#,
         r#"{"data":[{"id":"claude-csswitch-codex-gpt-5"},{"id":"unknown-alias"}]}"#,
+        r#"{"data":[{"id":"claude-csswitch-codex-"}]}"#,
         r#"{"data":[
                 {"id":"claude-csswitch-codex-gpt-5"},
                 {"id":"claude-opus-5"},
-                {"id":"claude-sonnet-5"},
-                {"id":"claude-opus-4-8"},
-                {"id":"claude-sonnet-4-6"}
+                {"id":"claude-haiku-4-5-20251001"}
             ]}"#,
     ] {
         let (port, _requests, server) = serve_models_after(Duration::ZERO, body);

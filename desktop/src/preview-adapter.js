@@ -265,9 +265,9 @@ export function mockInvoke(cmd, args) {
       if (args.req && args.req.template_id === "codex") {
         return Promise.resolve({
           models: PREVIEW_CODEX_NETWORK ? [] : [
-            { id: "claude-csswitch-codex-gpt-5.6-sol", display_name: "Codex / GPT-5.6-Sol", supports_tools: true },
-            { id: "claude-csswitch-codex-gpt-5.6-terra", display_name: "Codex / GPT-5.6-Terra", supports_tools: true },
-            { id: "claude-csswitch-codex-gpt-5.6-luna", display_name: "Codex / GPT-5.6-Luna", supports_tools: true },
+            { id: "claude-csswitch-codex-gpt-5.6-sol", display_name: "Codex / GPT-5.6-Sol", supports_tools: true, reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], default_reasoning_effort: "medium", reviewer_compatible: false, transport: "responses_lite" },
+            { id: "claude-csswitch-codex-gpt-5.6-terra", display_name: "Codex / GPT-5.6-Terra", supports_tools: true, reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], default_reasoning_effort: "medium", reviewer_compatible: false, transport: "responses_lite" },
+            { id: "claude-csswitch-codex-gpt-5.6-luna", display_name: "Codex / GPT-5.6-Luna", supports_tools: true, reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"], default_reasoning_effort: "medium", reviewer_compatible: false, transport: "responses_lite" },
           ],
           source: PREVIEW_CODEX_STALE ? "stale-cache" : PREVIEW_CODEX_NETWORK ? "network" : "live",
           error_kind: PREVIEW_CODEX_STALE || PREVIEW_CODEX_NETWORK ? "network" : null,

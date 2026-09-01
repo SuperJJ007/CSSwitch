@@ -51,6 +51,15 @@ const MAX_ETAG_BYTES: usize = 512;
 const MAX_REASONING_LEVELS: usize = 32;
 const MAX_REASONING_EFFORT_BYTES: usize = 32;
 const CREATED_AT: &str = "2026-01-01T00:00:00Z";
+// Science 0.1.41 exposes three built-in Reviewer slots by these selector ids.
+// Keep the ids for protocol compatibility, but publish the assigned Codex
+// model names directly so neither the main picker nor Reviewer picker leaks
+// misleading Claude role names.
+const SCIENCE_REVIEWER_ROLE_IDS: [&str; 3] = [
+    "claude-opus-5",
+    "claude-sonnet-5",
+    "claude-haiku-4-5-20251001",
+];
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -278,6 +287,10 @@ impl ResolvedCodexModel<'_> {
         self.model.default_reasoning_effort.as_deref()
     }
 
+    pub(crate) fn supported_reasoning_efforts(&self) -> &[String] {
+        &self.model.supported_reasoning_efforts
+    }
+
     pub(crate) fn supports_reasoning_summary(&self) -> bool {
         self.model.supports_reasoning_summary
     }
@@ -320,16 +333,31 @@ impl CodexModelsSnapshot {
         if crate::static_profile::official_role_alias(requested).is_none() {
             return Err(CodexModelResolutionError::UnknownSelector);
         }
-        self.models
+        let compatible = self.compatible_reviewer_models();
+        let selected = SCIENCE_REVIEWER_ROLE_IDS
             .iter()
-            .filter(|candidate| !candidate.use_responses_lite)
-            .min_by(|left, right| {
-                left.priority
-                    .cmp(&right.priority)
-                    .then_with(|| left.id.cmp(&right.id))
-            })
+            .position(|role| *role == requested)
+            .and_then(|index| compatible.get(index).copied())
+            // Legacy Science role aliases remain accepted for old sessions,
+            // but are intentionally no longer advertised in the model list.
+            .or_else(|| compatible.first().copied());
+        selected
             .map(|model| ResolvedCodexModel { model })
             .ok_or(CodexModelResolutionError::NoCompatibleStandardResponsesModel)
+    }
+
+    fn compatible_reviewer_models(&self) -> Vec<&CachedModel> {
+        let mut compatible: Vec<&CachedModel> = self
+            .models
+            .iter()
+            .filter(|candidate| !candidate.use_responses_lite)
+            .collect();
+        compatible.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        compatible
     }
 
     pub(crate) fn source(&self) -> CatalogSource {
@@ -341,35 +369,31 @@ impl CodexModelsSnapshot {
     }
 
     pub(crate) fn response_body(&self) -> Value {
-        let mut data: Vec<Value> = self
+        let reviewer_models = self.compatible_reviewer_models();
+        let data: Vec<Value> = self
             .models
             .iter()
             .map(|model| {
-                let science_id = science_model_alias(&model.id);
+                let reviewer_slot = reviewer_models
+                    .iter()
+                    .position(|candidate| candidate.id == model.id)
+                    .and_then(|index| SCIENCE_REVIEWER_ROLE_IDS.get(index));
+                let science_id = reviewer_slot
+                    .map(|id| (*id).to_owned())
+                    .unwrap_or_else(|| science_model_alias(&model.id));
                 json!({
                     "type": "model",
                     "id": science_id,
                     "display_name": format!("{SCIENCE_DISPLAY_PREFIX}{}", model.display_name),
                     "supports_tools": true,
+                    "reasoning_efforts": model.supported_reasoning_efforts,
+                    "default_reasoning_effort": model.default_reasoning_effort,
+                    "reviewer_compatible": !model.use_responses_lite,
+                    "transport": if model.use_responses_lite { "responses_lite" } else { "responses" },
                     "created_at": CREATED_AT,
                 })
             })
             .collect();
-        for (id, canonical_name) in crate::static_profile::SCIENCE_CANONICAL_ROLE_MODELS {
-            let Ok(model) = self.resolve_request_model(id) else {
-                continue;
-            };
-            data.push(json!({
-                "type": "model",
-                "id": id,
-                "display_name": format!(
-                    "{canonical_name} · {SCIENCE_DISPLAY_PREFIX}{}",
-                    model.model.display_name
-                ),
-                "supports_tools": true,
-                "created_at": CREATED_AT,
-            }));
-        }
         json!({
             "data": data,
             "has_more": false,
@@ -1799,10 +1823,7 @@ mod tests {
         assert!(snapshot.contains_raw("gpt-b"));
         assert!(snapshot.contains_raw("chatgpt-only"));
         assert!(!snapshot.contains_raw("hidden"));
-        assert_eq!(
-            snapshot.response_body()["first_id"],
-            "claude-csswitch-codex-chatgpt-only"
-        );
+        assert_eq!(snapshot.response_body()["first_id"], "claude-opus-5");
         let chatgpt_only = snapshot
             .resolve_science_model("claude-csswitch-codex-chatgpt-only")
             .unwrap();
@@ -1816,6 +1837,7 @@ mod tests {
             .unwrap();
         assert_eq!(gpt_a.raw_id(), "gpt-a");
         assert_eq!(gpt_a.default_reasoning_effort(), Some("medium"));
+        assert_eq!(gpt_a.supported_reasoning_efforts(), ["medium"]);
         assert!(gpt_a.supports_reasoning_summary());
         assert!(!gpt_a.supports_parallel_tool_calls());
         assert!(snapshot.resolve_science_model("gpt-a").is_none());
@@ -1979,6 +2001,8 @@ mod tests {
         assert_eq!(data[0]["display_name"], "Codex / GPT-5.6-Sol");
         assert_eq!(data[1]["display_name"], "Codex / GPT-5.6-Terra");
         assert_eq!(data[2]["display_name"], "Codex / GPT-5.6-Luna");
+        assert_eq!(data[0]["reviewer_compatible"], false);
+        assert_eq!(data[0]["transport"], "responses_lite");
         for raw_id in ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"] {
             let alias = science_model_alias(raw_id);
             assert_eq!(
@@ -2008,15 +2032,41 @@ mod tests {
     }
 
     #[test]
-    fn routable_canonical_roles_are_published_for_science_settings() {
-        let body = serde_json::to_vec(&json!({"models": [{
-            "slug": "gpt-standard",
-            "display_name": "GPT Standard",
-            "visibility": "list",
-            "priority": 1,
-            "supports_reasoning_summaries": true,
-            "use_responses_lite": false
-        }]}))
+    fn reviewer_slots_publish_distinct_codex_names_without_claude_role_labels() {
+        let body = serde_json::to_vec(&json!({"models": [
+            {
+                "slug": "gpt-lite",
+                "display_name": "GPT Lite",
+                "visibility": "list",
+                "priority": 1,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": true
+            },
+            {
+                "slug": "gpt-review-1",
+                "display_name": "GPT Review 1",
+                "visibility": "list",
+                "priority": 2,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": false
+            },
+            {
+                "slug": "gpt-review-2",
+                "display_name": "GPT Review 2",
+                "visibility": "list",
+                "priority": 3,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": false
+            },
+            {
+                "slug": "gpt-review-3",
+                "display_name": "GPT Review 3",
+                "visibility": "list",
+                "priority": 4,
+                "supports_reasoning_summaries": true,
+                "use_responses_lite": false
+            }
+        ]}))
         .unwrap();
         let (endpoint, _count, _requests, server) =
             serve_responses(vec![response("200 OK", &body, "")]);
@@ -2028,22 +2078,45 @@ mod tests {
         server.join().unwrap();
         let response = snapshot.response_body();
         let data = response["data"].as_array().unwrap();
-        for id in [
-            "claude-opus-5",
-            "claude-sonnet-5",
-            "claude-opus-4-8",
-            "claude-sonnet-4-6",
-            "claude-haiku-4-5-20251001",
-        ] {
-            assert!(
-                data.iter().any(|model| model["id"] == id),
-                "Science canonical model {id} must be listed when it is routable"
-            );
-            assert_eq!(
-                snapshot.resolve_request_model(id).unwrap().raw_id(),
-                "gpt-standard"
-            );
+        assert_eq!(data.len(), 4);
+        assert_eq!(data[0]["id"], "claude-csswitch-codex-gpt-lite");
+        for (index, (id, display_name, raw_id)) in [
+            ("claude-opus-5", "Codex / GPT Review 1", "gpt-review-1"),
+            ("claude-sonnet-5", "Codex / GPT Review 2", "gpt-review-2"),
+            (
+                "claude-haiku-4-5-20251001",
+                "Codex / GPT Review 3",
+                "gpt-review-3",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(data[index + 1]["id"], id);
+            assert_eq!(data[index + 1]["display_name"], display_name);
+            assert!(!data[index + 1]["display_name"]
+                .as_str()
+                .unwrap()
+                .contains("Opus"));
+            assert!(!data[index + 1]["display_name"]
+                .as_str()
+                .unwrap()
+                .contains("Sonnet"));
+            assert!(!data[index + 1]["display_name"]
+                .as_str()
+                .unwrap()
+                .contains("Haiku"));
+            assert_eq!(snapshot.resolve_request_model(id).unwrap().raw_id(), raw_id);
         }
+        assert!(!data.iter().any(|model| model["id"] == "claude-opus-4-8"));
+        assert!(!data.iter().any(|model| model["id"] == "claude-sonnet-4-6"));
+        assert_eq!(
+            snapshot
+                .resolve_request_model("claude-opus-4-8")
+                .unwrap()
+                .raw_id(),
+            "gpt-review-1"
+        );
         let _ = fs::remove_dir_all(root);
     }
 

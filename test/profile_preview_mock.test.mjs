@@ -7,6 +7,22 @@ const source = readFileSync(new URL("../desktop/src/preview-adapter.js", import.
 const mockInvokeSource = source
   .split("export function mockInvoke(cmd, args) {", 2)[1]
   .split("\nexport function getMockCodexOperation", 1)[0];
+const profileSource = readFileSync(
+  new URL("../desktop/src/profile-controller.js", import.meta.url),
+  "utf8",
+);
+const catalogFunctions = "function isSafeCodexDisplayName" + profileSource
+  .split("function isSafeCodexDisplayName", 2)[1]
+  .split("// ── C2：新建向导 ──", 1)[0];
+
+function escapeHtml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
 
 function makeMock() {
   const context = {
@@ -92,4 +108,63 @@ test("preview clear and delete remove applied truth only for the applied profile
   await nonAppliedDelete.mockInvoke("delete_profile", { id: "b" });
   assert.equal(nonAppliedDelete.mockStore.applied_profile_id, "a");
   assert.equal(nonAppliedDelete.mockStore.selection_pending, false);
+});
+
+test("Codex catalog renders exact effort choices and Reviewer compatibility", () => {
+  const messages = [];
+  const context = {
+    TextEncoder,
+    escapeHtml,
+    modelSourceLabel: (source) => source,
+    setMsg: (message, kind) => messages.push({ message, kind }),
+  };
+  vm.createContext(context);
+  vm.runInContext(catalogFunctions, context);
+
+  const meta = { textContent: "" };
+  const list = { innerHTML: "" };
+  context.renderCodexCatalog(meta, list, {
+    source: "live",
+    age_seconds: 0,
+    models: [{
+      id: "claude-csswitch-codex-gpt-5.6-sol",
+      display_name: "Codex / GPT-5.6-Sol",
+      reasoning_efforts: ["none", "low", "medium", "high", "xhigh", "max"],
+      default_reasoning_effort: "medium",
+      reviewer_compatible: false,
+      transport: "responses_lite",
+    }],
+  });
+
+  assert.match(list.innerHTML, /claude-csswitch-codex-gpt-5\.6-sol/);
+  assert.match(list.innerHTML, /none \/ low \/ medium \/ high \/ xhigh \/ max/);
+  assert.match(list.innerHTML, /默认 medium/);
+  assert.match(list.innerHTML, /Reviewer 不兼容/);
+  assert.equal(messages.at(-1).kind, "ok");
+  assert.match(messages.at(-1).message, /Responses Lite 项不能用于 Reviewer/);
+});
+
+test("Codex catalog marks standard Responses models as Reviewer-selectable", () => {
+  const context = {
+    TextEncoder,
+    escapeHtml,
+    modelSourceLabel: (source) => source,
+    setMsg: () => {},
+  };
+  vm.createContext(context);
+  vm.runInContext(catalogFunctions, context);
+
+  const list = { innerHTML: "" };
+  context.renderCodexCatalog({ textContent: "" }, list, {
+    source: "fresh-cache",
+    models: [{
+      id: "claude-csswitch-codex-gpt-standard",
+      display_name: "Codex / GPT Standard",
+      reasoning_efforts: ["medium", "high"],
+      reviewer_compatible: true,
+      transport: "responses",
+    }],
+  });
+
+  assert.match(list.innerHTML, /Reviewer 可选/);
 });

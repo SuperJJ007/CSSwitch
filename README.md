@@ -86,6 +86,8 @@
 3. 登录成功后，Codex 配置会自动出现在「模型连接」中，但不会自动替换当前 Provider。
 4. 将 Codex 配置「设为当前」，回到首页点击「一键开始」。
 5. 在 Science 的模型选择器中选择 `Codex / …` 模型。模型列表来自当前账号的动态目录，CSSwitch 不会补造账号中不存在的模型。
+6. Science 每次请求选择的 effort 会映射到 Codex `reasoning.effort`，且只能使用该模型目录声明的取值。
+7. Science 的主模型和 Reviewer 菜单只显示真实的 `Codex / GPT-*` 名称；三个 Reviewer 槽位按账号目录优先级对应不同的兼容 Codex 模型，不再显示 Opus / Sonnet / Haiku 名称。当前标为 Responses Lite 的 GPT-5.6 模型仍可用于普通会话，但不兼容 Reviewer 的强制 `verdict` 工具合同。
 
 ### 安装与查看 Skill
 

@@ -300,6 +300,7 @@ pub struct RequestContext<'a> {
     pub auth_epoch: &'a str,
     pub account_hash: &'a str,
     pub reasoning_effort: Option<&'a str>,
+    pub supported_reasoning_efforts: &'a [String],
     pub supports_reasoning_summary: bool,
     pub supports_parallel_tool_calls: bool,
     pub use_responses_lite: bool,
@@ -446,7 +447,18 @@ pub(crate) fn translate_anthropic_exchange(
         }
     }
     let tool_choice = translate_tool_choice(object.get("tool_choice"), &tools, &tool_names)?;
-    let output_format = translate_output_format(object)?;
+    let (output_format, requested_effort) = translate_output_config(object)?;
+    if let Some(effort) = requested_effort {
+        if !context
+            .supported_reasoning_efforts
+            .iter()
+            .any(|supported| supported == effort)
+        {
+            return Err(ProtocolError::invalid(
+                "output_config.effort is unsupported by the selected Codex model",
+            ));
+        }
+    }
     if context.use_responses_lite && output_format.is_some() {
         return Err(ProtocolError::invalid(
             "structured output is unsupported for Responses Lite",
@@ -459,11 +471,16 @@ pub(crate) fn translate_anthropic_exchange(
             .and_then(|value| value.get("type"))
             .and_then(Value::as_str)
             == Some("disabled");
+    if reasoning_disabled && requested_effort.is_some() {
+        return Err(ProtocolError::invalid(
+            "output_config.effort conflicts with thinking.type=disabled",
+        ));
+    }
     let reasoning = if reasoning_disabled {
         Some(Value::Null)
     } else {
         let mut policy = serde_json::Map::new();
-        if let Some(effort) = context.reasoning_effort {
+        if let Some(effort) = requested_effort.or(context.reasoning_effort) {
             policy.insert("effort".into(), Value::String(effort.to_string()));
         }
         if context.supports_reasoning_summary {
@@ -864,21 +881,29 @@ fn translate_tools(
         .collect()
 }
 
-fn translate_output_format(object: &Map<String, Value>) -> Result<Option<Value>, ProtocolError> {
-    let current = match object.get("output_config") {
-        None => None,
+fn translate_output_config<'a>(
+    object: &'a Map<String, Value>,
+) -> Result<(Option<Value>, Option<&'a str>), ProtocolError> {
+    let (current, effort) = match object.get("output_config") {
+        None => (None, None),
         Some(Value::Object(config)) => {
-            if config.contains_key("effort") {
-                return Err(ProtocolError::invalid(
-                    "output_config.effort is unsupported for Codex",
-                ));
-            }
-            if config.keys().any(|key| key != "format") {
+            if config.keys().any(|key| key != "format" && key != "effort") {
                 return Err(ProtocolError::invalid(
                     "output_config field is unsupported for Codex",
                 ));
             }
-            config.get("format")
+            let effort = match config.get("effort") {
+                Some(Value::String(effort))
+                    if !effort.is_empty()
+                        && effort.len() <= 32
+                        && !effort.chars().any(char::is_control) =>
+                {
+                    Some(effort.as_str())
+                }
+                Some(_) => return Err(ProtocolError::invalid("output_config.effort is invalid")),
+                None => None,
+            };
+            (config.get("format"), effort)
         }
         Some(_) => return Err(ProtocolError::invalid("output_config is invalid")),
     };
@@ -889,7 +914,7 @@ fn translate_output_format(object: &Map<String, Value>) -> Result<Option<Value>,
         ));
     }
     let Some(format) = current.or(legacy) else {
-        return Ok(None);
+        return Ok((None, effort));
     };
     let format = format
         .as_object()
@@ -911,12 +936,15 @@ fn translate_output_format(object: &Map<String, Value>) -> Result<Option<Value>,
         return Err(ProtocolError::bounds("request is too large"));
     }
     let digest = hex_digest(&encoded);
-    Ok(Some(json!({
-        "type": "json_schema",
-        "name": format!("csswitch_{}", &digest[..16]),
-        "schema": schema,
-        "strict": true,
-    })))
+    Ok((
+        Some(json!({
+            "type": "json_schema",
+            "name": format!("csswitch_{}", &digest[..16]),
+            "schema": schema,
+            "strict": true,
+        })),
+        effort,
+    ))
 }
 
 fn validate_openai_strict_schema(schema: &Value) -> Result<(), ProtocolError> {
@@ -2460,6 +2488,7 @@ mod tests {
             auth_epoch: EPOCH,
             account_hash: ACCOUNT,
             reasoning_effort: Some("high"),
+            supported_reasoning_efforts: &[],
             supports_reasoning_summary: true,
             supports_parallel_tool_calls: true,
             use_responses_lite: false,
@@ -2954,16 +2983,71 @@ mod tests {
     }
 
     #[test]
-    fn translator_rejects_unmapped_anthropic_effort_before_transport() {
+    fn translator_maps_supported_request_effort_before_transport() {
+        let efforts = ["none", "low", "medium", "high", "xhigh", "max"].map(str::to_string);
+        let context = RequestContext {
+            supported_reasoning_efforts: &efforts,
+            ..context()
+        };
         let request = json!({
             "messages": [{"role": "user", "content": "x"}],
+            "output_config": {"effort": "xhigh"},
+        });
+        let translated = translate_anthropic_request(&request, &context, &signer()).unwrap();
+        assert_eq!(translated["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn translator_rejects_unsupported_request_effort_before_transport() {
+        let efforts = ["low", "medium", "high"].map(str::to_string);
+        let context = RequestContext {
+            supported_reasoning_efforts: &efforts,
+            ..context()
+        };
+        let request = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "output_config": {"effort": "max"},
+        });
+        assert!(matches!(
+            translate_anthropic_request(&request, &context, &signer()),
+            Err(ProtocolError {
+                kind: ProtocolErrorKind::InvalidRequest,
+                detail: "output_config.effort is unsupported by the selected Codex model"
+            })
+        ));
+    }
+
+    #[test]
+    fn translator_rejects_invalid_or_disabled_request_effort_before_transport() {
+        let efforts = ["high"].map(str::to_string);
+        let context = RequestContext {
+            supported_reasoning_efforts: &efforts,
+            ..context()
+        };
+        for effort in [Value::Null, json!(""), json!(7)] {
+            let request = json!({
+                "messages": [{"role": "user", "content": "x"}],
+                "output_config": {"effort": effort},
+            });
+            assert!(matches!(
+                translate_anthropic_request(&request, &context, &signer()),
+                Err(ProtocolError {
+                    kind: ProtocolErrorKind::InvalidRequest,
+                    detail: "output_config.effort is invalid"
+                })
+            ));
+        }
+
+        let request = json!({
+            "messages": [{"role": "user", "content": "x"}],
+            "thinking": {"type": "disabled"},
             "output_config": {"effort": "high"},
         });
         assert!(matches!(
-            translate_anthropic_request(&request, &context(), &signer()),
+            translate_anthropic_request(&request, &context, &signer()),
             Err(ProtocolError {
                 kind: ProtocolErrorKind::InvalidRequest,
-                detail: "output_config.effort is unsupported for Codex"
+                detail: "output_config.effort conflicts with thinking.type=disabled"
             })
         ));
     }

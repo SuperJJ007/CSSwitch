@@ -890,6 +890,7 @@ pub(super) fn collect_codex_nonstream<R: Read>(
 #[derive(Clone, Copy, Debug, Default)]
 struct CodexRequestPolicy<'a> {
     reasoning_effort: Option<&'a str>,
+    supported_reasoning_efforts: &'a [String],
     supports_reasoning_summary: bool,
     supports_parallel_tool_calls: bool,
     use_responses_lite: bool,
@@ -923,6 +924,7 @@ fn handle_codex_messages_with_policy(
         auth_epoch: secrets.auth_epoch(),
         account_hash: secrets.account_hash(),
         reasoning_effort: policy.reasoning_effort,
+        supported_reasoning_efforts: policy.supported_reasoning_efforts,
         supports_reasoning_summary: policy.supports_reasoning_summary,
         supports_parallel_tool_calls: policy.supports_parallel_tool_calls,
         use_responses_lite: policy.use_responses_lite,
@@ -1114,6 +1116,7 @@ pub(super) fn handle_codex_messages_with_catalog(
         transport,
         CodexRequestPolicy {
             reasoning_effort: target_model.default_reasoning_effort(),
+            supported_reasoning_efforts: target_model.supported_reasoning_efforts(),
             supports_reasoning_summary: target_model.supports_reasoning_summary(),
             supports_parallel_tool_calls: target_model.supports_parallel_tool_calls(),
             use_responses_lite: target_model.use_responses_lite(),
