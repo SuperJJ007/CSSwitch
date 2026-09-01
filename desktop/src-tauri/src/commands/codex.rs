@@ -32,6 +32,46 @@ const MAX_AUTH_LINE_BYTES: usize = 8 * 1024;
 const MAX_AUTH_OUTPUT_BYTES: u64 = 64 * 1024;
 const AUTH_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const ACCEPTED_CANCEL_WATCHDOG: Duration = Duration::from_secs(2);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodexAuthUnavailableCause {
+    KeychainUnavailable,
+    InteractionTimeout,
+    SidecarSpawnFailed,
+    SidecarProtocolError,
+    IdentityMismatch,
+    AuthStateInvalid,
+    StorageUnavailable,
+    UnsupportedPlatform,
+    AuthStateChanged,
+}
+
+impl CodexAuthUnavailableCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::KeychainUnavailable => "keychain_unavailable",
+            Self::InteractionTimeout => "interaction_timeout",
+            Self::SidecarSpawnFailed => "sidecar_spawn_failed",
+            Self::SidecarProtocolError => "sidecar_protocol_error",
+            Self::IdentityMismatch => "identity_mismatch",
+            Self::AuthStateInvalid => "auth_state_invalid",
+            Self::StorageUnavailable => "storage_unavailable",
+            Self::UnsupportedPlatform => "unsupported_platform",
+            Self::AuthStateChanged => "auth_state_changed",
+        }
+    }
+
+    fn retryable(self) -> bool {
+        matches!(
+            self,
+            Self::KeychainUnavailable
+                | Self::InteractionTimeout
+                | Self::StorageUnavailable
+                | Self::AuthStateChanged
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub(crate) struct CodexAuthCommandError {
     code: &'static str,
@@ -52,18 +92,12 @@ impl CodexAuthCommandError {
         }
     }
 
-    fn unavailable(cause: &'static str) -> Self {
+    fn unavailable(cause: CodexAuthUnavailableCause) -> Self {
         Self {
             code: "codex_auth_unavailable",
             reason: None,
-            cause: Some(cause),
-            retryable: matches!(
-                cause,
-                "keychain_unavailable"
-                    | "interaction_timeout"
-                    | "storage_unavailable"
-                    | "auth_state_changed"
-            ),
+            cause: Some(cause.as_str()),
+            retryable: cause.retryable(),
         }
     }
 
@@ -838,7 +872,7 @@ struct ManagedAuthProcess {
     stdin: Option<std::process::ChildStdin>,
     stdout: std::process::ChildStdout,
     pending: Vec<u8>,
-    executable_fingerprint: String,
+    identity: crate::commands::runtime::config_mutation::AuthSidecarIdentity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -851,10 +885,10 @@ enum SidecarWaitFailure {
 fn auth_error_from_sidecar_wait(error: SidecarWaitFailure) -> CodexAuthCommandError {
     match error {
         SidecarWaitFailure::Cancelled | SidecarWaitFailure::Timeout => {
-            CodexAuthCommandError::unavailable("interaction_timeout")
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::InteractionTimeout)
         }
         SidecarWaitFailure::Protocol => {
-            CodexAuthCommandError::unavailable("sidecar_protocol_error")
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarProtocolError)
         }
     }
 }
@@ -3613,6 +3647,13 @@ fn spawn_codex_auth_sidecar_at(
     let mut child = command
         .spawn()
         .map_err(|_| "无法启动 Codex 认证 sidecar。".to_string())?;
+    let identity = match capture_auth_sidecar_identity(child.id(), &executable_fingerprint) {
+        Ok(identity) => identity,
+        Err(error) => {
+            stop_auth_child(&mut child);
+            return Err(error);
+        }
+    };
     if auth_sidecar_executable_fingerprint(binary).as_deref() != Ok(executable_fingerprint.as_str())
     {
         stop_auth_child(&mut child);
@@ -3637,7 +3678,7 @@ fn spawn_codex_auth_sidecar_at(
         stdin,
         stdout,
         pending: Vec::new(),
-        executable_fingerprint,
+        identity,
     })
 }
 
@@ -3747,7 +3788,7 @@ fn wait_for_single_sidecar_response_controlled(
         stdin: _,
         ref mut stdout,
         pending,
-        executable_fingerprint: _,
+        identity: _,
     } = process;
 
     let deadline = Instant::now() + timeout;
@@ -4227,8 +4268,9 @@ fn run_codex_auth_preflight_sidecar<R: tauri::Runtime>(
     let binary = codex_gateway_bin(app)?;
     run_codex_auth_preflight_sidecar_at(
         &binary,
-        &production_home()
-            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
+        &production_home().map_err(|_| {
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+        })?,
         reservation,
         route,
     )
@@ -4248,13 +4290,15 @@ fn run_codex_auth_preflight_sidecar_at(
         None,
         false,
     )
-    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    .map_err(|_| {
+        CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+    })?;
     let identity = match auth_sidecar_identity(&process) {
         Ok(identity) => identity,
         Err(_) => {
             stop_auth_child(&mut process.child);
             return Err(CodexAuthCommandError::unavailable(
-                "sidecar_identity_unconfirmed",
+                CodexAuthUnavailableCause::SidecarProtocolError,
             ));
         }
     };
@@ -4283,8 +4327,9 @@ fn run_codex_auth_preflight_sidecar_at(
 fn codex_gateway_bin<R: tauri::Runtime>(
     app: &tauri::AppHandle<R>,
 ) -> Result<PathBuf, CodexAuthCommandError> {
-    let binary = gateway_bin_path(app)
-        .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    let binary = gateway_bin_path(app).ok_or_else(|| {
+        CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+    })?;
     Ok(binary)
 }
 
@@ -4297,14 +4342,15 @@ fn spawn_codex_auth_sidecar<R: tauri::Runtime>(
     let binary = codex_gateway_bin(app)?;
     spawn_codex_auth_sidecar_at(
         &binary,
-        &production_home()
-            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
+        &production_home().map_err(|_| {
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+        })?,
         action,
         Some(route),
         Some(operation_id),
         false,
     )
-    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
+    .map_err(|_| CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed))
 }
 
 fn register_login_process(
@@ -4325,7 +4371,13 @@ fn register_login_process(
 fn auth_sidecar_identity(
     process: &ManagedAuthProcess,
 ) -> Result<crate::commands::runtime::config_mutation::AuthSidecarIdentity, String> {
-    let pid = process.child.id();
+    Ok(process.identity.clone())
+}
+
+fn capture_auth_sidecar_identity(
+    pid: u32,
+    executable_fingerprint: &str,
+) -> Result<crate::commands::runtime::config_mutation::AuthSidecarIdentity, String> {
     let process_start = crate::runtime::science::process_start_identity_digest(pid)
         .ok_or_else(|| "Codex 认证 sidecar process-start identity 不可确认。".to_string())?;
     let process_group_id = {
@@ -4350,7 +4402,7 @@ fn auth_sidecar_identity(
         crate::commands::runtime::config_mutation::AuthSidecarIdentity {
             pid,
             process_start,
-            executable_fingerprint: process.executable_fingerprint.clone(),
+            executable_fingerprint: executable_fingerprint.to_string(),
             process_group_id,
         },
     )
@@ -4371,11 +4423,14 @@ fn run_codex_logout_sidecar_p2b<R: tauri::Runtime>(
         .auth_operation
         .as_ref()
         .map(|auth| auth.auth_operation_id.clone())
-        .ok_or_else(|| CodexAuthCommandError::unavailable("auth_state_changed"))?;
+        .ok_or_else(|| {
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::AuthStateChanged)
+        })?;
     let mut value = run_codex_logout_sidecar_at_with_identity(
         &binary,
-        &production_home()
-            .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?,
+        &production_home().map_err(|_| {
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+        })?,
         &route,
         skip_revoke,
         mutation,
@@ -4458,13 +4513,15 @@ fn run_codex_logout_sidecar_at_with_identity(
         operation_id,
         skip_revoke,
     )
-    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))?;
+    .map_err(|_| {
+        CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarSpawnFailed)
+    })?;
     let identity = match auth_sidecar_identity(&process) {
         Ok(identity) => identity,
         Err(_) => {
             stop_auth_child(&mut process.child);
             return Err(CodexAuthCommandError::unavailable(
-                "sidecar_identity_unconfirmed",
+                CodexAuthUnavailableCause::SidecarProtocolError,
             ));
         }
     };
@@ -4478,12 +4535,16 @@ fn run_codex_logout_sidecar_at_with_identity(
         .is_err()
     {
         stop_auth_child(&mut process.child);
-        return Err(CodexAuthCommandError::unavailable("auth_state_changed"));
+        return Err(CodexAuthCommandError::unavailable(
+            CodexAuthUnavailableCause::AuthStateChanged,
+        ));
     }
     if on_identity(&identity).is_err() {
         stop_auth_child(&mut process.child);
         mutation.clear_pid();
-        return Err(CodexAuthCommandError::unavailable("auth_state_changed"));
+        return Err(CodexAuthCommandError::unavailable(
+            CodexAuthUnavailableCause::AuthStateChanged,
+        ));
     }
     let result: Result<Value, CodexAuthCommandError> = if let Some(operation_id) = operation_id {
         let digest = auth_start_authorization_digest(operation_id);
@@ -4493,7 +4554,9 @@ fn run_codex_logout_sidecar_at_with_identity(
             Ok(process) => process,
             Err(_) => {
                 mutation.clear_pid();
-                return Err(CodexAuthCommandError::unavailable("auth_state_changed"));
+                return Err(CodexAuthCommandError::unavailable(
+                    CodexAuthUnavailableCause::AuthStateChanged,
+                ));
             }
         };
         let cancel = AtomicBool::new(false);
@@ -4514,7 +4577,9 @@ fn run_codex_logout_sidecar_at_with_identity(
                 "error": stream.get("error").cloned().unwrap_or(Value::Null),
             })
         })
-        .map_err(|_| CodexAuthCommandError::unavailable("sidecar_protocol_invalid"))
+        .map_err(|_| {
+            CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::SidecarProtocolError)
+        })
     } else {
         wait_for_single_sidecar_response_controlled(
             process,
@@ -4544,35 +4609,55 @@ fn require_authenticated_status_typed(value: &Value) -> Result<(), CodexAuthComm
                 .unwrap_or("");
             Err(match code {
                 "auth_busy" => CodexAuthCommandError::busy(),
-                "keychain_unavailable" => {
-                    CodexAuthCommandError::unavailable("keychain_unavailable")
+                "keychain_unavailable" => CodexAuthCommandError::unavailable(
+                    CodexAuthUnavailableCause::KeychainUnavailable,
+                ),
+                "auth_state_invalid" => {
+                    CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::AuthStateInvalid)
                 }
-                "auth_state_invalid" => CodexAuthCommandError::unavailable("auth_state_invalid"),
-                "auth_storage_error" => CodexAuthCommandError::unavailable("storage_unavailable"),
-                "unsupported_platform" => {
-                    CodexAuthCommandError::unavailable("unsupported_platform")
+                "auth_storage_error" => CodexAuthCommandError::unavailable(
+                    CodexAuthUnavailableCause::StorageUnavailable,
+                ),
+                "unsupported_platform" => CodexAuthCommandError::unavailable(
+                    CodexAuthUnavailableCause::UnsupportedPlatform,
+                ),
+                "auth_changed" => {
+                    CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::AuthStateChanged)
                 }
-                "auth_changed" => CodexAuthCommandError::unavailable("auth_state_changed"),
-                "identity_mismatch" => CodexAuthCommandError::unavailable("identity_mismatch"),
-                _ => CodexAuthCommandError::unavailable("sidecar_protocol_error"),
+                "identity_mismatch" => {
+                    CodexAuthCommandError::unavailable(CodexAuthUnavailableCause::IdentityMismatch)
+                }
+                _ => CodexAuthCommandError::unavailable(
+                    CodexAuthUnavailableCause::SidecarProtocolError,
+                ),
             })
         }
         Some(true) => {
             let authenticated = value
                 .pointer("/status/authenticated")
                 .and_then(Value::as_bool)
-                .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_protocol_error"))?;
+                .ok_or_else(|| {
+                    CodexAuthCommandError::unavailable(
+                        CodexAuthUnavailableCause::SidecarProtocolError,
+                    )
+                })?;
             if authenticated {
                 Ok(())
             } else {
                 let reason = value
                     .pointer("/status/reason")
                     .and_then(Value::as_str)
-                    .ok_or_else(|| CodexAuthCommandError::unavailable("sidecar_protocol_error"))?;
+                    .ok_or_else(|| {
+                        CodexAuthCommandError::unavailable(
+                            CodexAuthUnavailableCause::SidecarProtocolError,
+                        )
+                    })?;
                 Err(CodexAuthCommandError::login_required(reason))
             }
         }
-        None => Err(CodexAuthCommandError::unavailable("sidecar_protocol_error")),
+        None => Err(CodexAuthCommandError::unavailable(
+            CodexAuthUnavailableCause::SidecarProtocolError,
+        )),
     }
 }
 
@@ -8091,16 +8176,52 @@ mod tests {
                 json!({"code":"codex_login_required","reason":reason,"retryable":false})
             );
         }
-        for (cause, retryable) in [
-            ("keychain_unavailable", true),
-            ("interaction_timeout", true),
-            ("sidecar_spawn_failed", false),
-            ("sidecar_protocol_error", false),
-            ("identity_mismatch", false),
-            ("auth_state_invalid", false),
-            ("storage_unavailable", true),
-            ("unsupported_platform", false),
-            ("auth_state_changed", true),
+        for (cause, cause_name, retryable) in [
+            (
+                CodexAuthUnavailableCause::KeychainUnavailable,
+                "keychain_unavailable",
+                true,
+            ),
+            (
+                CodexAuthUnavailableCause::InteractionTimeout,
+                "interaction_timeout",
+                true,
+            ),
+            (
+                CodexAuthUnavailableCause::SidecarSpawnFailed,
+                "sidecar_spawn_failed",
+                false,
+            ),
+            (
+                CodexAuthUnavailableCause::SidecarProtocolError,
+                "sidecar_protocol_error",
+                false,
+            ),
+            (
+                CodexAuthUnavailableCause::IdentityMismatch,
+                "identity_mismatch",
+                false,
+            ),
+            (
+                CodexAuthUnavailableCause::AuthStateInvalid,
+                "auth_state_invalid",
+                false,
+            ),
+            (
+                CodexAuthUnavailableCause::StorageUnavailable,
+                "storage_unavailable",
+                true,
+            ),
+            (
+                CodexAuthUnavailableCause::UnsupportedPlatform,
+                "unsupported_platform",
+                false,
+            ),
+            (
+                CodexAuthUnavailableCause::AuthStateChanged,
+                "auth_state_changed",
+                true,
+            ),
         ] {
             let value = serde_json::to_value(RuntimeCommandError::from(
                 CodexAuthCommandError::unavailable(cause),
@@ -8108,7 +8229,7 @@ mod tests {
             .unwrap();
             assert_eq!(
                 value,
-                json!({"code":"codex_auth_unavailable","cause":cause,"retryable":retryable})
+                json!({"code":"codex_auth_unavailable","cause":cause_name,"retryable":retryable})
             );
         }
         assert_eq!(
@@ -10154,7 +10275,11 @@ exit 23"#,
                         Some(operation_id),
                         false,
                     )
-                    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
+                    .map_err(|_| {
+                        CodexAuthCommandError::unavailable(
+                            CodexAuthUnavailableCause::SidecarSpawnFailed,
+                        )
+                    })
                 },
             );
             assert!(matches!(other_result, Err(RuntimeCommandError::Auth(_))));
@@ -10178,7 +10303,11 @@ exit 23"#,
                         Some(operation_id),
                         false,
                     )
-                    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
+                    .map_err(|_| {
+                        CodexAuthCommandError::unavailable(
+                            CodexAuthUnavailableCause::SidecarSpawnFailed,
+                        )
+                    })
                 },
             );
             assert!(failed.is_err());
@@ -10223,7 +10352,11 @@ exit 23"#,
                         Some(operation_id),
                         false,
                     )
-                    .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
+                    .map_err(|_| {
+                        CodexAuthCommandError::unavailable(
+                            CodexAuthUnavailableCause::SidecarSpawnFailed,
+                        )
+                    })
                 },
             )
             .unwrap();
@@ -10590,6 +10723,33 @@ exit 23"#,
     }
 
     #[test]
+    fn auth_sidecar_identity_is_captured_before_fast_status_exit() {
+        let _serial = R0_CODEX_PROCESS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let temp = TempDir::new("auth-status-fast-exit-identity");
+        let script = temp.script("exit 0");
+        let expected_fingerprint = auth_sidecar_executable_fingerprint(&script).unwrap();
+        let mut process = spawn_codex_auth_sidecar_at(
+            &script,
+            &temp.0,
+            CodexAuthAction::Status,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(process.child.wait().unwrap().success());
+
+        let identity = auth_sidecar_identity(&process).unwrap();
+
+        assert_eq!(identity.pid, process.child.id());
+        assert_eq!(identity.process_group_id, identity.pid as i32);
+        assert_eq!(identity.executable_fingerprint, expected_fingerprint);
+        assert_ne!(identity.process_start, format!("pid:{}", identity.pid));
+    }
+
+    #[test]
     fn p2b_start_authorization_keeps_cancel_channel_until_terminal() {
         let _serial = R0_CODEX_PROCESS_TEST_LOCK
             .lock()
@@ -10770,7 +10930,11 @@ exit 23"#,
                     Some(operation_id),
                     false,
                 )
-                .map_err(|_| CodexAuthCommandError::unavailable("sidecar_spawn_failed"))
+                .map_err(|_| {
+                    CodexAuthCommandError::unavailable(
+                        CodexAuthUnavailableCause::SidecarSpawnFailed,
+                    )
+                })
             },
         )
         .unwrap();

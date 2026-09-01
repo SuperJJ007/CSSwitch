@@ -809,33 +809,24 @@ fn codex_models_response_exposes_science_aliases_and_cache_diagnostics() {
     assert!(head.contains("x-csswitch-model-source: live"));
     assert!(head.contains("x-csswitch-model-age-seconds: 0"));
     let body: Value = serde_json::from_slice(http_body(&response)).unwrap();
-    assert_eq!(body["data"].as_array().unwrap().len(), 8);
-    assert_eq!(body["data"][0]["id"], "claude-csswitch-codex-gpt-5.6-sol");
+    assert_eq!(body["data"].as_array().unwrap().len(), 3);
+    assert_eq!(body["data"][0]["id"], "claude-opus-5");
     assert_eq!(body["data"][0]["display_name"], "Codex / GPT-5.6-Sol");
     assert_eq!(body["data"][0]["reasoning_efforts"], json!(["medium"]));
     assert_eq!(body["data"][0]["default_reasoning_effort"], "medium");
     assert_eq!(body["data"][0]["reviewer_compatible"], true);
     assert_eq!(body["data"][0]["transport"], "responses");
-    assert_eq!(body["data"][1]["id"], "claude-csswitch-codex-gpt-5.6-terra");
+    assert_eq!(body["data"][1]["id"], "claude-sonnet-5");
     assert_eq!(body["data"][1]["display_name"], "Codex / GPT-5.6-Terra");
-    assert_eq!(body["data"][2]["id"], "claude-csswitch-codex-gpt-5.6-luna");
+    assert_eq!(body["data"][2]["id"], "claude-haiku-4-5-20251001");
     assert_eq!(body["data"][2]["display_name"], "Codex / GPT-5.6-Luna");
-    for canonical in [
-        "claude-opus-5",
-        "claude-sonnet-5",
-        "claude-opus-4-8",
-        "claude-sonnet-4-6",
-        "claude-haiku-4-5-20251001",
-    ] {
-        assert!(
-            body["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|model| model["id"] == canonical),
-            "routable Science canonical role {canonical} must be published"
-        );
-    }
+    assert!(!serde_json::to_string(&body).unwrap().contains("Opus 5"));
+    assert!(!serde_json::to_string(&body).unwrap().contains("Sonnet 5"));
+    assert!(!body["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|model| model["id"] == "claude-opus-4-8"));
     assert_eq!(body["diagnostics"]["source"], "live");
     assert_eq!(body["diagnostics"]["stale"], false);
     assert!(!serde_json::to_string(&body)

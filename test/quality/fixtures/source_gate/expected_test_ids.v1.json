@@ -1524,7 +1524,7 @@
         "desktop/gateway/Cargo.toml::lib::codex_models::tests::r0_cache_epoch_precedes_cache_and_invalidation_removes_cache",
         "desktop/gateway/Cargo.toml::lib::codex_models::tests::r0_codex_fetch_models_mutates_shared_catalog_cache",
         "desktop/gateway/Cargo.toml::lib::codex_models::tests::retry_policy_is_bounded_and_auth_never_uses_stale_cache",
-        "desktop/gateway/Cargo.toml::lib::codex_models::tests::routable_canonical_roles_are_published_for_science_settings",
+        "desktop/gateway/Cargo.toml::lib::codex_models::tests::reviewer_slots_publish_distinct_codex_names_without_claude_role_labels",
         "desktop/gateway/Cargo.toml::lib::codex_models::tests::stale_cache_revalidates_with_etag_and_network_failure_falls_back",
         "desktop/gateway/Cargo.toml::lib::codex_network::tests::direct_factory_builds_both_client_kinds",
         "desktop/gateway/Cargo.toml::lib::codex_network::tests::http_proxy_fixture_performs_real_connect_and_tls",
