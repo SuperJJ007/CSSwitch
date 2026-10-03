@@ -26,7 +26,7 @@ impl Drop for AuthorityDirectoryStream {
 }
 
 pub(super) const MAX_AUTHORITY_SNAPSHOT_ENTRIES: usize = 131_072;
-pub(super) const MAX_AUTHORITY_SNAPSHOT_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub(super) const MAX_AUTHORITY_SNAPSHOT_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub(super) const MAX_AUTHORITY_SNAPSHOT_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub(super) const MAX_AUTHORITY_FULL_COPY_FILE_BYTES: u64 = 128 * 1024 * 1024;
 pub(super) const MAX_AUTHORITY_FULL_COPY_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
